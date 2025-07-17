@@ -1,7 +1,7 @@
 name: Kompass Studio CI
 on:
   pull_request:
-    branches: [kompass]
+    branches: [kompass-studio]
     paths:
       - 'pnpm-lock.yaml'
       - 'studio/**/*'
@@ -10,7 +10,9 @@ on:
       - 'composition/**/*'
       - '.github/workflows/k-studio-ci.yaml'
   push:
-    branches: [kompass]
+    branches: [kompass-studio]
+    tags:
+      - 'kompass-studio@*'
 
 concurrency:
   group: ${{github.workflow}}-${{github.head_ref}}
@@ -74,5 +76,5 @@ jobs:
           docker_context: .
           dockerfile: studio/Dockerfile
           token: ${{secrets.GITHUB_TOKEN}}
-          image_name: k-studio
+          image_name: kompass-studio
           image_description: 'Kompass Cosmo Studio'
