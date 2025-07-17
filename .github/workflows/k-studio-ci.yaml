@@ -1,6 +1,7 @@
 name: Kompass Studio CI
 on:
   pull_request:
+    branches: [kompass]
     paths:
       - 'pnpm-lock.yaml'
       - 'studio/**/*'
@@ -8,6 +9,8 @@ on:
       - 'shared/**/*'
       - 'composition/**/*'
       - '.github/workflows/k-studio-ci.yaml'
+  push:
+    branches: [kompass]
 
 concurrency:
   group: ${{github.workflow}}-${{github.head_ref}}
