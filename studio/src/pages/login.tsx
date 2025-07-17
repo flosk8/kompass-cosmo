@@ -12,6 +12,7 @@ import { useEffect } from "react";
 import { z } from "zod";
 import useCookie from "@/hooks/use-cookie";
 import {KompassLogo} from "@/components/kompass-logo";
+import {KompassStack} from "@/components/auth/kompass-stack";
 
 const loginUrl = `${process.env.NEXT_PUBLIC_COSMO_CP_URL}/v1/auth/login`;
 
@@ -139,7 +140,8 @@ const LoginPage: NextPageWithLayout = () => {
         </div>
       </div>
       <div className="relative hidden flex-1 flex-col items-center gap-y-4 text-center text-white xl:flex xl:pt-40 2xl:pt-52">
-        <ProductCosmoStack />
+        {/*<ProductCosmoStack />*/}
+        <KompassStack />
       </div>
     </div>
   );

@@ -34,6 +34,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "../ui/dropdown-menu";
+import {KompassLogo} from "@/components/kompass-logo";
 
 export type NavLink = {
   title: string;
@@ -159,7 +160,7 @@ export const SideNav = (props: SideNavLayoutProps) => {
                     }
                     className="ml-2"
                   >
-                    <Logo />
+                    <KompassLogo />
                   </Link>
                 </TooltipTrigger>
                 <TooltipContent>All Federated Graphs</TooltipContent>
