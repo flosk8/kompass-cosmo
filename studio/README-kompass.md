@@ -14,4 +14,4 @@ The build image will be pushed to the  [Git Hub Docker Repository](https://githu
 To build and tag a new release, sync the main branch of this fork with the original Wundergraph Cosomo repository.
 Then merge into the `kompass-studio` branch.
 Then create a new tag in the format `kompass-studio@X.Y.Z` where `X.Y.Z` is the original studio version number.
-The origial studio version number can be found in the `package.json` of the studio. [package.json](../studio/package.json)
+The original studio version number can be found in the `package.json` of the studio. [package.json](../studio/package.json)
