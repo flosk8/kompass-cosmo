@@ -1,24 +1,37 @@
-import { and, count, desc, eq, gt, lt } from 'drizzle-orm';
+import { and, count, desc, eq, gt, inArray, lt, SQL } from 'drizzle-orm';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { joinLabel, splitLabel } from '@wundergraph/cosmo-shared';
-import { ProposalState } from '../../db/models.js';
+import { ProposalState, ProposalOrigin } from '../../db/models.js';
 import * as schema from '../../db/schema.js';
-import { GetChecksResponse, Label, LintSeverityLevel, ProposalDTO, ProposalSubgraphDTO } from '../../types/index.js';
+import {
+  GetChecksResponse,
+  Label,
+  LintSeverityLevel,
+  ProposalDTO,
+  ProposalSubgraphDTO,
+  SchemaCheckDTO,
+} from '../../types/index.js';
 import { getDiffBetweenGraphs } from '../composition/schemaCheck.js';
-import { normalizeLabels } from '../util.js';
+import { isCheckSuccessful, normalizeLabels } from '../util.js';
+import { traced } from '../tracing.js';
 import { SchemaCheckRepository } from './SchemaCheckRepository.js';
 
 /**
  * Repository for organization related operations.
  */
+@traced
 export class ProposalRepository {
-  constructor(private db: PostgresJsDatabase<typeof schema>) {}
+  constructor(
+    private db: PostgresJsDatabase<typeof schema>,
+    private organizationId: string,
+  ) {}
 
   public async createProposal({
     federatedGraphId,
     name,
     userId,
     proposalSubgraphs,
+    origin,
   }: {
     federatedGraphId: string;
     name: string;
@@ -32,6 +45,7 @@ export class ProposalRepository {
       currentSchemaVersionId?: string;
       labels: Label[];
     }[];
+    origin: ProposalOrigin;
   }): Promise<ProposalDTO> {
     const proposal = await this.db
       .insert(schema.proposals)
@@ -40,18 +54,19 @@ export class ProposalRepository {
         name,
         createdById: userId,
         state: 'DRAFT',
+        origin,
       })
       .returning();
 
     await this.db.insert(schema.proposalSubgraphs).values(
       proposalSubgraphs.map((subgraph) => ({
         proposalId: proposal[0].id,
-        subgraphId: subgraph.subgraphId,
+        subgraphId: subgraph.subgraphId || null,
         subgraphName: subgraph.subgraphName,
         schemaSDL: subgraph.schemaSDL || null,
         isDeleted: subgraph.isDeleted,
         isNew: subgraph.isNew,
-        currentSchemaVersionId: subgraph.currentSchemaVersionId,
+        currentSchemaVersionId: subgraph.currentSchemaVersionId || null,
         labels: subgraph.isNew ? normalizeLabels(subgraph.labels).map((l) => joinLabel(l)) : undefined,
       })),
     );
@@ -63,6 +78,7 @@ export class ProposalRepository {
       createdById: proposal[0].createdById || '',
       state: proposal[0].state,
       federatedGraphId: proposal[0].federatedGraphId,
+      origin: proposal[0].origin,
     };
   }
 
@@ -78,10 +94,13 @@ export class ProposalRepository {
         createdByEmail: schema.users.email,
         state: schema.proposals.state,
         federatedGraphId: schema.proposals.federatedGraphId,
+        origin: schema.proposals.origin,
       })
       .from(schema.proposals)
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
       .leftJoin(schema.users, eq(schema.proposals.createdById, schema.users.id))
-      .where(eq(schema.proposals.id, id));
+      .where(and(eq(schema.proposals.id, id), eq(schema.targets.organizationId, this.organizationId)));
 
     const proposalSubgraphs = await this.db
       .select({
@@ -109,6 +128,7 @@ export class ProposalRepository {
         createdByEmail: proposal[0].createdByEmail || '',
         state: proposal[0].state,
         federatedGraphId: proposal[0].federatedGraphId,
+        origin: proposal[0].origin,
       },
       proposalSubgraphs: proposalSubgraphs.map((subgraph) => ({
         id: subgraph.id,
@@ -139,10 +159,19 @@ export class ProposalRepository {
         createdByEmail: schema.users.email,
         state: schema.proposals.state,
         federatedGraphId: schema.proposals.federatedGraphId,
+        origin: schema.proposals.origin,
       })
       .from(schema.proposals)
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
       .leftJoin(schema.users, eq(schema.proposals.createdById, schema.users.id))
-      .where(and(eq(schema.proposals.name, name), eq(schema.proposals.federatedGraphId, federatedGraphId)));
+      .where(
+        and(
+          eq(schema.proposals.name, name),
+          eq(schema.proposals.federatedGraphId, federatedGraphId),
+          eq(schema.targets.organizationId, this.organizationId),
+        ),
+      );
 
     if (proposal.length === 0) {
       return undefined;
@@ -171,6 +200,7 @@ export class ProposalRepository {
         createdByEmail: proposal[0].createdByEmail || '',
         state: proposal[0].state,
         federatedGraphId: proposal[0].federatedGraphId,
+        origin: proposal[0].origin,
       },
       proposalSubgraphs: proposalSubgraphs.map((subgraph) => ({
         id: subgraph.id,
@@ -198,11 +228,10 @@ export class ProposalRepository {
     limit: number;
     offset: number;
   }): Promise<{ proposals: { proposal: ProposalDTO; proposalSubgraphs: ProposalSubgraphDTO[] }[] }> {
-    let whereCondition: any = eq(schema.proposals.federatedGraphId, federatedGraphId);
+    const conditions: (SQL<unknown> | undefined)[] = [];
 
     if (startDate && endDate) {
-      whereCondition = and(
-        whereCondition,
+      conditions.push(
         gt(schema.proposals.createdAt, new Date(startDate)),
         lt(schema.proposals.createdAt, new Date(endDate)),
       );
@@ -218,10 +247,19 @@ export class ProposalRepository {
         createdByEmail: schema.users.email,
         state: schema.proposals.state,
         federatedGraphId: schema.proposals.federatedGraphId,
+        origin: schema.proposals.origin,
       })
       .from(schema.proposals)
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
       .leftJoin(schema.users, eq(schema.proposals.createdById, schema.users.id))
-      .where(whereCondition)
+      .where(
+        and(
+          ...conditions,
+          eq(schema.targets.organizationId, this.organizationId),
+          eq(schema.federatedGraphs.id, federatedGraphId),
+        ),
+      )
       .orderBy(desc(schema.proposals.createdAt));
 
     if (limit) {
@@ -263,6 +301,7 @@ export class ProposalRepository {
           createdByEmail: proposal.createdByEmail || '',
           state: proposal.state,
           federatedGraphId: proposal.federatedGraphId,
+          origin: proposal.origin,
         },
         proposalSubgraphs: proposalSubgraphs.map((subgraph) => ({
           id: subgraph.id,
@@ -290,11 +329,10 @@ export class ProposalRepository {
     startDate?: string;
     endDate?: string;
   }): Promise<number> {
-    let whereCondition: any = eq(schema.proposals.federatedGraphId, federatedGraphId);
+    const conditions: (SQL<unknown> | undefined)[] = [];
 
     if (startDate && endDate) {
-      whereCondition = and(
-        whereCondition,
+      conditions.push(
         gt(schema.proposals.createdAt, new Date(startDate)),
         lt(schema.proposals.createdAt, new Date(endDate)),
       );
@@ -305,7 +343,15 @@ export class ProposalRepository {
         count: count(),
       })
       .from(schema.proposals)
-      .where(whereCondition);
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
+      .where(
+        and(
+          ...conditions,
+          eq(schema.targets.organizationId, this.organizationId),
+          eq(schema.proposals.federatedGraphId, federatedGraphId),
+        ),
+      );
 
     return result[0]?.count || 0;
   }
@@ -341,12 +387,12 @@ export class ProposalRepository {
       await this.db.insert(schema.proposalSubgraphs).values(
         proposalSubgraphs.map((subgraph) => ({
           proposalId: id,
-          subgraphId: subgraph.subgraphId,
+          subgraphId: subgraph.subgraphId || null,
           subgraphName: subgraph.subgraphName,
           schemaSDL: subgraph.schemaSDL || null,
           isDeleted: subgraph.isDeleted,
           isNew: subgraph.isNew,
-          currentSchemaVersionId: subgraph.currentSchemaVersionId,
+          currentSchemaVersionId: subgraph.currentSchemaVersionId || null,
           labels: subgraph.isNew ? normalizeLabels(subgraph.labels).map((l) => joinLabel(l)) : undefined,
         })),
       );
@@ -391,7 +437,13 @@ export class ProposalRepository {
         publishSeverityLevel: schema.namespaceProposalConfig.publishSeverityLevel,
       })
       .from(schema.namespaceProposalConfig)
-      .where(eq(schema.namespaceProposalConfig.namespaceId, namespaceId));
+      .innerJoin(schema.namespaces, eq(schema.namespaceProposalConfig.namespaceId, schema.namespaces.id))
+      .where(
+        and(
+          eq(schema.namespaceProposalConfig.namespaceId, namespaceId),
+          eq(schema.namespaces.organizationId, this.organizationId),
+        ),
+      );
 
     if (proposalConfig.length === 0) {
       return;
@@ -400,12 +452,14 @@ export class ProposalRepository {
     return proposalConfig[0];
   }
 
-  public async getApprovedProposalSubgraphsBySubgraph({
+  public async getProposalSubgraphsBySubgraph({
     subgraphName,
     namespaceId,
+    approvedOnly = false,
   }: {
     subgraphName: string;
     namespaceId: string;
+    approvedOnly?: boolean;
   }) {
     const proposalSubgraphs = await this.db
       .select({
@@ -422,21 +476,25 @@ export class ProposalRepository {
       .where(
         and(
           eq(schema.proposalSubgraphs.subgraphName, subgraphName),
-          eq(schema.proposals.state, 'APPROVED'),
           eq(schema.targets.namespaceId, namespaceId),
+          eq(schema.targets.organizationId, this.organizationId),
+          approvedOnly
+            ? eq(schema.proposals.state, 'APPROVED')
+            : inArray(schema.proposals.state, ['DRAFT', 'APPROVED']),
         ),
       );
 
     return proposalSubgraphs;
   }
 
-  public async matchSchemaWithProposal({
+  public async matchSchemaWithProposals({
     subgraphName,
     namespaceId,
     schemaCheckId,
     schemaSDL,
     routerCompatibilityVersion,
     isDeleted,
+    approvedOnly = false,
   }: {
     subgraphName: string;
     namespaceId: string;
@@ -444,11 +502,11 @@ export class ProposalRepository {
     schemaSDL: string;
     routerCompatibilityVersion: string;
     isDeleted: boolean;
-  }): Promise<{ proposalId: string; proposalSubgraphId: string } | undefined> {
-    const proposalSubgraphs = await this.getApprovedProposalSubgraphsBySubgraph({
-      subgraphName,
-      namespaceId,
-    });
+    approvedOnly?: boolean;
+  }): Promise<{ proposalId: string; proposalSubgraphId: string }[]> {
+    const proposalSubgraphs = await this.getProposalSubgraphsBySubgraph({ subgraphName, namespaceId, approvedOnly });
+
+    const matches: { proposalId: string; proposalSubgraphId: string }[] = [];
 
     for (const proposalSubgraph of proposalSubgraphs) {
       if (proposalSubgraph.isDeleted && isDeleted) {
@@ -467,10 +525,11 @@ export class ProposalRepository {
               },
             });
         }
-        return {
+        matches.push({
           proposalId: proposalSubgraph.proposalId,
           proposalSubgraphId: proposalSubgraph.id,
-        };
+        });
+        continue;
       }
 
       if (!proposalSubgraph.proposedSchemaSDL) {
@@ -499,13 +558,13 @@ export class ProposalRepository {
       }
 
       if (schemaChanges.changes.length === 0) {
-        return {
+        matches.push({
           proposalId: proposalSubgraph.proposalId,
           proposalSubgraphId: proposalSubgraph.id,
-        };
+        });
       }
     }
-    return undefined;
+    return matches;
   }
 
   public async getLatestCheckForProposal(
@@ -533,6 +592,8 @@ export class ProposalRepository {
         hasLintErrors: schema.schemaChecks.hasLintErrors,
         hasGraphPruningErrors: schema.schemaChecks.hasGraphPruningErrors,
         clientTrafficCheckSkipped: schema.schemaChecks.clientTrafficCheckSkipped,
+        checkExtensionDeliveryId: schema.schemaChecks.checkExtensionDeliveryId,
+        checkExtensionErrorMessage: schema.schemaChecks.checkExtensionErrorMessage,
       })
       .from(schema.schemaChecks)
       .where(eq(schema.schemaChecks.id, latestCheck[0].schemaCheckId))
@@ -549,12 +610,34 @@ export class ProposalRepository {
     const hasLintErrors = Boolean(check[0].hasLintErrors);
     const hasGraphPruningErrors = Boolean(check[0].hasGraphPruningErrors);
     const clientTrafficCheckSkipped = Boolean(check[0].clientTrafficCheckSkipped);
+    const checkExtensionDeliveryId = check[0].checkExtensionDeliveryId || undefined;
+    const checkExtensionErrorMessage = check[0].checkExtensionErrorMessage || undefined;
 
-    const isSuccessful =
-      isComposable &&
-      (!isBreaking || (isBreaking && !hasClientTraffic && !clientTrafficCheckSkipped)) &&
-      !hasLintErrors &&
-      !hasGraphPruningErrors;
+    const schemaCheckRepo = new SchemaCheckRepository(this.db);
+    const linkedChecks = await schemaCheckRepo.getLinkedSchemaChecks({
+      schemaCheckID: check[0].id,
+      organizationId: this.organizationId,
+    });
+    const isLinkedTrafficCheckFailed = linkedChecks.some(
+      (linkedCheck) => linkedCheck.hasClientTraffic && !linkedCheck.isForcedSuccess,
+    );
+    const isLinkedPruningCheckFailed = linkedChecks.some(
+      (linkedCheck) => linkedCheck.hasGraphPruningErrors && !linkedCheck.isForcedSuccess,
+    );
+
+    const isSuccessful = isCheckSuccessful({
+      isComposable,
+      isBreaking,
+      hasClientTraffic,
+      hasLintErrors,
+      hasGraphPruningErrors,
+      clientTrafficCheckSkipped,
+      hasProposalMatchError: false,
+      isLinkedTrafficCheckFailed,
+      isLinkedPruningCheckFailed,
+      checkExtensionDeliveryId,
+      checkExtensionErrorMessage,
+    });
 
     return {
       checkId: check[0].id,
@@ -565,6 +648,7 @@ export class ProposalRepository {
   public async getChecksByProposalId({
     proposalId,
     federatedGraphId,
+    organizationId,
     limit,
     offset,
     startDate,
@@ -572,16 +656,16 @@ export class ProposalRepository {
   }: {
     proposalId: string;
     federatedGraphId: string;
+    organizationId: string;
     limit: number;
     offset: number;
     startDate?: string;
     endDate?: string;
   }): Promise<GetChecksResponse> {
-    let whereCondition: any = eq(schema.proposalChecks.proposalId, proposalId);
+    const conditions: (SQL<unknown> | undefined)[] = [eq(schema.proposalChecks.proposalId, proposalId)];
 
     if (startDate && endDate) {
-      whereCondition = and(
-        whereCondition,
+      conditions.push(
         gt(schema.proposalChecks.createdAt, new Date(startDate)),
         lt(schema.proposalChecks.createdAt, new Date(endDate)),
       );
@@ -606,10 +690,12 @@ export class ProposalRepository {
         compositionSkipped: schema.schemaChecks.compositionSkipped,
         breakingChangesSkipped: schema.schemaChecks.breakingChangesSkipped,
         errorMessage: schema.schemaChecks.errorMessage,
+        checkExtensionDeliveryId: schema.schemaChecks.checkExtensionDeliveryId,
+        checkExtensionErrorMessage: schema.schemaChecks.checkExtensionErrorMessage,
       })
       .from(schema.proposalChecks)
       .innerJoin(schema.schemaChecks, eq(schema.proposalChecks.schemaCheckId, schema.schemaChecks.id))
-      .where(whereCondition)
+      .where(and(...conditions))
       .orderBy(desc(schema.proposalChecks.createdAt));
 
     if (limit) {
@@ -628,7 +714,7 @@ export class ProposalRepository {
         schemaCheckId: schema.proposalChecks.schemaCheckId,
       })
       .from(schema.proposalChecks)
-      .where(whereCondition);
+      .where(and(...conditions));
 
     const schemaCheckRepo = new SchemaCheckRepository(this.db);
     // Get all checkedSubgraphs for all checks in one go
@@ -637,6 +723,11 @@ export class ProposalRepository {
         const checkedSubgraphs = await schemaCheckRepo.getCheckedSubgraphsForCheckIdAndFederatedGraphId({
           checkId: c.id,
           federatedGraphId,
+        });
+
+        const linkedChecks = await schemaCheckRepo.getLinkedSchemaChecks({
+          schemaCheckID: c.id,
+          organizationId,
         });
 
         return {
@@ -665,7 +756,10 @@ export class ProposalRepository {
           compositionSkipped: c.compositionSkipped ?? false,
           breakingChangesSkipped: c.breakingChangesSkipped ?? false,
           errorMessage: c.errorMessage || undefined,
-        };
+          linkedChecks,
+          checkExtensionDeliveryId: c.checkExtensionDeliveryId || undefined,
+          checkExtensionErrorMessage: c.checkExtensionErrorMessage || undefined,
+        } satisfies SchemaCheckDTO;
       }),
     );
 
@@ -720,7 +814,11 @@ export class ProposalRepository {
       })
       .from(schema.proposalChecks)
       .innerJoin(schema.proposals, eq(schema.proposalChecks.proposalId, schema.proposals.id))
-      .where(eq(schema.proposalChecks.schemaCheckId, checkId));
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
+      .where(
+        and(eq(schema.proposalChecks.schemaCheckId, checkId), eq(schema.targets.organizationId, this.organizationId)),
+      );
 
     if (proposal.length === 0) {
       return undefined;
@@ -747,10 +845,13 @@ export class ProposalRepository {
       })
       .from(schema.schemaCheckProposalMatch)
       .innerJoin(schema.proposals, eq(schema.schemaCheckProposalMatch.proposalId, schema.proposals.id))
+      .innerJoin(schema.federatedGraphs, eq(schema.proposals.federatedGraphId, schema.federatedGraphs.id))
+      .innerJoin(schema.targets, eq(schema.federatedGraphs.targetId, schema.targets.id))
       .where(
         and(
           eq(schema.schemaCheckProposalMatch.schemaCheckId, checkId),
           eq(schema.proposals.federatedGraphId, federatedGraphId),
+          eq(schema.targets.organizationId, this.organizationId),
         ),
       );
 

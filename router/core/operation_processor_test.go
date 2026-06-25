@@ -29,6 +29,7 @@ func TestOperationProcessorPersistentOperations(t *testing.T) {
 		Name:    "test",
 		Version: "1.0.0",
 	}
+	const cacheHashNotStored = "0000000000000000000000000000000000000000000000000000000000000000"
 	testCases := []struct {
 		ExpectedType  string
 		ExpectedError error
@@ -39,7 +40,7 @@ func TestOperationProcessorPersistentOperations(t *testing.T) {
 		 * Test cases persist operation
 		 */
 		{
-			Input:         `{"operationName": "test", "variables": {"foo": "bar"}, "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "does-not-exist"}}}`,
+			Input:         `{"operationName": "test", "variables": {"foo": "bar"}, "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "` + cacheHashNotStored + `"}}}`,
 			Variables:     `{"foo": "bar"}`,
 			ExpectedError: errors.New("could not resolve persisted query, feature is not configured"),
 		},
@@ -72,6 +73,73 @@ func TestOperationProcessorPersistentOperations(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPersistedOperationCachePopulatesOperationName(t *testing.T) {
+	executor := &Executor{
+		PlanConfig:      plan.Configuration{},
+		RouterSchema:    nil,
+		Resolver:        nil,
+		RenameTypeNames: nil,
+	}
+	processor := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                executor,
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        1,
+	})
+
+	kit, err := processor.NewKit()
+	require.NoError(t, err)
+	defer kit.Free()
+
+	entry := NormalizationCacheEntry{
+		normalizedRepresentation: "query TestOperation { a }",
+		operationType:            "query",
+	}
+
+	err = kit.handleFoundPersistedOperationEntry(entry)
+	require.NoError(t, err)
+	require.Equal(t, "TestOperation", kit.parsedOperation.Request.OperationName)
+}
+
+func TestPersistedOperationCacheOperationNameIsStableAcrossKitReuse(t *testing.T) {
+	executor := &Executor{
+		PlanConfig:      plan.Configuration{},
+		RouterSchema:    nil,
+		Resolver:        nil,
+		RenameTypeNames: nil,
+	}
+	processor := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                executor,
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        1,
+	})
+
+	kit1, err := processor.NewKit()
+	require.NoError(t, err)
+
+	err = kit1.handleFoundPersistedOperationEntry(NormalizationCacheEntry{
+		normalizedRepresentation: "query FirstName { a }",
+		operationType:            "query",
+	})
+	require.NoError(t, err)
+
+	firstName := kit1.parsedOperation.Request.OperationName
+	require.Equal(t, "FirstName", firstName)
+
+	kit1.Free()
+
+	kit2, err := processor.NewKit()
+	require.NoError(t, err)
+	defer kit2.Free()
+
+	err = kit2.handleFoundPersistedOperationEntry(NormalizationCacheEntry{
+		normalizedRepresentation: "query SecondName { a }",
+		operationType:            "query",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "SecondName", kit2.parsedOperation.Request.OperationName)
+	require.Equal(t, "FirstName", firstName)
 }
 
 func TestParseOperationProcessor(t *testing.T) {
@@ -260,7 +328,7 @@ func TestNormalizeVariablesOperationProcessor(t *testing.T) {
 			_, err = kit.NormalizeOperation("test", false)
 			require.NoError(t, err)
 
-			_, err = kit.NormalizeVariables()
+			_, _, err = kit.NormalizeVariables()
 			require.NoError(t, err)
 
 			assert.Equal(t, tc.ExpectedNormalizedRepresentation, kit.parsedOperation.NormalizedRepresentation)
@@ -354,6 +422,103 @@ const nonSchemaIntrospectionQueryWithMultipleQueries = `{"operationName":"Hello"
 const nonTypeIntrospectionQueryWithMultipleQueries = `{"operationName":"Hello","query":"query Hello { world } query IntrospectionQuery { __type(name: \"Droid\") { name } }"}`
 const typeIntrospectionWithAdditionalFields = `{"operationName":null,"variables":{},"query":"query Intro { __typename __type(name: \"Query\"){ name } }"}`
 const mutationQuery = `{"operationName":null,"query":"mutation Foo {bar}"}`
+
+func TestUnmarshalOperationFromBody(t *testing.T) {
+	executor := &Executor{
+		PlanConfig:      plan.Configuration{},
+		RouterSchema:    nil,
+		Resolver:        nil,
+		RenameTypeNames: nil,
+	}
+	parser := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                executor,
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        4,
+	})
+	testCases := []struct {
+		Name          string
+		Input         string
+		ExpectedQuery string
+		ExpectedVars  string
+		ExpectedOp    string
+		ExpectedError error
+	}{
+		{
+			Name:          "JSON with extra whitespace and newlines",
+			Input:         "{\n  \"query\": \"query { initialPayload(repeat:3) }\",\n  \"variables\": {\n    \"foo\": \"bar\",\n    \"baz\": [1, 2, 3]\n  },\n  \"operationName\": \"TestOperation\"\n}",
+			ExpectedQuery: "query { initialPayload(repeat:3) }",
+			ExpectedVars:  `{"foo":"bar","baz":[1,2,3]}`,
+			ExpectedOp:    "TestOperation",
+			ExpectedError: nil,
+		},
+		{
+			Name:          "JSON with tabs and multiple spaces",
+			Input:         "{\t\"query\":\t\t\"query { user { name } }\",\t\"variables\":\t{\t\t\"id\":\t123\t},\t\"operationName\":\t\"GetUser\"\t}",
+			ExpectedQuery: "query { user { name } }",
+			ExpectedVars:  `{"id":123}`,
+			ExpectedOp:    "GetUser",
+			ExpectedError: nil,
+		},
+		{
+			Name:          "Already compacted JSON",
+			Input:         `{"query":"query { test }","variables":{"x":1},"operationName":"Test"}`,
+			ExpectedQuery: "query { test }",
+			ExpectedVars:  `{"x":1}`,
+			ExpectedOp:    "Test",
+			ExpectedError: nil,
+		},
+		{
+			Name: "JSON with nested objects and arrays",
+			Input: `{
+				"query": "query { user(id: $id) { name profile { email } } }",
+				"variables": {
+					"id": "123",
+					"metadata": {
+						"tags": ["tag1", "tag2"],
+						"count": 42
+					}
+				},
+				"operationName": "GetUser"
+			}`,
+			ExpectedQuery: "query { user(id: $id) { name profile { email } } }",
+			ExpectedVars:  `{"id":"123","metadata":{"tags":["tag1","tag2"],"count":42}}`,
+			ExpectedOp:    "GetUser",
+			ExpectedError: nil,
+		},
+		{
+			Name: "JSON with null values",
+			Input: `{
+				"query": "query { test }",
+				"variables": null,
+				"operationName": null
+			}`,
+			ExpectedQuery: "query { test }",
+			ExpectedVars:  `{}`,
+			ExpectedOp:    "",
+			ExpectedError: nil,
+		},
+	}
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			kit, err := parser.NewKit()
+			require.NoError(t, err)
+			defer kit.Free()
+
+			err = kit.UnmarshalOperationFromBody([]byte(tc.Input))
+
+			if tc.ExpectedError != nil {
+				require.EqualError(t, err, tc.ExpectedError.Error())
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, kit.parsedOperation)
+				assert.Equal(t, tc.ExpectedQuery, kit.parsedOperation.Request.Query)
+				require.JSONEq(t, tc.ExpectedVars, string(kit.parsedOperation.Request.Variables))
+				assert.Equal(t, tc.ExpectedOp, kit.parsedOperation.Request.OperationName)
+			}
+		})
+	}
+}
 
 func TestOperationProcessorIntrospectionQuery(t *testing.T) {
 	executor := &Executor{
@@ -485,4 +650,62 @@ func TestOperationProcessorIntrospectionQuery(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSkipIncludeVariableNamesStableAfterKitReuse verifies that skipIncludeVariableNames
+// returns owned strings (not unsafe aliases into kit.doc.Input.RawBytes) so that the slice
+// stored in persistedOperationVariableNames remains valid after the kit is returned to the
+// pool and reused for a different query. Without explicit string creation the aliased strings would
+// silently read garbage, causing cache-key corruption for every subsequent APQ request.
+func TestSkipIncludeVariableNamesStableAfterKitReuse(t *testing.T) {
+	executor := &Executor{
+		PlanConfig:      plan.Configuration{},
+		RouterSchema:    nil,
+		Resolver:        nil,
+		RenameTypeNames: nil,
+	}
+	// Pool of exactly one kit so that kit2 is guaranteed to reuse kit1's buffer.
+	processor := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                executor,
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        1,
+	})
+
+	// A query whose @include directives bind two variables.  The variable names
+	// "withAligators" and "withCats" live at well-known byte offsets inside the
+	// raw query bytes written to kit.doc.Input.RawBytes by Parse().
+	const skipIncludeQuery = `query Employee($withAligators: Boolean!, $withCats: Boolean!) { employee(id: 1) { details { pets { ... on Alligator @include(if: $withAligators) { name } ... on Cat @include(if: $withCats) { name } } } } }`
+
+	kit1, err := processor.NewKit()
+	require.NoError(t, err)
+
+	kit1.parsedOperation.Request.Query = skipIncludeQuery
+	require.NoError(t, kit1.Parse())
+
+	names := kit1.skipIncludeVariableNames()
+	require.Equal(t, []string{"withAligators", "withCats"}, names,
+		"skipIncludeVariableNames should return sorted variable names")
+
+	kit1.Free() // returns kit to pool; RawBytes are zeroed in length but NOT zeroed in content
+
+	// Acquire the same kit slot and parse a different query with reversed order of fragments and variables,
+	// whose bytes overwrite the positions where "withAligators" and "withCats" used to live.
+	const polluterQuery = `query Employee($withCats: Boolean! $withAligators: Boolean!) { employee(id: 1) { details { pets { ... on Cat @include(if: $withCats) { name } ... on Alligator @include(if: $withAligators) { name } } } } }`
+
+	kit2, err := processor.NewKit()
+	require.NoError(t, err)
+	defer kit2.Free()
+
+	kit2.parsedOperation.Request.Query = polluterQuery
+	require.NoError(t, kit2.Parse())
+
+	// Without strings.Clone in skipIncludeVariableNames, names[0] and names[1]
+	// are unsafe aliases into the now-overwritten RawBytes — they will read the
+	// polluter query's bytes and no longer equal the original variable names.
+	require.Equal(t, "withAligators", names[0],
+		"skipIncludeVariableNames must return cloned (not aliased) strings: "+
+			"'withAligators' was corrupted after kit reuse")
+	require.Equal(t, "withCats", names[1],
+		"skipIncludeVariableNames must return cloned (not aliased) strings: "+
+			"'withCats' was corrupted after kit reuse")
 }

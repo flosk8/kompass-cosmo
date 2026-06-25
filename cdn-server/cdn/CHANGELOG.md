@@ -4,6 +4,54 @@ Binaries are attached to the github release otherwise all images can be found [h
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+# [0.15.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.14.1...@wundergraph/cosmo-cdn@0.15.0) (2026-05-11)
+
+### Features
+
+* split router execution configs ([#2847](https://github.com/wundergraph/cosmo/issues/2847)) ([893ff72](https://github.com/wundergraph/cosmo/commit/893ff721e28d34eb308b74c845773a0186a7467c)) (@Aenimus)
+
+## [0.14.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.14.0...@wundergraph/cosmo-cdn@0.14.1) (2026-05-01)
+
+**Note:** Version bump only for package @wundergraph/cosmo-cdn
+
+# [0.14.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.13.0...@wundergraph/cosmo-cdn@0.14.0) (2026-04-29)
+
+### Features
+
+* centralize TS dependency management via catalogs ([#2782](https://github.com/wundergraph/cosmo/issues/2782)) ([a6a6956](https://github.com/wundergraph/cosmo/commit/a6a69565727f01a942a16e6d560d0fedabcb531e)) (@comatory)
+
+# [0.13.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.12.0...@wundergraph/cosmo-cdn@0.13.0) (2026-04-14)
+
+### Features
+
+* update packages to address high severity vulnerabilities ([#2757](https://github.com/wundergraph/cosmo/issues/2757)) ([e14c41b](https://github.com/wundergraph/cosmo/commit/e14c41bfac517c6f1ea7d9d00e85bbbdff29b4e0)) (@pepol)
+
+# [0.12.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.11.0...@wundergraph/cosmo-cdn@0.12.0) (2026-03-27)
+
+### Features
+
+* add PQL manifest support for persisted operations ([#2635](https://github.com/wundergraph/cosmo/issues/2635)) ([38a648c](https://github.com/wundergraph/cosmo/commit/38a648cff927b45d5ee5323bf303f83198c64411)) (@StarpTech)
+
+# [0.11.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.10.0...@wundergraph/cosmo-cdn@0.11.0) (2025-11-29)
+
+### Features
+
+* subgraph check extensions ([#2281](https://github.com/wundergraph/cosmo/issues/2281)) ([c190b5a](https://github.com/wundergraph/cosmo/commit/c190b5ad19f9fd8f7a67317a29fe845d475dbf10)) (@wilsonrivera)
+
+# [0.10.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.9.5...@wundergraph/cosmo-cdn@0.10.0) (2025-11-19)
+
+### Features
+
+* **admission-server,cdn-server:** upgrade hono to v4.10.6 ([#2340](https://github.com/wundergraph/cosmo/issues/2340)) ([9f9faa0](https://github.com/wundergraph/cosmo/commit/9f9faa00eed1027e8d3cbe08e594c94e08028553)) (@pepol)
+
+## [0.9.5](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.9.4...@wundergraph/cosmo-cdn@0.9.5) (2025-10-03)
+
+**Note:** Version bump only for package @wundergraph/cosmo-cdn
+
+## [0.9.4](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.9.3...@wundergraph/cosmo-cdn@0.9.4) (2025-08-07)
+
+**Note:** Version bump only for package @wundergraph/cosmo-cdn
+
 ## [0.9.3](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-cdn@0.9.2...@wundergraph/cosmo-cdn@0.9.3) (2025-05-02)
 
 ### Bug Fixes

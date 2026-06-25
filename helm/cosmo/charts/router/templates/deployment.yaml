@@ -30,6 +30,10 @@ spec:
       {{- end }}
       labels:
         {{- include "router.selectorLabels" . | nindent 8 }}
+        {{- include "router.additionalPodLabels" . | nindent 8 }}
+        {{- range $key, $value := .Values.commonLabels }}
+        {{ $key }}: {{ quote $value }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -205,6 +209,10 @@ spec:
           {{- end }}
           {{- with .Values.probes.readiness }}
           readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.startup }}
+          startupProbe:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:

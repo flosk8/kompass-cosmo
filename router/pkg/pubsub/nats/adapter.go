@@ -4,44 +4,54 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"sync"
 	"time"
+
+	"github.com/wundergraph/cosmo/router/pkg/metric"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
 	"go.uber.org/zap"
+)
+
+const (
+	natsRequest = "request"
+	natsPublish = "publish"
+	natsReceive = "receive"
 )
 
 // Adapter defines the methods that a NATS adapter should implement
 type Adapter interface {
-	// Subscribe subscribes to the given events and sends updates to the updater
-	Subscribe(ctx context.Context, event SubscriptionEventConfiguration, updater resolve.SubscriptionUpdater) error
-	// Publish publishes the given event to the specified subject
-	Publish(ctx context.Context, event PublishAndRequestEventConfiguration) error
+	datasource.Adapter
 	// Request sends a request to the specified subject and writes the response to the given writer
-	Request(ctx context.Context, event PublishAndRequestEventConfiguration, w io.Writer) error
-	// Startup initializes the adapter
-	Startup(ctx context.Context) error
-	// Shutdown gracefully shuts down the adapter
-	Shutdown(ctx context.Context) error
+	Request(ctx context.Context, cfg datasource.PublishEventConfiguration, event datasource.StreamEvent) ([]byte, error)
+}
+
+// Ensure ProviderAdapter implements ProviderSubscriptionHooks
+var _ datasource.Adapter = (*ProviderAdapter)(nil)
+
+type consumerConfig struct {
+	deleteOnShutdown bool
+	trackedConsumers sync.Map // key = consumer name, value = stream name
 }
 
 // ProviderAdapter implements the AdapterInterface for NATS pub/sub
 type ProviderAdapter struct {
-	ctx              context.Context
-	client           *nats.Conn
-	js               jetstream.JetStream
-	logger           *zap.Logger
-	closeWg          sync.WaitGroup
-	hostName         string
-	routerListenAddr string
-	url              string
-	opts             []nats.Option
-	flushTimeout     time.Duration
+	ctx               context.Context
+	cancel            context.CancelFunc
+	client            *nats.Conn
+	js                jetstream.JetStream
+	logger            *zap.Logger
+	closeWg           sync.WaitGroup
+	hostName          string
+	routerListenAddr  string
+	url               string
+	opts              []nats.Option
+	flushTimeout      time.Duration
+	streamMetricStore metric.StreamMetricStore
+	consumerConfig    consumerConfig
 }
 
 // getInstanceIdentifier returns an identifier for the current instance.
@@ -72,11 +82,16 @@ func (p *ProviderAdapter) getDurableConsumerName(durableName string, subjects []
 	return fmt.Sprintf("%s-%x", durableName, subjHash.Sum64()), nil
 }
 
-func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEventConfiguration, updater resolve.SubscriptionUpdater) error {
+func (p *ProviderAdapter) Subscribe(ctx context.Context, cfg datasource.SubscriptionEventConfiguration, updater datasource.SubscriptionEventUpdater) error {
+	subConf, ok := cfg.(*SubscriptionEventConfiguration)
+	if !ok {
+		return datasource.NewError("subscription event not support by nats provider", nil)
+	}
+
 	log := p.logger.With(
-		zap.String("provider_id", event.ProviderID),
+		zap.String("provider_id", subConf.ProviderID()),
 		zap.String("method", "subscribe"),
-		zap.Strings("subjects", event.Subjects),
+		zap.Strings("subjects", subConf.Subjects),
 	)
 
 	if p.client == nil {
@@ -87,32 +102,16 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEvent
 		return datasource.NewError("nats jetstream not initialized", nil)
 	}
 
-	if event.StreamConfiguration != nil {
-		durableConsumerName, err := p.getDurableConsumerName(event.StreamConfiguration.Consumer, event.Subjects)
-		if err != nil {
-			return err
-		}
-		consumerConfig := jetstream.ConsumerConfig{
-			Durable:        durableConsumerName,
-			FilterSubjects: event.Subjects,
-		}
-		// Durable consumers are removed automatically only if the InactiveThreshold value is set
-		if event.StreamConfiguration.ConsumerInactiveThreshold > 0 {
-			consumerConfig.InactiveThreshold = time.Duration(event.StreamConfiguration.ConsumerInactiveThreshold) * time.Second
-		}
-
-		consumer, err := p.js.CreateOrUpdateConsumer(ctx, event.StreamConfiguration.StreamName, consumerConfig)
+	if subConf.StreamConfiguration != nil {
+		consumer, err := p.createOrUpdateDurableConsumer(ctx, subConf)
 		if err != nil {
 			log.Error("creating or updating consumer", zap.Error(err))
-			return datasource.NewError(fmt.Sprintf(`failed to create or update consumer for stream "%s"`, event.StreamConfiguration.StreamName), err)
+			return datasource.NewError(
+				fmt.Sprintf(`failed to create or update consumer for stream "%s"`, subConf.StreamConfiguration.StreamName), err,
+			)
 		}
 
-		p.closeWg.Add(1)
-
-		go func() {
-
-			defer p.closeWg.Done()
-
+		p.closeWg.Go(func() {
 			for {
 				select {
 				case <-p.ctx.Done():
@@ -130,9 +129,36 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEvent
 					}
 
 					for msg := range msgBatch.Messages() {
+						// The durable consumer is shared across every subscription to these subjects
+						// and outlives any single subscription. A FetchNoWait batch can therefore still
+						// be in flight when this subscription is cancelled (e.g. the client sent
+						// "complete" and immediately re-subscribed). If we delivered and acked here we
+						// would advance the durable's ack floor for a message no live subscriber
+						// received, silently losing it for the next subscriber. Instead, leave the
+						// message pending via Nak so it is redelivered to whichever subscription
+						// consumes the durable next.
+						if ctx.Err() != nil || p.ctx.Err() != nil {
+							if nakErr := msg.Nak(); nakErr != nil {
+								log.Debug("negative-acknowledging message after subscription cancellation", zap.String("message_subject", msg.Subject()), zap.Error(nakErr))
+							}
+							continue
+						}
+
 						log.Debug("subscription update", zap.String("message_subject", msg.Subject()), zap.ByteString("data", msg.Data()))
 
-						updater.Update(msg.Data())
+						p.streamMetricStore.Consume(p.ctx, metric.StreamsEvent{
+							ProviderId:          subConf.ProviderID(),
+							StreamOperationName: natsReceive,
+							ProviderType:        metric.ProviderTypeNats,
+							DestinationName:     msg.Subject(),
+						})
+
+						updater.Update([]datasource.StreamEvent{
+							&Event{evt: &MutableEvent{
+								Data:    msg.Data(),
+								Headers: map[string][]string(msg.Headers()),
+							}},
+						})
 
 						// Acknowledge the message after it has been processed
 						ackErr := msg.Ack()
@@ -142,16 +168,15 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEvent
 						}
 					}
 				}
-
 			}
-		}()
+		})
 
 		return nil
 	}
 
 	msgChan := make(chan *nats.Msg)
-	subscriptions := make([]*nats.Subscription, len(event.Subjects))
-	for i, subject := range event.Subjects {
+	subscriptions := make([]*nats.Subscription, len(subConf.Subjects))
+	for i, subject := range subConf.Subjects {
 		subscription, err := p.client.ChanSubscribe(subject, msgChan)
 		if err != nil {
 			log.Error("subscribing to NATS subject", zap.Error(err), zap.String("subscription_subject", subject))
@@ -160,16 +185,30 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEvent
 		subscriptions[i] = subscription
 	}
 
-	p.closeWg.Add(1)
+	// Flush ensures the SUB commands are delivered to the NATS server before returning,
+	// so that publishers can immediately target these subjects without missing messages.
+	if err := p.client.Flush(); err != nil {
+		log.Error("flushing NATS connection after subscribe", zap.Error(err))
+		return datasource.NewError("failed to flush NATS connection", err)
+	}
 
-	go func() {
-		defer p.closeWg.Done()
-
+	p.closeWg.Go(func() {
 		for {
 			select {
 			case msg := <-msgChan:
 				log.Debug("subscription update", zap.String("message_subject", msg.Subject), zap.ByteString("data", msg.Data))
-				updater.Update(msg.Data)
+				p.streamMetricStore.Consume(p.ctx, metric.StreamsEvent{
+					ProviderId:          subConf.ProviderID(),
+					StreamOperationName: natsReceive,
+					ProviderType:        metric.ProviderTypeNats,
+					DestinationName:     msg.Subject,
+				})
+				updater.Update([]datasource.StreamEvent{
+					&Event{evt: &MutableEvent{
+						Data:    msg.Data,
+						Headers: map[string][]string(msg.Header),
+					}},
+				})
 			case <-p.ctx.Done():
 				// When the application context is done, we stop the subscriptions
 				for _, subscription := range subscriptions {
@@ -192,59 +231,127 @@ func (p *ProviderAdapter) Subscribe(ctx context.Context, event SubscriptionEvent
 				return
 			}
 		}
-	}()
+	})
 
 	return nil
 }
 
-func (p *ProviderAdapter) Publish(_ context.Context, event PublishAndRequestEventConfiguration) error {
+func (p *ProviderAdapter) Publish(ctx context.Context, conf datasource.PublishEventConfiguration, events []datasource.StreamEvent) error {
+	pubConf, ok := conf.(*PublishAndRequestEventConfiguration)
+	if !ok {
+		return datasource.NewError("publish event not support by nats provider", nil)
+	}
+
 	log := p.logger.With(
-		zap.String("provider_id", event.ProviderID),
+		zap.String("provider_id", pubConf.ProviderID()),
 		zap.String("method", "publish"),
-		zap.String("subject", event.Subject),
+		zap.String("subject", pubConf.Subject),
 	)
 
 	if p.client == nil {
 		return datasource.NewError("nats client not initialized", nil)
 	}
 
-	log.Debug("publish", zap.ByteString("data", event.Data))
+	log.Debug("publish", zap.Int("event_count", len(events)))
 
-	err := p.client.Publish(event.Subject, event.Data)
-	if err != nil {
-		log.Error("publish error", zap.Error(err))
-		return datasource.NewError(fmt.Sprintf("error publishing to NATS subject %s", event.Subject), err)
+	var errs []error
+
+	for _, streamEvent := range events {
+		natsEvent, err := castToMutableEvent(streamEvent)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		err = p.client.Publish(pubConf.Subject, natsEvent.Data)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Produce metrics for all failed and successfully published events
+	successCount := len(events) - len(errs)
+	for range successCount {
+		p.streamMetricStore.Produce(ctx, metric.StreamsEvent{
+			ProviderId:          pubConf.ProviderID(),
+			StreamOperationName: natsPublish,
+			ProviderType:        metric.ProviderTypeNats,
+			DestinationName:     pubConf.Subject,
+		})
+	}
+	for range len(errs) {
+		p.streamMetricStore.Produce(ctx, metric.StreamsEvent{
+			ProviderId:          pubConf.ProviderID(),
+			StreamOperationName: natsPublish,
+			ProviderType:        metric.ProviderTypeNats,
+			ErrorType:           "publish_error",
+			DestinationName:     pubConf.Subject,
+		})
+	}
+
+	// Collect and return all errors if any occurred
+	if len(errs) > 0 {
+		combinedErr := errors.Join(errs...)
+		log.Error("publish errors", zap.Error(combinedErr), zap.Int("failed_count", len(errs)), zap.Int("total_count", len(events)))
+		return datasource.NewError(
+			fmt.Sprintf("error publishing %d/%d events to NATS subject %s", len(errs), len(events), pubConf.Subject), combinedErr,
+		)
 	}
 
 	return nil
 }
 
-func (p *ProviderAdapter) Request(ctx context.Context, event PublishAndRequestEventConfiguration, w io.Writer) error {
+func (p *ProviderAdapter) Request(ctx context.Context, cfg datasource.PublishEventConfiguration, event datasource.StreamEvent) ([]byte, error) {
+	reqConf, ok := cfg.(*PublishAndRequestEventConfiguration)
+	if !ok {
+		return nil, datasource.NewError("publish event not support by nats provider", nil)
+	}
+
 	log := p.logger.With(
-		zap.String("provider_id", event.ProviderID),
+		zap.String("provider_id", cfg.ProviderID()),
 		zap.String("method", "request"),
-		zap.String("subject", event.Subject),
+		zap.String("subject", reqConf.Subject),
 	)
 
 	if p.client == nil {
-		return datasource.NewError("nats client not initialized", nil)
+		return nil, datasource.NewError("nats client not initialized", nil)
 	}
 
-	log.Debug("request", zap.ByteString("data", event.Data))
+	natsEvent, ok := event.Clone().(*MutableEvent)
+	if !ok {
+		return nil, datasource.NewError("invalid event type for NATS adapter", nil)
+	}
 
-	msg, err := p.client.RequestWithContext(ctx, event.Subject, event.Data)
+	log.Debug("request", zap.ByteString("data", natsEvent.Data))
+
+	msg, err := p.client.RequestWithContext(ctx, reqConf.Subject, natsEvent.Data)
 	if err != nil {
-		log.Error("request error", zap.Error(err))
-		return datasource.NewError(fmt.Sprintf("error requesting from NATS subject %s", event.Subject), err)
+		log.Error(
+			"request error",
+			zap.Error(err),
+			zap.String("provider_id", reqConf.ProviderID()),
+			zap.String("provider_type", string(reqConf.ProviderType())),
+			zap.String("field_name", reqConf.RootFieldName()),
+		)
+		p.streamMetricStore.Produce(ctx, metric.StreamsEvent{
+			ProviderId:          reqConf.ProviderID(),
+			StreamOperationName: natsRequest,
+			ProviderType:        metric.ProviderTypeNats,
+			ErrorType:           "request_error",
+			DestinationName:     reqConf.Subject,
+		})
+		return nil, datasource.NewError(fmt.Sprintf("error requesting from NATS subject %s", reqConf.Subject), err)
 	}
 
-	_, err = w.Write(msg.Data)
-	if err != nil {
-		log.Error("error writing response to writer", zap.Error(err))
-		return err
-	}
+	p.streamMetricStore.Produce(ctx, metric.StreamsEvent{
+		ProviderId:          reqConf.ProviderID(),
+		StreamOperationName: natsRequest,
+		ProviderType:        metric.ProviderTypeNats,
+		DestinationName:     reqConf.Subject,
+	})
 
-	return err
+	// We don't collect metrics on err here as it's an error related to the writer
+	return msg.Data, nil
 }
 
 func (p *ProviderAdapter) flush(ctx context.Context) error {
@@ -283,6 +390,10 @@ func (p *ProviderAdapter) Shutdown(ctx context.Context) error {
 
 	var shutdownErr error
 
+	if p.consumerConfig.deleteOnShutdown {
+		p.deleteDurableConsumers(ctx)
+	}
+
 	fErr := p.flush(ctx)
 	if fErr != nil {
 		shutdownErr = errors.Join(shutdownErr, fErr)
@@ -292,6 +403,10 @@ func (p *ProviderAdapter) Shutdown(ctx context.Context) error {
 	if drainErr != nil {
 		shutdownErr = errors.Join(shutdownErr, drainErr)
 	}
+
+	// Close the client
+	p.client.Close()
+	p.cancel()
 
 	// Wait for all subscriptions to be closed
 	p.closeWg.Wait()
@@ -303,19 +418,111 @@ func (p *ProviderAdapter) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func NewAdapter(ctx context.Context, logger *zap.Logger, url string, opts []nats.Option, hostName string, routerListenAddr string) (Adapter, error) {
+// createOrUpdateDurableConsumer creates or updates the durable consumer on the nats server,
+// based on configuration settings from the adapter and subConf.
+// It computes the consumer name, adds or updates the consumer on the nats server and
+// keeps track of added consumers for later deletion.
+func (p *ProviderAdapter) createOrUpdateDurableConsumer(ctx context.Context, subConf *SubscriptionEventConfiguration) (jetstream.Consumer, error) {
+	if p.js == nil {
+		return nil, nil
+	}
+
+	durableConsumerName, err := p.getDurableConsumerName(subConf.StreamConfiguration.Consumer, subConf.Subjects)
+	if err != nil {
+		return nil, fmt.Errorf("compute consumer name: %w", err)
+	}
+	consumerConfig := jetstream.ConsumerConfig{
+		Durable:        durableConsumerName,
+		FilterSubjects: subConf.Subjects,
+	}
+	// Durable consumers are removed automatically only if the InactiveThreshold value is set
+	if subConf.StreamConfiguration.ConsumerInactiveThreshold > 0 {
+		consumerConfig.InactiveThreshold = time.Duration(subConf.StreamConfiguration.ConsumerInactiveThreshold) * time.Second
+	}
+
+	consumer, err := p.js.CreateOrUpdateConsumer(ctx, subConf.StreamConfiguration.StreamName, consumerConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create or update consumer on nats: %w", err)
+	}
+
+	// Track newly created durable consumer so we can later delete them, if it's necessary.
+	if p.consumerConfig.deleteOnShutdown {
+		p.consumerConfig.trackedConsumers.Store(durableConsumerName, subConf.StreamConfiguration.StreamName)
+	}
+
+	return consumer, nil
+}
+
+// deleteDurableConsumers deletes all durable consumers used by this router instance from the nats server.
+func (p *ProviderAdapter) deleteDurableConsumers(ctx context.Context) {
+	if p.js == nil {
+		return
+	}
+
+	p.consumerConfig.trackedConsumers.Range(func(key, value any) bool {
+		consumerName, ok := key.(string)
+		if !ok {
+			// skip this odd element, should not happen in reality
+			return true
+		}
+
+		streamName, ok := value.(string)
+		if !ok {
+			// skip this odd element, should not happen in reality
+			return true
+		}
+
+		err := p.js.DeleteConsumer(ctx, streamName, consumerName)
+		if err != nil {
+			p.logger.Warn("failed to delete durable consumer on shutdown",
+				zap.String("stream", streamName),
+				zap.String("consumer", consumerName),
+				zap.Error(err),
+			)
+		}
+
+		return true
+	})
+}
+
+func NewAdapter(ctx context.Context, logger *zap.Logger, url string, opts []nats.Option, hostName string, routerListenAddr string, deleteConsumersOnShutdown bool, providerOpts datasource.ProviderOpts) (Adapter, error) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 
+	var store metric.StreamMetricStore
+	if providerOpts.StreamMetricStore != nil {
+		store = providerOpts.StreamMetricStore
+	} else {
+		store = metric.NewNoopStreamMetricStore()
+	}
+
+	ctx, cancelFunc := context.WithCancel(ctx)
+
 	return &ProviderAdapter{
-		ctx:              ctx,
-		logger:           logger.With(zap.String("pubsub", "nats")),
-		closeWg:          sync.WaitGroup{},
-		hostName:         hostName,
-		routerListenAddr: routerListenAddr,
-		url:              url,
-		opts:             opts,
-		flushTimeout:     10 * time.Second,
+		ctx:               ctx,
+		cancel:            cancelFunc,
+		logger:            logger.With(zap.String("pubsub", "nats")),
+		closeWg:           sync.WaitGroup{},
+		hostName:          hostName,
+		routerListenAddr:  routerListenAddr,
+		url:               url,
+		opts:              opts,
+		flushTimeout:      10 * time.Second,
+		streamMetricStore: store,
+		consumerConfig: consumerConfig{
+			deleteOnShutdown: deleteConsumersOnShutdown,
+		},
 	}, nil
+}
+
+func castToMutableEvent(event datasource.StreamEvent) (*MutableEvent, error) {
+	switch evt := event.(type) {
+	case *Event:
+		return evt.evt, nil
+	case *MutableEvent:
+		return evt, nil
+	default:
+		return nil, errors.New("invalid event type for NATS adapter")
+	}
 }

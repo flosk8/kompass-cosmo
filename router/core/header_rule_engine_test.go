@@ -1,1058 +1,619 @@
 package core
 
 import (
-	"context"
-	"fmt"
 	"net/http"
-	"net/http/httptest"
-	"net/url"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
-
-	"github.com/stretchr/testify/require"
-	"github.com/wundergraph/cosmo/router/internal/expr"
-	"github.com/wundergraph/cosmo/router/pkg/config"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	cachedirective "github.com/pquerna/cachecontrol/cacheobject"
+	"github.com/wundergraph/cosmo/router/pkg/config"
 )
 
-func TestPropagateHeaderRule(t *testing.T) {
-
-	t.Run("Should propagate with named header name / named", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Named:     "X-Test-1",
-					},
-					{
-						Operation: "propagate",
-						Named:     "x-teST-3",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-1", "test1")
-		clientReq.Header.Set("X-Test-2", "test2")
-		clientReq.Header.Set("X-tesT-3", "test3")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 2)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-1"))
-		assert.Empty(t, updatedClientReq.Header.Get("X-Test-2"))
-		assert.Equal(t, "test3", updatedClientReq.Header.Get("X-Test-3"))
-	})
-
-	t.Run("Should propagate repeated header names", func(t *testing.T) {
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Named:     "X-Test-1",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Add("X-Test-1", "test1")
-		clientReq.Header.Add("X-Test-1", "test2")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 1)
-		assert.Equal(t, []string{"test1", "test2"}, updatedClientReq.Header.Values("X-Test-1"))
-	})
-
-	t.Run("Should propagate based on matching regex / matching", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Matching:  "(?i)X-Test-.*",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-1", "test1")
-		clientReq.Header.Set("X-Test-2", "test2")
-		clientReq.Header.Set("Y-Test", "test3")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 2)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-1"))
-		assert.Equal(t, "test2", updatedClientReq.Header.Get("X-Test-2"))
-		assert.Empty(t, updatedClientReq.Header.Get("Y-Test"))
-	})
-
-	t.Run("Should propagate based on matching regex / matching in different case", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Matching:  "x-tEsT-.*",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("x-Test-1", "test1")
-		clientReq.Header.Set("X-tEsT-2", "test2")
-		clientReq.Header.Set("Y-Test", "test3")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 2)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-1"))
-		assert.Equal(t, "test2", updatedClientReq.Header.Get("X-Test-2"))
-		assert.Empty(t, updatedClientReq.Header.Get("Y-Test"))
-	})
-
-	t.Run("Should propagate with default value / named + default", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Named:     "X-Test-1",
-						Default:   "default",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 1)
-		assert.Equal(t, "default", updatedClientReq.Header.Get("X-Test-1"))
-	})
-
-	t.Run("Should not propagate as disallowed headers / named", func(t *testing.T) {
-
-		rules := []*config.RequestHeaderRule{
-			{
-				Operation: "propagate",
-				Named:     "X-Test-1",
-			},
-		}
-
-		for _, name := range ignoredHeaders {
-			rules = append(rules, &config.RequestHeaderRule{
-				Operation: "propagate",
-				Named:     name,
-			})
-		}
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: rules,
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-1", "test1")
-
-		for i, name := range ignoredHeaders {
-			clientReq.Header.Set(name, fmt.Sprintf("test-%d", i))
-		}
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 1)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-1"))
-
-	})
-
-	t.Run("Should handle nil responses", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-		resp := ht.OnOriginResponse(nil, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-		require.Nil(t, resp)
-	})
+// writeHeaderSourceFile writes contents to a fresh temp file and returns its path.
+// Used by FromFile header rule tests.
+func writeHeaderSourceFile(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "header-source")
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+	return path
 }
 
-func TestRenamePropagateHeaderRule(t *testing.T) {
+func TestCreateMostRestrictivePolicy(t *testing.T) {
+	t.Parallel()
 
-	t.Run("Rename header / named", func(t *testing.T) {
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Named:     "X-Test-1",
-						Rename:    "X-Test-Renamed",
-					},
-					{
-						Operation: "propagate",
-						Named:     "X-teST-cASE-insensitive",
-						Rename:    "X-Test-case-not-sensitive",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-1", "test1")
-		clientReq.Header.Set("X-Test-2", "test2")
-		clientReq.Header.Set("X-Test-Case-Insensitive", "test3")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 2)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-Renamed"))
-		assert.Empty(t, updatedClientReq.Header.Get("X-Test-1"))
-		assert.Empty(t, updatedClientReq.Header.Get("X-Test-2"))
-		assert.Equal(t, "test3", updatedClientReq.Header.Get("X-Test-Case-Not-Sensitive"))
-	})
-
-	t.Run("Rename based on matching regex pattern / matching", func(t *testing.T) {
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: []*config.RequestHeaderRule{
-					{
-						Operation: "propagate",
-						Matching:  "(?i)X-Test-.*",
-						Rename:    "X-Test-Renamed-1",
-					},
-					{
-						Operation: "propagate",
-						Matching:  "x-testcase-in.*",
-						Rename:    "X-Test-Renamed-Case",
-					},
-					{
-						Operation: "propagate",
-						Matching:  "(?i)X-Test-Default-.*",
-						Rename:    "X-Test-Renamed-Default-2",
-						Default:   "default",
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-1", "test1")
-		clientReq.Header.Set("X-Test-Default-2", "")
-		clientReq.Header.Set("x-TESTCASE-INSENSITIVE", "test3")
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 3)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-Renamed-1"))
-		assert.Equal(t, "default", updatedClientReq.Header.Get("X-Test-Renamed-Default-2"))
-		assert.Equal(t, "test3", updatedClientReq.Header.Get("X-Test-Renamed-Case"))
-		assert.Empty(t, updatedClientReq.Header.Get("X-Test-1"))
-		assert.Empty(t, updatedClientReq.Header.Get("X-Test-2"))
-	})
-
-	t.Run("Should not rename to disallowed headers / named", func(t *testing.T) {
-
-		rules := []*config.RequestHeaderRule{
-			{
-				Operation: "propagate",
-				Named:     "X-Test-Old",
-				Rename:    "X-Test-Renamed",
-			},
-		}
-
-		for _, name := range ignoredHeaders {
-			rules = append(rules, &config.RequestHeaderRule{
-				Operation: "propagate",
-				Named:     fmt.Sprintf("X-Test-%s", name),
-				Rename:    name,
-			})
-		}
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			All: &config.GlobalHeaderRule{
-				Request: rules,
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Old", "test1")
-
-		for i, name := range ignoredHeaders {
-			clientReq.Header.Set(fmt.Sprintf("X-Test-%s", name), fmt.Sprintf("X-Test-%d", i))
-		}
-
-		originReq, err := http.NewRequest("POST", "http://localhost", nil)
-		assert.Nil(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver(nil),
-		})
-
-		assert.Len(t, updatedClientReq.Header, 1)
-		assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-Renamed"))
-	})
-}
-
-func TestSkipAllIgnoredHeaders(t *testing.T) {
-
-	ht, err := NewHeaderPropagation(&config.HeaderRules{
-		All: &config.GlobalHeaderRule{
-			Request: []*config.RequestHeaderRule{
-				{
-					Operation: "propagate",
-					Matching:  "(?i).*",
-				},
-			},
+	tests := []struct {
+		name           string
+		policies       []*cachedirective.Object
+		expectedHeader string
+	}{
+		{
+			name:           "empty policies",
+			policies:       []*cachedirective.Object{},
+			expectedHeader: "",
 		},
-	})
-	assert.Nil(t, err)
-
-	rr := httptest.NewRecorder()
-
-	clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-	require.NoError(t, err)
-	clientReq.Header.Set("X-Test-1", "test1")
-
-	for i, header := range ignoredHeaders {
-		clientReq.Header.Set(header, fmt.Sprintf("test-%d", i))
+		{
+			name: "single policy max-age",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 60}},
+			},
+			expectedHeader: "max-age=60",
+		},
+		{
+			name: "no-store short-circuits",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{NoStore: true}},
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 300}},
+			},
+			expectedHeader: "no-store",
+		},
+		{
+			name: "no-cache wins over max-age",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{NoCachePresent: true}},
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 300}},
+			},
+			expectedHeader: "no-cache",
+		},
+		{
+			name: "shortest max-age wins",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 600}},
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 300}},
+			},
+			expectedHeader: "max-age=300",
+		},
+		{
+			name: "private wins over public",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 300, Public: true}},
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 600, PrivatePresent: true}},
+			},
+			expectedHeader: "max-age=300, private",
+		},
+		{
+			name: "public without private",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 300, Public: true}},
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{MaxAge: 600, Public: true}},
+			},
+			expectedHeader: "max-age=300, public",
+		},
+		{
+			name: "no-cache with private",
+			policies: []*cachedirective.Object{
+				{RespDirectives: &cachedirective.ResponseCacheDirectives{NoCachePresent: true, PrivatePresent: true}},
+			},
+			expectedHeader: "no-cache, private",
+		},
 	}
 
-	originReq, err := http.NewRequest("POST", "http://localhost", nil)
-	assert.Nil(t, err)
-
-	updatedClientReq, _ := ht.OnOriginRequest(originReq, &requestContext{
-		logger:           zap.NewNop(),
-		responseWriter:   rr,
-		request:          clientReq,
-		operation:        &operationContext{},
-		subgraphResolver: NewSubgraphResolver(nil),
-	})
-
-	for _, header := range ignoredHeaders {
-		assert.Empty(t, updatedClientReq.Header.Get(header), fmt.Sprintf("header %s should be empty", header))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result, header := createMostRestrictivePolicy(tt.policies)
+			assert.Equal(t, tt.expectedHeader, header)
+			assert.NotNil(t, result)
+		})
 	}
 
-	assert.Equal(t, "test1", updatedClientReq.Header.Get("X-Test-1"))
-
-}
-
-func TestSubgraphPropagateHeaderRule(t *testing.T) {
-
-	t.Run("Should propagate set header / named", func(t *testing.T) {
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Named:     "X-Test-Subgraph",
-						},
-						{
-							Operation: "propagate",
-							Named:     "X-test-suBGraph-case",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-		clientReq.Header.Set("X-Test-Subgraph-Case", "Test-Value1")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
+	t.Run("expires header - earlier wins", func(t *testing.T) {
+		t.Parallel()
+		policies := []*cachedirective.Object{
 			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
+				RespDirectives:    &cachedirective.ResponseCacheDirectives{},
+				RespExpiresHeader: time.Now().Add(10 * time.Minute),
 			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Len(t, updatedClientReq1.Header, 2)
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph"))
-		assert.Equal(t, "Test-Value1", updatedClientReq1.Header.Get("X-Test-Subgraph-case"))
-		assert.Empty(t, updatedClientReq1.Header.Get("Test-Value"))
-	})
-
-	t.Run("Should propagate set header / matching", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Matching:  "(?i)X-Test-.*",
-						},
-						{
-							Operation: "propagate",
-							Matching:  "X-TestCASE-.*",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-		clientReq.Header.Set("X-TestCase-Subgraph", "Test-Value")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
 			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph"))
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-TestCase-Subgraph"))
-		assert.Empty(t, updatedClientReq1.Header.Get("Test-Value"))
-	})
-
-	t.Run("Should not propagate disallowed header / named", func(t *testing.T) {
-		rules := []*config.RequestHeaderRule{
-			{
-				Operation: "propagate",
-				Named:     "X-Test-Subgraph",
+				RespDirectives:    &cachedirective.ResponseCacheDirectives{},
+				RespExpiresHeader: time.Now().Add(5 * time.Minute),
 			},
 		}
-
-		for _, name := range ignoredHeaders {
-			rules = append(rules, &config.RequestHeaderRule{
-				Operation: "propagate",
-				Named:     name,
-			})
-		}
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: rules,
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-
-		for i, name := range ignoredHeaders {
-			clientReq.Header.Set(name, fmt.Sprintf("X-Test-%d", i))
-		}
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Len(t, updatedClientReq1.Header, 1)
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph"))
-		assert.Empty(t, updatedClientReq1.Header.Get("Test-Value"))
-	})
-
-	t.Run("Should not propagate disallowed headers / matching", func(t *testing.T) {
-
-		rules := []*config.RequestHeaderRule{
-			{
-				Operation: "propagate",
-				Matching:  ".*",
-			},
-		}
-
-		for _, name := range ignoredHeaders {
-			rules = append(rules, &config.RequestHeaderRule{
-				Operation: "propagate",
-				Named:     fmt.Sprintf("X-Test-%s", name),
-				Rename:    name,
-			})
-		}
-
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: rules,
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-
-		for i, name := range ignoredHeaders {
-			clientReq.Header.Set(name, fmt.Sprintf("X-Test-%d", i))
-		}
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Len(t, updatedClientReq1.Header, 1)
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph"))
-		assert.Empty(t, updatedClientReq1.Header.Get("Test-Value"))
-	})
-
-}
-
-func TestSubgraphRenamePropagateHeaderRule(t *testing.T) {
-
-	t.Run("Should rename header / named", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Named:     "X-Test-Subgraph",
-							Rename:    "X-Test-Subgraph-Renamed",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph-Renamed"))
-		assert.Empty(t, updatedClientReq1.Header.Get("X-Test-Subgraph"))
-	})
-
-	t.Run("Should fallback to default value when header value is not set / named", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Rename:    "X-Test-Subgraph-Renamed-2",
-							Named:     "X-Test-Subgraph-2",
-							Default:   "Test-Value-Default-2",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph-2", "")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Test-Value-Default-2", updatedClientReq1.Header.Get("X-Test-Subgraph-Renamed-2"))
-		assert.Empty(t, updatedClientReq1.Header.Get("X-Test-Subgraph"))
-	})
-
-	t.Run("Should rename header and don't fallback to default value when header is set / named", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Rename:    "X-Test-Subgraph-Renamed",
-							Named:     "X-Test-Subgraph",
-							Default:   "Test-Value-Default",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph-Renamed"))
-		assert.Empty(t, updatedClientReq1.Header.Get("X-Test-Subgraph"))
-	})
-
-	t.Run("Should rename headers based / matching rule", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Rename:    "X-Test-Subgraph-Renamed",
-							Matching:  "(?i)X-Test-.*",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Subgraph", "Test-Value")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Test-Value", updatedClientReq1.Header.Get("X-Test-Subgraph-Renamed"))
-		assert.Empty(t, updatedClientReq1.Header.Get("X-Test-Subgraph"))
-	})
-
-	t.Run("Should rename headers and fallback to default value when header value is not set / matching rule", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
-			Subgraphs: map[string]*config.GlobalHeaderRule{
-				"subgraph-1": {
-					Request: []*config.RequestHeaderRule{
-						{
-							Operation: "propagate",
-							Rename:    "X-Test-Subgraph-Default-Renamed",
-							Matching:  "(?i)X-Test-Default.*",
-							Default:   "Default",
-						},
-					},
-				},
-			},
-		})
-		assert.Nil(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientReq, err := http.NewRequest("POST", "http://localhost", nil)
-		require.NoError(t, err)
-		clientReq.Header.Set("X-Test-Default-Subgraph", "")
-
-		sg1Url, _ := url.Parse("http://subgraph-1.local")
-
-		subgraphResolver := NewSubgraphResolver([]Subgraph{
-			{
-				Name:      "subgraph-1",
-				Id:        "subgraph-1",
-				Url:       sg1Url,
-				UrlString: sg1Url.String(),
-			},
-		})
-
-		ctx := &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: subgraphResolver,
-		}
-
-		originReq1, err := http.NewRequest("POST", "http://subgraph-1.local", nil)
-		assert.Nil(t, err)
-		updatedClientReq1, _ := ht.OnOriginRequest(originReq1, ctx)
-
-		assert.Equal(t, "Default", updatedClientReq1.Header.Get("X-Test-Subgraph-Default-Renamed"))
-		assert.Empty(t, updatedClientReq1.Header.Get("X-Test-Default-Subgraph"))
+		result, header := createMostRestrictivePolicy(policies)
+		assert.Equal(t, "", header)
+		assert.NotNil(t, result)
+		assert.False(t, result.RespExpiresHeader.IsZero())
+		assert.True(t, result.RespExpiresHeader.Before(time.Now().Add(6*time.Minute)))
 	})
 }
 
-func TestInvalidRegex(t *testing.T) {
+func TestCreateCacheControlPolicyHeaderRules(t *testing.T) {
+	t.Parallel()
 
-	_, err := NewHeaderPropagation(&config.HeaderRules{
-		All: &config.GlobalHeaderRule{
-			Request: []*config.RequestHeaderRule{
-				{
-					Operation: "propagate",
-					Matching:  "[",
-				},
-			},
-		},
+	t.Run("disabled cache returns nil", func(t *testing.T) {
+		t.Parallel()
+		result := CreateCacheControlPolicyHeaderRules(config.CacheControlPolicy{
+			Enabled: false,
+		})
+		assert.Nil(t, result)
 	})
-	assert.Error(t, err)
+
+	t.Run("enabled cache returns global after-rule", func(t *testing.T) {
+		t.Parallel()
+		result := CreateCacheControlPolicyHeaderRules(config.CacheControlPolicy{
+			Enabled: true,
+			Value:   "max-age=300",
+		})
+		require.NotNil(t, result)
+		require.Len(t, result.All, 1)
+		assert.Equal(t, config.ResponseHeaderRuleAlgorithmMostRestrictiveCacheControl, result.All[0].Algorithm)
+		assert.Equal(t, "max-age=300", result.All[0].Default)
+		assert.Nil(t, result.Subgraphs)
+	})
+
+	t.Run("subgraph-specific cache returns per-subgraph after-rule", func(t *testing.T) {
+		t.Parallel()
+		result := CreateCacheControlPolicyHeaderRules(config.CacheControlPolicy{
+			Subgraphs: []config.SubgraphCacheControlRule{
+				{Name: "sg1", Value: "max-age=60"},
+			},
+		})
+		require.NotNil(t, result)
+		assert.Nil(t, result.All)
+		require.Contains(t, result.Subgraphs, "sg1")
+		require.Len(t, result.Subgraphs["sg1"], 1)
+		assert.Equal(t, "max-age=60", result.Subgraphs["sg1"][0].Default)
+	})
+
+	t.Run("global and subgraph rules coexist", func(t *testing.T) {
+		t.Parallel()
+		result := CreateCacheControlPolicyHeaderRules(config.CacheControlPolicy{
+			Enabled: true,
+			Value:   "max-age=300",
+			Subgraphs: []config.SubgraphCacheControlRule{
+				{Name: "sg1", Value: "max-age=60"},
+			},
+		})
+		require.NotNil(t, result)
+		require.Len(t, result.All, 1)
+		assert.Equal(t, "max-age=300", result.All[0].Default)
+		require.Contains(t, result.Subgraphs, "sg1")
+		assert.Equal(t, "max-age=60", result.Subgraphs["sg1"][0].Default)
+	})
 }
 
-func TestExpression(t *testing.T) {
-	t.Run("Should return error when expression is invalid", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
+func TestApplyResponseRuleKeyValue(t *testing.T) {
+	t.Parallel()
+
+	newPropagation := func() *responseHeaderPropagation {
+		return &responseHeaderPropagation{
+			header: make(http.Header),
+			m:      &sync.Mutex{},
+		}
+	}
+
+	// We need a minimal HeaderPropagation to call the method
+	hp := &HeaderPropagation{}
+
+	t.Run("first write sets initial value", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmFirstWrite}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"first"})
+		assert.Equal(t, []string{"first"}, prop.header.Values("X-Test"))
+	})
+
+	t.Run("first write ignores second value", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmFirstWrite}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"first"})
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"second"})
+		assert.Equal(t, []string{"first"}, prop.header.Values("X-Test"))
+	})
+
+	t.Run("last write overwrites", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmLastWrite}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"first"})
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"second"})
+		assert.Equal(t, []string{"second"}, prop.header.Values("X-Test"))
+	})
+
+	t.Run("append accumulates values", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmAppend}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"a"})
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"b", "c"})
+		assert.Equal(t, []string{"a,b,c"}, prop.header.Values("X-Test"))
+	})
+
+	t.Run("append to empty header", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmAppend}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "X-Test", []string{"only"})
+		assert.Equal(t, []string{"only"}, prop.header.Values("X-Test"))
+	})
+
+	t.Run("append with Set-Cookie preserves multiple header lines", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{Algorithm: config.ResponseHeaderRuleAlgorithmAppend}
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "Set-Cookie", []string{"a=1; Path=/"})
+		hp.applyResponseRuleKeyValue(nil, prop, rule, "Set-Cookie", []string{"b=2; Path=/"})
+		// Set-Cookie must NOT be comma-joined (RFC 6265)
+		assert.Equal(t, []string{"a=1; Path=/", "b=2; Path=/"}, prop.header.Values("Set-Cookie"))
+	})
+}
+
+func TestApplyResponseRuleSetWritesToSubgraphResponse(t *testing.T) {
+	t.Parallel()
+
+	newPropagation := func() *responseHeaderPropagation {
+		return &responseHeaderPropagation{
+			header: make(http.Header),
+			m:      &sync.Mutex{},
+		}
+	}
+
+	hp := &HeaderPropagation{}
+
+	t.Run("set writes to subgraph response header, not propagation header", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		res := &http.Response{Header: make(http.Header)}
+		rule := &config.ResponseHeaderRule{
+			Operation: config.HeaderRuleOperationSet,
+			Name:      "X-Custom",
+			Value:     "test-value",
+		}
+		hp.applyResponseRule(prop, res, rule)
+		require.Equal(t, "", prop.header.Get("X-Custom"), "set should not write to propagation header")
+		require.Equal(t, "test-value", res.Header.Get("X-Custom"), "set should write to subgraph response header")
+	})
+
+	t.Run("set Cache-Control writes to subgraph response header", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		res := &http.Response{Header: make(http.Header)}
+		rule := &config.ResponseHeaderRule{
+			Operation: config.HeaderRuleOperationSet,
+			Name:      "Cache-Control",
+			Value:     "max-age=300",
+		}
+		hp.applyResponseRule(prop, res, rule)
+		require.Equal(t, "", prop.header.Get("Cache-Control"), "set should not write to propagation header")
+		require.Equal(t, "max-age=300", res.Header.Get("Cache-Control"), "set should write to subgraph response header")
+	})
+
+	t.Run("propagate still writes to propagation header", func(t *testing.T) {
+		t.Parallel()
+		prop := newPropagation()
+		rule := &config.ResponseHeaderRule{
+			Operation: config.HeaderRuleOperationPropagate,
+			Named:     "X-Custom",
+			Algorithm: config.ResponseHeaderRuleAlgorithmFirstWrite,
+		}
+		res := &http.Response{
+			Header: http.Header{"X-Custom": []string{"from-subgraph"}},
+		}
+		hp.applyResponseRule(prop, res, rule)
+		require.Equal(t, "from-subgraph", prop.header.Get("X-Custom"))
+	})
+}
+
+func TestPropagatedHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("set rule returns header name", func(t *testing.T) {
+		t.Parallel()
+		names, regexps, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationSet, Name: "X-A", Value: "v"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"X-A"}, names)
+		assert.Nil(t, regexps)
+	})
+
+	t.Run("propagate named returns name", func(t *testing.T) {
+		t.Parallel()
+		names, regexps, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationPropagate, Named: "X-B"},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"X-B"}, names)
+		assert.Nil(t, regexps)
+	})
+
+	t.Run("propagate matching returns compiled regex", func(t *testing.T) {
+		t.Parallel()
+		names, regexps, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationPropagate, Matching: "^X-.*"},
+		})
+		require.NoError(t, err)
+		assert.Nil(t, names)
+		require.Len(t, regexps, 1)
+		assert.True(t, regexps[0].Pattern.MatchString("X-Custom"))
+		assert.False(t, regexps[0].NegateMatch)
+	})
+
+	t.Run("propagate matching with negate", func(t *testing.T) {
+		t.Parallel()
+		_, regexps, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationPropagate, Matching: "^X-.*", NegateMatch: true},
+		})
+		require.NoError(t, err)
+		require.Len(t, regexps, 1)
+		assert.True(t, regexps[0].NegateMatch)
+	})
+
+	t.Run("set with empty name errors", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationSet, Name: ""},
+		})
+		require.Error(t, err)
+	})
+	t.Run("set with FromFile returns header name", func(t *testing.T) {
+		t.Parallel()
+		path := writeHeaderSourceFile(t, "secret-value")
+		names, regexps, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationSet, Name: "X-Secret", FromFile: &config.FileHeaderSource{Path: path}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"X-Secret"}, names)
+		assert.Nil(t, regexps)
+	})
+	t.Run("propagate with no name or match errors", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationPropagate},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("invalid operation errors", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: "invalid"},
+		})
+		require.Error(t, err)
+	})
+
+	t.Run("invalid regex errors", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := PropagatedHeaders([]*config.RequestHeaderRule{
+			{Operation: config.HeaderRuleOperationPropagate, Matching: "[invalid"},
+		})
+		require.Error(t, err)
+	})
+}
+
+func TestNewHeaderPropagation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil rules returns nil", func(t *testing.T) {
+		t.Parallel()
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), nil, nil)
+		require.NoError(t, err)
+		assert.Nil(t, hp)
+	})
+
+	t.Run("empty rules returns valid instance", func(t *testing.T) {
+		t.Parallel()
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, hp)
+	})
+
+	t.Run("invalid regex in request rule returns error", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{
+				Request: []*config.RequestHeaderRule{
+					{Operation: config.HeaderRuleOperationPropagate, Matching: "[invalid"},
+				},
+			},
+		}, nil)
+		require.Error(t, err)
+	})
+
+	t.Run("invalid regex in response rule returns error", func(t *testing.T) {
+		t.Parallel()
+		_, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{
+				Response: []*config.ResponseHeaderRule{
+					{Operation: config.HeaderRuleOperationPropagate, Matching: "[invalid"},
+				},
+			},
+		}, nil)
+		require.Error(t, err)
+	})
+
+	t.Run("nil receiver returns false for Has*Rules", func(t *testing.T) {
+		t.Parallel()
+		var hp *HeaderPropagation
+		assert.False(t, hp.HasRequestRules())
+		assert.False(t, hp.HasResponseRules())
+	})
+}
+
+func TestNewHeaderPropagation_FromFile(t *testing.T) {
+	t.Parallel()
+
+	t.Run("loads file contents into memory at startup", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "secret-token")
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
 			All: &config.GlobalHeaderRule{
 				Request: []*config.RequestHeaderRule{
 					{
-						Operation:  "propagate",
-						Expression: "invalid",
+						Operation: config.HeaderRuleOperationSet,
+						Name:      "X-Auth",
+						FromFile:  &config.FileHeaderSource{Path: path, RefreshInterval: time.Second},
 					},
 				},
 			},
-		})
-		assert.Nil(t, ht)
-		assert.Error(t, err)
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, hp)
+
+		// The buffered content must be the file's exact bytes — no trimming, no decoding.
+		content, ok := hp.fileSourceContents[path]
+		require.True(t, ok, "expected file source content to be cached under the file path")
+		assert.Equal(t, "secret-token", content.buffer.String())
 	})
 
-	t.Run("Should set header value when expression is static value", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
+	t.Run("missing file returns error", func(t *testing.T) {
+		t.Parallel()
+
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+		_, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
 			All: &config.GlobalHeaderRule{
 				Request: []*config.RequestHeaderRule{
 					{
-						Name:       "X-Test-Subgraph",
-						Operation:  "set",
-						Expression: "\"static\"",
+						Operation: config.HeaderRuleOperationSet,
+						Name:      "X-Auth",
+						FromFile:  &config.FileHeaderSource{Path: missing, RefreshInterval: time.Second},
 					},
 				},
 			},
-		})
-		assert.NotNil(t, ht)
-		assert.NoError(t, err)
-
-		rr := httptest.NewRecorder()
-
-		clientCtx := withRequestContext(context.Background(), &requestContext{})
-		clientReq, err := http.NewRequestWithContext(clientCtx, "POST", "http://localhost", nil)
-		require.NoError(t, err)
-
-		updatedClientReq, _ := ht.OnOriginRequest(clientReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver([]Subgraph{}),
-		})
-
-		assert.Equal(t, "static", updatedClientReq.Header.Get("X-Test-Subgraph"))
+		}, nil)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "does not exist")
 	})
 
-	t.Run("Should set header value when expression is from another header value", func(t *testing.T) {
-		ht, err := NewHeaderPropagation(&config.HeaderRules{
+	t.Run("multiple rules referencing the same path share one in-memory copy", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "shared-value")
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{
+				Request: []*config.RequestHeaderRule{
+					{Operation: config.HeaderRuleOperationSet, Name: "X-A", FromFile: &config.FileHeaderSource{Path: path, RefreshInterval: time.Second}},
+					{Operation: config.HeaderRuleOperationSet, Name: "X-B", FromFile: &config.FileHeaderSource{Path: path, RefreshInterval: time.Second}},
+				},
+			},
+		}, nil)
+		require.NoError(t, err)
+
+		assert.Len(t, hp.fileSourceContents, 1, "expected the file to be loaded once and shared across rules")
+	})
+
+	t.Run("zero refresh_interval is defaulted to 30s", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "x")
+		rule := &config.RequestHeaderRule{
+			Operation: config.HeaderRuleOperationSet,
+			Name:      "X-A",
+			FromFile:  &config.FileHeaderSource{Path: path},
+		}
+
+		_, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{Request: []*config.RequestHeaderRule{rule}},
+		}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, rule.FromFile.RefreshInterval, "engine must apply the 30s default for rules built outside YAML loading")
+	})
+
+	t.Run("subgraph-scoped FromFile rule is loaded", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "sg-secret")
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			Subgraphs: map[string]*config.GlobalHeaderRule{
+				"sg-1": {
+					Request: []*config.RequestHeaderRule{
+						{Operation: config.HeaderRuleOperationSet, Name: "X-Auth", FromFile: &config.FileHeaderSource{Path: path, RefreshInterval: time.Second}},
+					},
+				},
+			},
+		}, nil)
+		require.NoError(t, err)
+
+		content, ok := hp.fileSourceContents[path]
+		require.True(t, ok)
+		assert.Equal(t, "sg-secret", content.buffer.String())
+	})
+
+	t.Run("Set rule mixing Expression and FromFile skips file watcher but still compiles expression", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "file-value")
+		expression := "request.header.Get('X-Origin')"
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
 			All: &config.GlobalHeaderRule{
 				Request: []*config.RequestHeaderRule{
 					{
-						Name:       "X-Test-Header",
-						Operation:  "set",
-						Expression: "request.header.Get(\"X-Other-Header\")",
+						Operation:  config.HeaderRuleOperationSet,
+						Name:       "X-Auth",
+						Expression: expression,
+						FromFile:   &config.FileHeaderSource{Path: path, RefreshInterval: time.Second},
 					},
 				},
 			},
-		})
-		require.NotNil(t, ht)
-		assert.NoError(t, err)
-
-		rr := httptest.NewRecorder()
-
-		reqCtx := &requestContext{}
-		clientCtx := withRequestContext(context.Background(), reqCtx)
-		clientReq, err := http.NewRequestWithContext(clientCtx, "POST", "http://localhost", nil)
+		}, nil)
 		require.NoError(t, err)
-		clientReq.Header.Set("X-Other-Header", "Other-Value")
-		reqCtx.expressionContext = expr.Context{Request: expr.LoadRequest(clientReq)}
+		require.NotNil(t, hp)
 
-		updatedClientReq, _ := ht.OnOriginRequest(clientReq, &requestContext{
-			logger:           zap.NewNop(),
-			responseWriter:   rr,
-			request:          clientReq,
-			operation:        &operationContext{},
-			subgraphResolver: NewSubgraphResolver([]Subgraph{}),
-		})
+		_, watcherCreated := hp.fileSourceContents[path]
+		assert.False(t, watcherCreated, "mixed Expression+FromFile rule must not register a file source / watcher")
+		assert.Empty(t, hp.fileSourceContents, "no file source content should be cached for mixed rules")
 
-		assert.Equal(t, "Other-Value", updatedClientReq.Header.Get("X-Test-Header"))
+		_, compiled := hp.compiledRules[expression]
+		assert.True(t, compiled, "expression compilation is independent of file source validation — the expression is still compiled and wins at apply time (see applyRequestRuleToHeader)")
+	})
+
+	t.Run("Propagate rule with FromFile skips file watcher", func(t *testing.T) {
+		t.Parallel()
+
+		path := writeHeaderSourceFile(t, "ignored")
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{
+				Request: []*config.RequestHeaderRule{
+					{
+						Operation: config.HeaderRuleOperationPropagate,
+						Named:     "X-Auth",
+						FromFile:  &config.FileHeaderSource{Path: path, RefreshInterval: time.Second},
+					},
+				},
+			},
+		}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, hp)
+
+		assert.Empty(t, hp.fileSourceContents, "FromFile is only meaningful for set rules — propagate rules must not register a file source")
+	})
+
+	t.Run("missing file is not statted when rule is invalid", func(t *testing.T) {
+		t.Parallel()
+
+		// If validation didn't skip invalid rules, this would error because the file
+		// doesn't exist. NewHeaderPropagation must succeed — proving the file is never
+		// touched for mixed rules.
+		missing := filepath.Join(t.TempDir(), "never-read")
+		expression := "request.header.Get('X-Origin')"
+
+		hp, err := NewHeaderPropagation(t.Context(), zap.NewNop(), &config.HeaderRules{
+			All: &config.GlobalHeaderRule{
+				Request: []*config.RequestHeaderRule{
+					{
+						Operation:  config.HeaderRuleOperationSet,
+						Name:       "X-Auth",
+						Expression: expression,
+						FromFile:   &config.FileHeaderSource{Path: missing, RefreshInterval: time.Second},
+					},
+				},
+			},
+		}, nil)
+		require.NoError(t, err, "validation must short-circuit before os.Stat for mixed rules")
+		require.NotNil(t, hp)
+		assert.Empty(t, hp.fileSourceContents)
 	})
 }

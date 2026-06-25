@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/expr-lang/expr/file"
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
@@ -53,7 +54,7 @@ func (copyCtx Context) Clone() *Context {
 
 	query := make(map[string]string, len(copyCtx.Request.URL.Query))
 	for k, v := range copyCtx.Request.URL.Query {
-		claims[k] = v
+		query[k] = v
 	}
 	copyCtx.Request.URL.Query = query
 
@@ -78,9 +79,22 @@ type Response struct {
 }
 
 type Operation struct {
-	Name string `expr:"name"`
-	Type string `expr:"type"`
-	Hash string `expr:"hash"`
+	Sha256Hash        string        `expr:"sha256Hash"`
+	ParsingTime       time.Duration `expr:"parsingTime"`
+	Name              string        `expr:"name"`
+	Type              string        `expr:"type"`
+	PersistedID       string        `expr:"persistedId"`
+	NormalizationTime time.Duration `expr:"normalizationTime"`
+	Hash              string        `expr:"hash"`
+	QueryPlanHash     string        `expr:"queryPlanHash"`
+	ValidationTime    time.Duration `expr:"validationTime"`
+	PlanningTime      time.Duration `expr:"planningTime"`
+
+	NormalizationCacheHit          bool `expr:"normalizationCacheHit"`
+	VariablesNormalizationCacheHit bool `expr:"variablesNormalizationCacheHit"`
+	VariablesRemappingCacheHit     bool `expr:"variablesRemappingCacheHit"`
+	PersistedOperationCacheHit     bool `expr:"persistedOperationCacheHit"`
+	PlanCacheHit                   bool `expr:"planCacheHit"`
 }
 
 type Client struct {
@@ -132,7 +146,8 @@ type SubgraphResponse struct {
 }
 
 type ClientTrace struct {
-	ConnectionAcquireDuration float64 `expr:"connAcquireDuration"`
+	FetchDuration             time.Duration `expr:"fetchDuration"`
+	ConnectionAcquireDuration time.Duration `expr:"connAcquireDuration"`
 }
 
 // Subgraph Related

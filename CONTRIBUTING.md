@@ -3,20 +3,28 @@
 Before contributing to the WunderGraph Cosmo repository, please open an issue to discuss the changes you would like to make. Alternatively, you can also open a discussion in the [WunderGraph Discussions](https://github.com/wundergraph/cosmo/discussions).
 We are open to all kinds of contributions, including bug fixes, new features, and documentation improvements.
 
+This project follows the principles of the [Open Source AI Manifesto](https://human-oss.dev). Please ensure your contributions align with its principles.
+
 The following sections provide a guide on how to contribute to the WunderGraph Cosmo repository.
 
 ## Prerequisites
 
 This guide assumes you have already installed the following software:
 
-- make (should be installed on all linux / IOS systems)
-- [golang](https://go.dev/dl/) `>= 1.18`
+- make (should be installed on all Linux / MacOS systems)
+- [golang](https://go.dev/dl/) `>= 1.25`
 - [pnpm](https://pnpm.io/installation) >= 9
 - Node.js [LTS](https://nodejs.org/en/about/releases/). You can also pnpm to [install](https://pnpm.io/cli/env) Node.js.
 - [docker desktop](https://docs.docker.com/desktop/) (includes: engine, buildkit & compose) **or**:
 - [docker engine](https://docs.docker.com/engine/) with:
   - [docker buildkit](https://docs.docker.com/build/buildkit/), with optionally: [docker buildx plugin](https://docs.docker.com/build/install-buildx/)
   - [docker compose plugin](https://docs.docker.com/compose/install/#scenario-two-install-the-compose-plugin)
+
+## Other Dependencies
+
+These are not core requirements, but they are needed for certain parts of the development workflow:
+
+- [bun](https://bun.com/docs/installation): Used for building and testing TypeScript-based router plugins. Some integration tests compile Bun binaries as part of the testing process, so having Bun installed is required when working with those components.
 
 ## Monorepo
 
@@ -44,7 +52,7 @@ According to best practices, we don't commit the `go.work` or `go.work.sum` file
 ### Example
 
 ```
-go 1.23
+go 1.25
 
 use (
 	./demo
@@ -59,8 +67,8 @@ use (
 
 We use [conventionalcommits](https://www.conventionalcommits.org/en/v1.0.0-beta.2/#why-use-conventional-commits) for changelog generation and more structured commit messages.
 
-In order to enforce this standard we use a linter on pre-commit hook. This functionality is provided by [husky](https://typicode.github.io/husky/#/).
-In some setup, you have to tell husky where to find your package manager or binaries. Here is the file `.huskyrc` you have to put in your user home directory.
+If you want to enforce this standard, you can set up a pre-commit hook. This functionality is provided by [husky](https://typicode.github.io/husky/#/). Run `pnpm husky` to install pre-commit hooks which format code and check commit message format.
+In some setup, you have to tell husky where to find your package manager or binaries. Here is the file `husky.sh` which you should put in your home's configuration directory (`~/.config/husky/husky.sh`).
 
 ```bash
 export NVM_DIR=/home/starptech/.nvm
@@ -79,6 +87,10 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 
 We merge all pull requests in `squash merge` mode. You're not enforced to use [conventional commit standard](https://www.conventionalcommits.org/en/v1.0.0-beta.2/#why-use-conventional-commits) across all your commits, but it's a good practice and increase transparency. At the end it's important that the squashed commit message follow the standard.
 
+When updating your branch after a review has been requested, prefer using a merge strategy (e.g. `git merge main`) rather than rebasing. This preserves the review context and avoids force-pushes that can disrupt the review process.
+
+If you're fixing a bug, or adding a feature which is not trivial, ensure the reviewers can validate the changes manually. Add `## How to test` section to the pull request description, with individual steps that reviewer can take to test the changes. Pictures and/or videos help a lot.
+
 ## Local Development
 
 ### Prerequisites
@@ -86,8 +98,8 @@ We merge all pull requests in `squash merge` mode. You're not enforced to use [c
 - [Docker](https://docs.docker.com/get-docker/)
 - [Docker Compose V2](https://docs.docker.com/compose/install/)
 - [NodeJS LTS](https://nodejs.org/en/download/)
-- [PNPM 8+](https://pnpm.io/installation)
-- [Go 1.23+](https://golang.org/doc/install)
+- [PNPM 9+](https://pnpm.io/installation)
+- [Go 1.25+](https://golang.org/doc/install)
 - [wgc](https://www.npmjs.com/package/wgc)
 - .env/.env.local (see below)
 
@@ -158,6 +170,43 @@ We manage multiple compose files:
 - `docker-compose.yml`: The default compose file. It contains all services that are required to run the platform for development.
 - `docker-compose.full.yml`: This compose file contains the full Cosmo platform. It is used for demo and testing.
 - `docker-compose.cosmo.yml`: This compose file allows to build all Cosmo components and manage them in a single compose file. It is used for testing and releasing.
+
+### Code Coverage
+
+We use Codecov for code coverage. Code coverage is used for both PRs and also our default branch main.
+
+#### Workaround for uploading to main
+
+Codecov relies on commit hashes to map code to Codecov reports, however unfortunately we use "Squash Merge", which means that the HEAD of any merged PR is never present on main post-merge, leading to no code coverage uploaded for main (which is used as a base for comparisons).
+
+In order to circumvent this we do the following steps:
+
+- Upload Codecov reports from PR runs to GitHub as artifacts for the PR's HEAD commit
+- Upon merge we find the PR and it's HEAD commit using the GitHub rest API
+- We find the github artifact from this commit hash
+- We then upload it again, but this time it acts as if it was uploaded from main
+
+#### Adding new projects
+
+When you add a new project (i.e. a subfolder in the cosmo repository root), if you wish to add code coverage for it you can follow these steps:
+
+- Add a flag in the codecov.yaml for your project with the folder name, this is important so coverage does not get overwritten (for example if a router pr gets merged, cli coverage won't be set to empty for that commit)
+
+```yaml
+flags:
+  router:
+    paths:
+      - router
+    carryforward: true
+```
+
+- You should be running tests in ci for your project via a GH Workflow, You need to add the GH Workflow name to `codecov-post-merge.yaml`, the line you are looking for will look something like this
+
+```yaml
+workflow-paths: .github/workflows/cli-ci.yaml,.github/workflows/router-ci.yaml,
+```
+
+Ensure you add the full relative path from the cosmo repository root and it is comma-separated, e.g.: for graphqlmetrics `,.github/workflows/graphqlmetrics-ci.yaml`
 
 **Clean up a compose stack before starting another one!**
 

@@ -1,8 +1,10 @@
 import { PlainMessage } from '@bufbuild/protobuf';
 import { Span } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { ClickHouseClient } from '../../clickhouse/index.js';
+import { traced } from '../../tracing.js';
 import { timestampToNanoseconds } from './util.js';
 
+@traced
 export class TraceRepository {
   constructor(private client: ClickHouseClient) {}
 
@@ -47,6 +49,7 @@ export class TraceRepository {
         SpanAttributes['wg.router.version'] as attrRouterVersion,
         SpanAttributes['wg.operation.persisted_id'] as attrOperationPersistedId,
         SpanAttributes['wg.federated_graph.id'] as attrFederatedGraphId,
+        SpanAttributes['wg.operation.protocol'] as attrOperationProtocol,
         SpanAttributes['wg.operation.batching.is_batched'] as attrIsBatched,
         SpanAttributes['wg.operation.batching.operations_count'] as attrBatchedOperationsCount,
         SpanAttributes['wg.operation.batching.operation_index'] as attrWgBatchedOperationIndex
@@ -60,9 +63,9 @@ export class TraceRepository {
         TraceId = trace_id
         AND Timestamp >= start 
         AND Timestamp <= end
-        AND SpanAttributes['wg.organization.id'] = '${organizationID}'
-        AND SpanAttributes['wg.federated_graph.id'] = '${federatedGraphId}'
-        AND spanId = '${spanID}'
+        AND SpanAttributes['wg.organization.id'] = {organizationID:String}
+        AND SpanAttributes['wg.federated_graph.id'] = {federatedGraphId:String}
+        AND spanId = {spanID:String}
       
       UNION ALL
       
@@ -72,10 +75,10 @@ export class TraceRepository {
         AND t.TraceId = trace_id
         AND t.Timestamp >= start
         AND t.Timestamp <= end
-        AND t.SpanAttributes['wg.organization.id'] = '${organizationID}'
-        AND t.SpanAttributes['wg.federated_graph.id'] = '${federatedGraphId}'
+        AND t.SpanAttributes['wg.organization.id'] = {organizationID:String}
+        AND t.SpanAttributes['wg.federated_graph.id'] = {federatedGraphId:String}
     ),
-    '${traceID}' AS trace_id,
+    {traceID:String} AS trace_id,
     (
         SELECT min(Start)
         FROM ${this.client.database}.otel_traces_trace_id_ts
@@ -93,7 +96,14 @@ export class TraceRepository {
     SETTINGS allow_experimental_analyzer = 1
     `;
 
-    const results = await this.client.queryPromise(query);
+    const params = {
+      traceID,
+      spanID,
+      organizationID,
+      federatedGraphId,
+    };
+
+    const results = await this.client.queryPromise(query, params);
 
     if (!Array.isArray(results)) {
       return [];
@@ -136,6 +146,7 @@ export class TraceRepository {
         operationPersistedID: result.attrOperationPersistedId,
         federatedGraphID: result.attrFederatedGraphId,
         isBatched: result.attrIsBatched,
+        operationProtocol: result.attrOperationProtocol,
         batchedOperationsCount: result.attrBatchedOperationsCount,
         batchedOperationIndex: result.attrWgBatchedOperationIndex,
       },

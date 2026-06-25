@@ -10,6 +10,7 @@ import type { RouterOptions } from '../../routes.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
 import OidcProvider from '../../services/OidcProvider.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { OrganizationRepository } from '../../repositories/OrganizationRepository.js';
 
 export function updateIDPMappers(
   opts: RouterOptions,
@@ -26,12 +27,26 @@ export function updateIDPMappers(
       throw new UnauthorizedError();
     }
 
+    const orgRepo = new OrganizationRepository(logger, opts.db);
+    const oidc = await orgRepo.getFeature({ organizationId: authContext.organizationId, featureId: 'oidc' });
+    if (!oidc?.enabled) {
+      return {
+        response: {
+          code: EnumStatusCode.ERR_UPGRADE_PLAN,
+          details: `OIDC feature is not enabled for this organization.`,
+        },
+      };
+    }
+
     const oidcProvider = new OidcProvider();
     const oidcRepo = new OidcRepository(opts.db);
 
     await opts.keycloakClient.authenticateClient();
 
-    const provider = await oidcRepo.getOidcProvider({ organizationId: authContext.organizationId });
+    const provider = await oidcRepo.getOidcProviderById({
+      id: req.id,
+      organizationId: authContext.organizationId,
+    });
     if (!provider) {
       return {
         response: {

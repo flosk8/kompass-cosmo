@@ -22,7 +22,10 @@ describe('Deactivate Organization', (ctx) => {
   test('Should deactivate org and delete after scheduled', async (testContext) => {
     const { client, server, keycloakClient, realm, queues, users, authenticator, blobStorage } = await SetupTest({
       dbname,
+      enabledFeatures: ['oidc'],
     });
+    testContext.onTestFinished(() => server.close());
+
     const mainUserContext = users[TestUser.adminAliceCompanyA];
 
     const orgName = genID();
@@ -35,6 +38,8 @@ describe('Deactivate Organization', (ctx) => {
     const org = await orgRepo.bySlug(orgName);
     expect(org).toBeDefined();
 
+    await orgRepo.updateFeature({ organizationId: org!.id, id: 'oidc', enabled: true });
+
     authenticator.changeUserWithSuppliedContext({
       ...mainUserContext,
       organizationId: org!.id,
@@ -44,7 +49,7 @@ describe('Deactivate Organization', (ctx) => {
 
     const createOIDCRes = await client.createOIDCProvider({
       clientID: '123',
-      clientSecrect: '345',
+      clientSecret: '345',
       discoveryEndpoint: `http://localhost:8080/realms/${realm}/.well-known/openid-configuration`,
       mappers: [],
     });
@@ -69,6 +74,7 @@ describe('Deactivate Organization', (ctx) => {
       blobStorage,
       deleteOrganizationAuditLogsQueue: queues.deleteOrganizationAuditLogsQueue,
     });
+    testContext.onTestFinished(() => worker.close());
 
     const job = await orgRepo.deactivateOrganization({
       organizationId: org!.id,
@@ -90,20 +96,19 @@ describe('Deactivate Organization', (ctx) => {
 
     const orgAfterDeletion = await orgRepo.bySlug(orgName);
     expect(orgAfterDeletion).toBeNull();
-
-    await worker.close();
-
-    await server.close();
   });
 
   test('Should reactivate org and remove the scheduled deletion', async (testContext) => {
     const { client, server, keycloakClient, realm, queues, users, authenticator, blobStorage } = await SetupTest({
       dbname,
+      enabledFeatures: ['oidc'],
     });
+    testContext.onTestFinished(() => server.close());
+
     const mainUserContext = users[TestUser.adminAliceCompanyA];
 
     const orgName = genID();
-    await client.createOrganization({
+    const x = await client.createOrganization({
       name: orgName,
       slug: orgName,
     });
@@ -128,6 +133,7 @@ describe('Deactivate Organization', (ctx) => {
       blobStorage,
       deleteOrganizationAuditLogsQueue: queues.deleteOrganizationAuditLogsQueue,
     });
+    testContext.onTestFinished(() => deleteOrgWorker.close());
 
     await orgRepo.deactivateOrganization({
       organizationId: org!.id,
@@ -150,6 +156,7 @@ describe('Deactivate Organization', (ctx) => {
       logger: server.log,
       deleteOrganizationQueue: queues.deleteOrganizationQueue,
     });
+    testContext.onTestFinished(() => reactivateWorker.close());
 
     const reactivateJob = await queues.reactivateOrganizationQueue.addJob({
       organizationId: org!.id,
@@ -165,10 +172,5 @@ describe('Deactivate Organization', (ctx) => {
 
     const reactivatedOrg = await orgRepo.bySlug(orgName);
     expect(reactivatedOrg?.deactivation).toBeUndefined();
-
-    await deleteOrgWorker.close();
-    await reactivateWorker.close();
-
-    await server.close();
   });
 });

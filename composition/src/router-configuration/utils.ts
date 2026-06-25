@@ -1,4 +1,10 @@
-import { ConfigurationData, FieldSetConditionData, FieldSetConditionDataParams } from './types';
+import {
+  type ConfigurationData,
+  type EntityCachingConfiguration,
+  type FieldSetConditionData,
+  type FieldSetConditionDataParams,
+} from './types';
+import { type FieldName } from '../types/types';
 
 export function newFieldSetConditionData({
   fieldCoordinatesPath,
@@ -10,9 +16,21 @@ export function newFieldSetConditionData({
   };
 }
 
+export function getOrInitializeEntityCaching(configurationData: ConfigurationData): EntityCachingConfiguration {
+  if (!configurationData.entityCaching) {
+    configurationData.entityCaching = {
+      cacheInvalidateConfigurations: [],
+      cachePopulateConfigurations: [],
+      entityCacheConfigurations: [],
+    };
+  }
+
+  return configurationData.entityCaching;
+}
+
 export function newConfigurationData(isEntity: boolean, renamedTypeName: string): ConfigurationData {
   return {
-    fieldNames: new Set<string>(),
+    fieldNames: new Set<FieldName>(),
     isRootNode: isEntity,
     typeName: renamedTypeName,
   };

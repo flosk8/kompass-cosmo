@@ -3,9 +3,12 @@ import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import * as schema from '../../db/schema.js';
 import { NamespaceDTO } from '../../types/index.js';
 import { RBACEvaluator } from '../services/RBACEvaluator.js';
+import { traced } from '../tracing.js';
+import { applyIdpNamespaceGate } from '../util.js';
 
 export const DefaultNamespace = 'default';
 
+@traced
 export class NamespaceRepository {
   constructor(
     private db: PostgresJsDatabase<typeof schema>,
@@ -34,6 +37,7 @@ export class NamespaceRepository {
       enableCacheWarmer: namespace.namespaceConfig?.enableCacheWarming ?? false,
       checksTimeframeInDays: namespace.namespaceConfig?.checksTimeframeInDays || undefined,
       enableProposals: namespace.namespaceConfig?.enableProposals ?? false,
+      enableSubgraphCheckExtensions: namespace.namespaceConfig?.enableSubgraphCheckExtensions ?? false,
     };
   }
 
@@ -59,6 +63,7 @@ export class NamespaceRepository {
       enableCacheWarmer: namespace.namespaceConfig?.enableCacheWarming ?? false,
       checksTimeframeInDays: namespace.namespaceConfig?.checksTimeframeInDays || undefined,
       enableProposals: namespace.namespaceConfig?.enableProposals ?? false,
+      enableSubgraphCheckExtensions: namespace.namespaceConfig?.enableSubgraphCheckExtensions ?? false,
     };
   }
 
@@ -113,12 +118,22 @@ export class NamespaceRepository {
       .where(and(eq(schema.namespaces.name, data.name), eq(schema.namespaces.organizationId, this.organizationId)));
   }
 
+  /**
+   * Returns `false` when the actor has no access (caller should short-circuit
+   * to an empty list). Returns `true` after pushing any required filtering
+   * conditions onto the supplied array.
+   */
   private async applyRbacConditionsToQuery(
     rbac: RBACEvaluator | undefined,
     conditions: (SQL<unknown> | undefined)[],
-  ): Promise<void> {
+  ): Promise<boolean> {
+    // Apply the IdP gate regardless of RBAC level (org viewer/admin still gated by login method).
+    if (!applyIdpNamespaceGate(rbac, schema.namespaces.id, conditions)) {
+      return false;
+    }
+
     if (!rbac || rbac.isOrganizationViewer) {
-      return;
+      return true;
     }
 
     const namespaceAdmin = rbac.ruleFor('namespace-admin');
@@ -131,7 +146,7 @@ export class NamespaceRepository {
       // The actor have access to every resource
       (rbac.namespaces.length === 0 && rbac.resources.length === 0)
     ) {
-      return;
+      return true;
     }
 
     const namespacesBasedOnResources: string[] = [];
@@ -150,12 +165,16 @@ export class NamespaceRepository {
     } else {
       conditions.push(inArray(schema.namespaces.id, [...new Set([...rbac.namespaces, ...namespacesBasedOnResources])]));
     }
+
+    return true;
   }
 
   public async list(rbac?: RBACEvaluator) {
     const conditions: (SQL<unknown> | undefined)[] = [eq(schema.namespaces.organizationId, this.organizationId)];
 
-    await this.applyRbacConditionsToQuery(rbac, conditions);
+    if (!(await this.applyRbacConditionsToQuery(rbac, conditions))) {
+      return [];
+    }
     return this.db.query.namespaces.findMany({ where: and(...conditions) });
   }
 
@@ -166,6 +185,7 @@ export class NamespaceRepository {
     enableCacheWarming?: boolean;
     checksTimeframeInDays?: number;
     enableProposals?: boolean;
+    enableSubgraphCheckExtensions?: boolean;
   }) {
     const values = {
       namespaceId: data.id,
@@ -174,6 +194,7 @@ export class NamespaceRepository {
       enableCacheWarming: data.enableCacheWarming,
       checksTimeframeInDays: data.checksTimeframeInDays,
       enableProposals: data.enableProposals,
+      enableSubgraphCheckExtensions: data.enableSubgraphCheckExtensions,
     };
 
     await this.db.insert(schema.namespaceConfig).values(values).onConflictDoUpdate({

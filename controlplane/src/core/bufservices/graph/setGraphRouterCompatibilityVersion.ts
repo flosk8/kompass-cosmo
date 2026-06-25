@@ -13,6 +13,7 @@ import { enrichLogger, getLogger, handleError } from '../../util.js';
 import { AuditLogRepository } from '../../repositories/AuditLogRepository.js';
 import { SubgraphRepository } from '../../repositories/SubgraphRepository.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function setGraphRouterCompatibilityVersion(
   opts: RouterOptions,
@@ -30,7 +31,6 @@ export function setGraphRouterCompatibilityVersion(
     }
 
     const fedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
-
     req.namespace = req.namespace || DefaultNamespace;
 
     const federatedGraph = await fedGraphRepo.byName(req.name, req.namespace);
@@ -97,6 +97,8 @@ export function setGraphRouterCompatibilityVersion(
     // If there are no subgraphs, we don't need to compose anything
     // and avoid producing a version with a composition error
     if (subgraphs.length === 0) {
+      const fedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
+      await fedGraphRepo.updateRouterCompatibilityVersion(federatedGraph.id, version);
       return {
         response: {
           code: EnumStatusCode.OK,
@@ -110,13 +112,11 @@ export function setGraphRouterCompatibilityVersion(
       };
     }
 
-    await opts.db.transaction(async (tx) => {
+    const { deploymentErrors, compositionErrors, compositionWarnings } = await opts.db.transaction(async (tx) => {
       const fedGraphRepo = new FederatedGraphRepository(logger, tx, authContext.organizationId);
-
       await fedGraphRepo.updateRouterCompatibilityVersion(federatedGraph.id, version);
 
-      const auditLogRepo = new AuditLogRepository(opts.db);
-
+      const auditLogRepo = new AuditLogRepository(tx);
       await auditLogRepo.addAuditLog({
         organizationId: authContext.organizationId,
         organizationSlug: authContext.organizationSlug,
@@ -132,53 +132,37 @@ export function setGraphRouterCompatibilityVersion(
         targetNamespaceDisplayName: federatedGraph.namespace,
       });
 
-      const composition = await fedGraphRepo.composeAndDeployGraphs({
-        federatedGraphs: [federatedGraph],
-        actorId: authContext.userId,
-        blobStorage: opts.blobStorage,
-        admissionConfig: {
-          cdnBaseUrl: opts.cdnBaseUrl,
-          webhookJWTSecret: opts.admissionWebhookJWTSecret,
-        },
-        chClient: opts.chClient!,
-      });
+      const compositionService = new CompositionService(
+        tx,
+        authContext.organizationId,
+        logger,
+        { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+        opts.blobStorage,
+        opts.chClient,
+        opts.webhookProxyUrl,
+        req.disableResolvabilityValidation,
+      );
 
-      if (composition.compositionErrors.length > 0) {
-        return {
-          response: {
-            code: EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED,
-          },
-          previousVersion: federatedGraph.routerCompatibilityVersion,
-          newVersion: federatedGraph.routerCompatibilityVersion,
-          compositionErrors: composition.compositionErrors,
-          compositionWarnings: composition.compositionWarnings,
-          deploymentErrors: composition.deploymentErrors,
-        };
-      }
-
-      if (composition.deploymentErrors.length > 0) {
-        return {
-          response: {
-            code: EnumStatusCode.ERR_DEPLOYMENT_FAILED,
-          },
-          previousVersion: federatedGraph.routerCompatibilityVersion,
-          newVersion: federatedGraph.routerCompatibilityVersion,
-          compositionErrors: composition.compositionErrors,
-          compositionWarnings: composition.compositionWarnings,
-          deploymentErrors: composition.deploymentErrors,
-        };
-      }
+      return await compositionService.composeAndDeployFederatedGraph({ actorId: authContext.userId, federatedGraph });
     });
 
     return {
       response: {
-        code: EnumStatusCode.OK,
+        code:
+          compositionErrors.length > 0
+            ? EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED
+            : deploymentErrors.length > 0
+              ? EnumStatusCode.ERR_DEPLOYMENT_FAILED
+              : EnumStatusCode.OK,
       },
       previousVersion: federatedGraph.routerCompatibilityVersion,
-      newVersion: version,
-      compositionErrors: [],
-      compositionWarnings: [],
-      deploymentErrors: [],
+      newVersion:
+        compositionErrors.length > 0 || deploymentErrors.length > 0
+          ? federatedGraph.routerCompatibilityVersion
+          : version,
+      compositionErrors,
+      compositionWarnings,
+      deploymentErrors,
     };
   });
 }

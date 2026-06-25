@@ -10,7 +10,8 @@ import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepos
 import { ProposalRepository } from '../../repositories/ProposalRepository.js';
 import { SubgraphRepository } from '../../repositories/SubgraphRepository.js';
 import type { RouterOptions } from '../../routes.js';
-import { enrichLogger, getLogger, handleError } from '../../util.js';
+import { UnauthorizedError } from '../../errors/errors.js';
+import { enrichLogger, fromProposalOriginEnum, getLogger, handleError } from '../../util.js';
 
 export function getProposal(
   opts: RouterOptions,
@@ -25,7 +26,7 @@ export function getProposal(
 
     const federatedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
     const subgraphRepo = new SubgraphRepository(logger, opts.db, authContext.organizationId);
-    const proposalRepo = new ProposalRepository(opts.db);
+    const proposalRepo = new ProposalRepository(opts.db, authContext.organizationId);
 
     const proposal = await proposalRepo.ById(req.proposalId);
     if (!proposal) {
@@ -43,10 +44,14 @@ export function getProposal(
       return {
         response: {
           code: EnumStatusCode.ERR_NOT_FOUND,
-          details: `Federated graph ${proposal.proposal.federatedGraphId} not found`,
+          details: `Federated graph of the proposal not found`,
         },
         currentSubgraphs: [],
       };
+    }
+
+    if (!authContext.rbac.hasFederatedGraphReadAccess(federatedGraph)) {
+      throw new UnauthorizedError();
     }
 
     const latestCheck = await proposalRepo.getLatestCheckForProposal(proposal.proposal.id);
@@ -89,6 +94,7 @@ export function getProposal(
         })),
         latestCheckSuccess: latestCheck?.isSuccessful || false,
         latestCheckId: latestCheck?.checkId || '',
+        origin: fromProposalOriginEnum(proposal.proposal.origin),
       }),
       currentSubgraphs,
     };

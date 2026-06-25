@@ -8,6 +8,11 @@ import (
 
 	"go.uber.org/zap"
 
+	nodev1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/node/v1"
+	"github.com/wundergraph/cosmo/router/pkg/config"
+	"github.com/wundergraph/cosmo/router/pkg/grpcconnector"
+	pubsub_datasource "github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
+
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/asttransform"
@@ -15,11 +20,6 @@ import (
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/operationreport"
-
-	nodev1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/node/v1"
-	"github.com/wundergraph/cosmo/router/pkg/config"
-	"github.com/wundergraph/cosmo/router/pkg/grpcconnector"
-	pubsub_datasource "github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
 )
 
 type ExecutorConfigurationBuilder struct {
@@ -35,6 +35,8 @@ type ExecutorConfigurationBuilder struct {
 
 	subscriptionClientOptions *SubscriptionClientOptions
 	instanceData              InstanceData
+
+	subscriptionHooks subscriptionHooks
 }
 
 type Executor struct {
@@ -69,22 +71,26 @@ func (b *ExecutorConfigurationBuilder) Build(ctx context.Context, opts *Executor
 	}
 
 	options := resolve.ResolverOptions{
-		MaxConcurrency:                     opts.RouterEngineConfig.Execution.MaxConcurrentResolvers,
-		Debug:                              opts.RouterEngineConfig.Execution.Debug.EnableResolverDebugging,
-		Reporter:                           opts.Reporter,
-		PropagateSubgraphErrors:            opts.RouterEngineConfig.SubgraphErrorPropagation.Enabled,
-		PropagateSubgraphStatusCodes:       opts.RouterEngineConfig.SubgraphErrorPropagation.PropagateStatusCodes,
-		RewriteSubgraphErrorPaths:          opts.RouterEngineConfig.SubgraphErrorPropagation.RewritePaths,
-		OmitSubgraphErrorLocations:         opts.RouterEngineConfig.SubgraphErrorPropagation.OmitLocations,
-		OmitSubgraphErrorExtensions:        opts.RouterEngineConfig.SubgraphErrorPropagation.OmitExtensions,
-		AllowedErrorExtensionFields:        opts.RouterEngineConfig.SubgraphErrorPropagation.AllowedExtensionFields,
-		AttachServiceNameToErrorExtensions: opts.RouterEngineConfig.SubgraphErrorPropagation.AttachServiceName,
-		DefaultErrorExtensionCode:          opts.RouterEngineConfig.SubgraphErrorPropagation.DefaultExtensionCode,
-		AllowedSubgraphErrorFields:         opts.RouterEngineConfig.SubgraphErrorPropagation.AllowedFields,
-		AllowAllErrorExtensionFields:       opts.RouterEngineConfig.SubgraphErrorPropagation.AllowAllExtensionFields,
-		MaxRecyclableParserSize:            opts.RouterEngineConfig.Execution.ResolverMaxRecyclableParserSize,
-		MultipartSubHeartbeatInterval:      opts.HeartbeatInterval,
-		MaxSubscriptionFetchTimeout:        opts.RouterEngineConfig.Execution.SubscriptionFetchTimeout,
+		MaxConcurrency:                         opts.RouterEngineConfig.Execution.MaxConcurrentResolvers,
+		Debug:                                  opts.RouterEngineConfig.Execution.Debug.EnableResolverDebugging,
+		Reporter:                               opts.Reporter,
+		PropagateSubgraphErrors:                opts.RouterEngineConfig.SubgraphErrorPropagation.Enabled,
+		PropagateSubgraphStatusCodes:           opts.RouterEngineConfig.SubgraphErrorPropagation.PropagateStatusCodes,
+		RewriteSubgraphErrorPaths:              opts.RouterEngineConfig.SubgraphErrorPropagation.RewritePaths,
+		OmitSubgraphErrorLocations:             opts.RouterEngineConfig.SubgraphErrorPropagation.OmitLocations,
+		OmitSubgraphErrorExtensions:            opts.RouterEngineConfig.SubgraphErrorPropagation.OmitExtensions,
+		AllowedErrorExtensionFields:            opts.RouterEngineConfig.SubgraphErrorPropagation.AllowedExtensionFields,
+		AttachServiceNameToErrorExtensions:     opts.RouterEngineConfig.SubgraphErrorPropagation.AttachServiceName,
+		DefaultErrorExtensionCode:              opts.RouterEngineConfig.SubgraphErrorPropagation.DefaultExtensionCode,
+		AllowedSubgraphErrorFields:             opts.RouterEngineConfig.SubgraphErrorPropagation.AllowedFields,
+		AllowAllErrorExtensionFields:           opts.RouterEngineConfig.SubgraphErrorPropagation.AllowAllExtensionFields,
+		MaxRecyclableParserSize:                opts.RouterEngineConfig.Execution.ResolverMaxRecyclableParserSize,
+		SubscriptionHeartbeatInterval:          opts.HeartbeatInterval,
+		MaxSubscriptionFetchTimeout:            opts.RouterEngineConfig.Execution.SubscriptionFetchTimeout,
+		PropagateFetchReasons:                  opts.RouterEngineConfig.Execution.EnableRequireFetchReasons,
+		ValidateRequiredExternalFields:         opts.RouterEngineConfig.Execution.ValidateRequiredExternalFields,
+		SetDeduplicationShardCountToGOMAXPROCS: true,
+		AllowCustomExtensionProperties:         opts.RouterEngineConfig.SubgraphExtensionPropagation.Enabled,
 	}
 
 	if opts.ApolloCompatibilityFlags.ValueCompletion.Enabled {
@@ -102,6 +108,17 @@ func (b *ExecutorConfigurationBuilder) Build(ctx context.Context, opts *Executor
 
 	if opts.ApolloRouterCompatibilityFlags.SubrequestHTTPError.Enabled {
 		options.ApolloRouterCompatibilitySubrequestHTTPError = true
+	}
+
+	if allowedFields := opts.RouterEngineConfig.SubgraphExtensionPropagation.AllowedExtensionFields; len(allowedFields) > 0 {
+		options.ResolvableOptions.AllowedSubgraphExtensions = make(map[string]struct{})
+		for _, field := range allowedFields {
+			options.ResolvableOptions.AllowedSubgraphExtensions[field] = struct{}{}
+		}
+	}
+
+	if algorithm := string(opts.RouterEngineConfig.SubgraphExtensionPropagation.Algorithm); algorithm != "" {
+		options.ResolvableOptions.ExtensionForwardingAlgorithm = resolve.MapExtensionForwardingAlgorithm(algorithm)
 	}
 
 	switch opts.RouterEngineConfig.SubgraphErrorPropagation.Mode {
@@ -211,10 +228,9 @@ func (b *ExecutorConfigurationBuilder) buildPlannerConfiguration(ctx context.Con
 		b.subgraphTrippers,
 		b.pluginHost,
 		b.logger,
-		routerEngineCfg.Execution.EnableSingleFlight,
 		routerEngineCfg.Execution.EnableNetPoll,
 		b.instanceData,
-	), b.logger)
+	), b.logger, b.subscriptionHooks)
 
 	// this generates the plan config using the data source factories from the config package
 	planConfig, providers, err := loader.Load(engineConfig, subgraphs, routerEngineCfg, pluginsEnabled)
@@ -235,6 +251,17 @@ func (b *ExecutorConfigurationBuilder) buildPlannerConfiguration(ctx context.Con
 	planConfig.MinifySubgraphOperations = routerEngineCfg.Execution.MinifySubgraphOperations
 
 	planConfig.EnableOperationNamePropagation = routerEngineCfg.Execution.EnableSubgraphFetchOperationName
+
+	planConfig.BuildFetchReasons = routerEngineCfg.Execution.EnableRequireFetchReasons || routerEngineCfg.Execution.ValidateRequiredExternalFields
+	planConfig.ValidateRequiredExternalFields = routerEngineCfg.Execution.ValidateRequiredExternalFields
+	planConfig.RelaxSubgraphOperationFieldSelectionMergingNullability = routerEngineCfg.Execution.RelaxSubgraphOperationFieldSelectionMergingNullability
+
+	// Enable cost computation when cost control is enabled
+	if routerEngineCfg.CostControl != nil && routerEngineCfg.CostControl.Enabled {
+		planConfig.ComputeCosts = true
+		planConfig.StaticCostDefaultListSize = routerEngineCfg.CostControl.EstimatedListSize
+		planConfig.IgnoreImplementingTypeWeights = routerEngineCfg.CostControl.IgnoreImplementingTypeWeights
+	}
 
 	return planConfig, providers, nil
 }

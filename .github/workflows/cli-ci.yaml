@@ -8,6 +8,7 @@ on:
       - 'shared/**/*'
       - 'composition/**/*'
       - '.github/workflows/cli-ci.yaml'
+      - '.github/actions/cli-build/action.yml'
 
 concurrency:
   group: ${{github.workflow}}-${{github.head_ref}}
@@ -33,8 +34,12 @@ jobs:
       - name: Generate code
         run: pnpm buf generate --template buf.ts.gen.yaml
 
-      - name: Check if git is not dirty after generating files
-        run: git diff --no-ext-diff --exit-code
+      - name: Generate router templates
+        run: pnpm --filter ./cli compile-templates
+
+      - uses: ./.github/actions/git-dirty-check
+        with:
+          package-name: cli
 
       - name: Build Node.js NPM Package
         run: pnpm --filter ./cli --filter ./connect --filter ./shared --filter ./composition --filter ./protographic run build
@@ -47,13 +52,26 @@ jobs:
         working-directory: cli
         run: bun test e2e
 
+      - name: Get Coverage
+        run: pnpm run --filter wgc coverage
+
+      - name: Upload Coverage to Codecov
+        uses: ./.github/actions/codecov-upload-pr
+        with:
+          artifact-name: cli-one
+          coverage-path: |
+            cli/coverage/clover.xml
+            cli/coverage/coverage-final.json
+          retention-days: 14
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+
   build_test_node_matrix:
     timeout-minutes: 10
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        node-version: ['20.x', '22.x']
+        node-version: ["22.x", "24.x"]
 
     steps:
       - uses: actions/checkout@v4

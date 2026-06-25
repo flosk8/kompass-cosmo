@@ -12,6 +12,7 @@ import {
   Unit,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { ClickHouseClient } from '../../clickhouse/index.js';
+import { traced } from '../../tracing.js';
 import {
   BaseFilters,
   ColumnMetaData,
@@ -28,6 +29,7 @@ import {
 /**
  * Repository for clickhouse analytics data
  */
+@traced
 export class AnalyticsRequestViewRepository {
   constructor(private client: ClickHouseClient) {}
 
@@ -501,7 +503,9 @@ export class AnalyticsRequestViewRepository {
     }
 
     if (client.length === 1) {
-      whereSql += `AND (${client.map((c) => `ClientName = '${c}'`).join(' OR ')})`;
+      // Add the client name as a parameter
+      queryParams.clientNameFilter = client[0];
+      whereSql += `AND ClientName = {clientNameFilter:String}`;
     }
 
     const query = `
@@ -553,7 +557,7 @@ export class AnalyticsRequestViewRepository {
     return httpStatusCodes;
   }
 
-  private getBaseFiltersForGroup = (name: AnalyticsViewGroupName) => {
+  private getBaseFiltersForGroup(name: AnalyticsViewGroupName) {
     const filters = { ...this.baseFilters };
 
     let baseFiltersForGroup: BaseFilters = {};
@@ -604,7 +608,7 @@ export class AnalyticsRequestViewRepository {
     }
 
     return baseFiltersForGroup;
-  };
+  }
 
   private getFilters(
     name: AnalyticsViewGroupName,
@@ -675,13 +679,13 @@ export class AnalyticsRequestViewRepository {
     return filters.filter((f) => allowedColumnNames.has(f.field));
   }
 
-  private getSortOrder = (id?: string, desc?: boolean) => {
+  private getSortOrder(id?: string, desc?: boolean) {
     const allowedColumns = Object.keys(this.columnMetadata);
 
     if (id && allowedColumns.includes(id)) {
       return `ORDER BY ${id} ${desc ? 'DESC' : 'ASC'}`;
     }
-  };
+  }
 
   public async getView(
     organizationId: string,
@@ -715,7 +719,9 @@ export class AnalyticsRequestViewRepository {
 
     // Important: This is the only place where we scope the data to a particular organization and graph.
     // We can only filter for data that is part of the JWT token otherwise a user could send us whatever they want.
-    const scopedSql = ` AND FederatedGraphID = '${federatedGraphId}' AND OrganizationID = '${organizationId}'`;
+    coercedQueryParams.scopedFederatedGraphId = federatedGraphId;
+    coercedQueryParams.scopedOrganizationId = organizationId;
+    const scopedSql = ` AND FederatedGraphID = {scopedFederatedGraphId:String} AND OrganizationID = {scopedOrganizationId:String}`;
 
     whereSql += scopedSql;
 

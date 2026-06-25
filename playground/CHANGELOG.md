@@ -4,6 +4,64 @@ Binaries are attached to the github release otherwise all images can be found [h
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [0.13.2](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.13.1...@wundergraph/playground@0.13.2) (2026-06-06)
+
+**Note:** Version bump only for package @wundergraph/playground
+
+## [0.13.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.13.0...@wundergraph/playground@0.13.1) (2026-05-01)
+
+**Note:** Version bump only for package @wundergraph/playground
+
+# [0.13.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.12.0...@wundergraph/playground@0.13.0) (2026-04-29)
+
+### Features
+
+* centralize TS dependency management via catalogs ([#2782](https://github.com/wundergraph/cosmo/issues/2782)) ([a6a6956](https://github.com/wundergraph/cosmo/commit/a6a69565727f01a942a16e6d560d0fedabcb531e)) (@comatory)
+
+# [0.12.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.11.1...@wundergraph/playground@0.12.0) (2026-04-24)
+
+### Features
+
+* update `lodash` and `lodash-es` ([#2780](https://github.com/wundergraph/cosmo/issues/2780)) ([bbf1e38](https://github.com/wundergraph/cosmo/commit/bbf1e38b3a346363fe742801f2982dbafb267454)) (@wilsonrivera)
+
+## [0.11.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.11.0...@wundergraph/playground@0.11.1) (2026-04-21)
+
+### Bug Fixes
+
+* formatting drift & linter in playground ([#2641](https://github.com/wundergraph/cosmo/issues/2641)) ([c7d1016](https://github.com/wundergraph/cosmo/commit/c7d10161feea2b2414f1b7642e895d46787dc1b3)) (@comatory)
+
+# [0.11.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.10.1...@wundergraph/playground@0.11.0) (2026-04-14)
+
+### Features
+
+* update packages to address high severity vulnerabilities ([#2757](https://github.com/wundergraph/cosmo/issues/2757)) ([e14c41b](https://github.com/wundergraph/cosmo/commit/e14c41bfac517c6f1ea7d9d00e85bbbdff29b4e0)) (@pepol)
+
+## [0.10.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.10.0...@wundergraph/playground@0.10.1) (2026-03-31)
+
+### Bug Fixes
+
+* pin axios to 1.13.5 across all packages ([#2713](https://github.com/wundergraph/cosmo/issues/2713)) ([9be9143](https://github.com/wundergraph/cosmo/commit/9be91435cbb595626347479c28551bd5d6a11d6f)) (@thisisnithin)
+
+# [0.10.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.9.6...@wundergraph/playground@0.10.0) (2026-03-05)
+
+### Features
+
+* add format script + optional git hooks ([#2579](https://github.com/wundergraph/cosmo/issues/2579)) ([edabd2b](https://github.com/wundergraph/cosmo/commit/edabd2bd8f775c5717ca785f16616cff6f7ae039)) (@comatory)
+
+## [0.9.6](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.9.5...@wundergraph/playground@0.9.6) (2025-11-26)
+
+### Bug Fixes
+
+* vulnerabilities by updating packages ([#2339](https://github.com/wundergraph/cosmo/issues/2339)) ([ef16299](https://github.com/wundergraph/cosmo/commit/ef16299f147ac4d01c0ca5db3c2dcc8f4f399b7b)) (@JivusAyrus)
+
+## [0.9.5](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.9.4...@wundergraph/playground@0.9.5) (2025-09-22)
+
+**Note:** Version bump only for package @wundergraph/playground
+
+## [0.9.4](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.9.3...@wundergraph/playground@0.9.4) (2025-08-15)
+
+**Note:** Version bump only for package @wundergraph/playground
+
 ## [0.9.3](https://github.com/wundergraph/cosmo/compare/@wundergraph/playground@0.9.2...@wundergraph/playground@0.9.3) (2025-07-10)
 
 ### Bug Fixes

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/ratelimit"
@@ -34,19 +35,32 @@ type CacheWarmupProcessor interface {
 type CacheWarmupConfig struct {
 	Log            *zap.Logger
 	Source         CacheWarmupSource
+	FallbackSource CacheWarmupSource
 	Workers        int
 	ItemsPerSecond int
+	ItemDelay      time.Duration
 	Timeout        time.Duration
 	Processor      CacheWarmupProcessor
 	AfterOperation func(item *CacheWarmupOperationPlanResult)
+}
+
+// Validate checks cache warmup options that can't be expressed in the JSON schema.
+// Callers should treat a non-nil error as a fatal config error and refuse to start.
+func (c *CacheWarmupConfig) Validate() error {
+	if c.ItemDelay < 0 {
+		return fmt.Errorf("the warmup config value for item_delay must not be negative, got %s", c.ItemDelay)
+	}
+	return nil
 }
 
 func WarmupCaches(ctx context.Context, cfg *CacheWarmupConfig) (err error) {
 	w := &cacheWarmup{
 		log:            cfg.Log.With(zap.String("component", "cache_warmup")),
 		source:         cfg.Source,
+		fallbackSource: cfg.FallbackSource,
 		workers:        cfg.Workers,
 		itemsPerSecond: cfg.ItemsPerSecond,
+		itemDelay:      cfg.ItemDelay,
 		timeout:        cfg.Timeout,
 		processor:      cfg.Processor,
 		afterOperation: cfg.AfterOperation,
@@ -57,12 +71,16 @@ func WarmupCaches(ctx context.Context, cfg *CacheWarmupConfig) (err error) {
 	if cfg.ItemsPerSecond < 1 {
 		w.itemsPerSecond = 0
 	}
+	if cfg.ItemDelay < 0 {
+		w.itemDelay = 0
+	}
 	if cfg.Timeout <= 0 {
 		w.timeout = time.Second * 30
 	}
 	w.log.Info("Warmup started",
 		zap.Int("workers", cfg.Workers),
 		zap.Int("items_per_second", cfg.ItemsPerSecond),
+		zap.Duration("item_delay", cfg.ItemDelay),
 		zap.Duration("timeout", cfg.Timeout),
 	)
 	start := time.Now()
@@ -92,8 +110,10 @@ func WarmupCaches(ctx context.Context, cfg *CacheWarmupConfig) (err error) {
 type cacheWarmup struct {
 	log            *zap.Logger
 	source         CacheWarmupSource
+	fallbackSource CacheWarmupSource
 	workers        int
 	itemsPerSecond int
+	itemDelay      time.Duration
 	timeout        time.Duration
 	processor      CacheWarmupProcessor
 	afterOperation func(item *CacheWarmupOperationPlanResult)
@@ -105,16 +125,22 @@ func (w *cacheWarmup) run(ctx context.Context) (int, error) {
 	defer cancel()
 
 	items, err := w.source.LoadItems(ctx, w.log)
+
+	// Try fallback if no items were loaded OR there was an error loading from main source
+	if len(items) == 0 || err != nil {
+		items, err = w.loadFromFallbackSource(ctx, err)
+	}
+
 	if err != nil {
 		return 0, err
 	}
 
 	if len(items) == 0 {
-		w.log.Debug("No items to process")
+		w.log.Info("No items to process")
 		return 0, nil
 	}
 
-	w.log.Info("Starting processing",
+	w.log.Debug("Starting processing",
 		zap.Int("items", len(items)),
 	)
 
@@ -123,7 +149,7 @@ func (w *cacheWarmup) run(ctx context.Context) (int, error) {
 	done := ctx.Done()
 	index := make(chan int, len(items))
 	defer close(index)
-	itemCompleted := make(chan struct{})
+	itemCompleted := make(chan struct{}, w.workers)
 
 	for i, item := range items {
 		if item.Client == nil {
@@ -166,8 +192,16 @@ func (w *cacheWarmup) run(ctx context.Context) (int, error) {
 						)
 					}
 
-					if err == nil && w.afterOperation != nil {
+					if err == nil && res != nil && w.afterOperation != nil {
 						w.afterOperation(res)
+					}
+
+					if w.itemDelay > 0 {
+						select {
+						case <-done:
+							return
+						case <-time.After(w.itemDelay):
+						}
 					}
 
 					select {
@@ -197,6 +231,25 @@ func (w *cacheWarmup) run(ctx context.Context) (int, error) {
 	return len(items), nil
 }
 
+func (w *cacheWarmup) loadFromFallbackSource(ctx context.Context, mainErr error) ([]*nodev1.Operation, error) {
+	if w.fallbackSource == nil {
+		return nil, mainErr
+	}
+
+	fallbackItems, err := w.fallbackSource.LoadItems(ctx, w.log)
+	if err != nil {
+		// If fallback source also failed, log the fallback error and return the original error
+		w.log.Error("Failed to load cache warmup config from fallback source", zap.Error(err))
+		return nil, mainErr
+	}
+
+	// In case we went to the fallback because the main source had an error, log the original error
+	if mainErr != nil {
+		w.log.Error("Falling back to PlanSource due to error loading cache warmup config from CDN", zap.Error(mainErr))
+	}
+	return fallbackItems, nil
+}
+
 type CacheWarmupPlanningProcessorOptions struct {
 	OperationProcessor        *OperationProcessor
 	OperationPlanner          *OperationPlanner
@@ -224,6 +277,7 @@ type CacheWarmupOperationPlanResult struct {
 	ClientName    string
 	ClientVersion string
 	PlanningTime  time.Duration
+	PlanCacheHit  bool
 }
 
 type CacheWarmupPlanningProcessor struct {
@@ -295,23 +349,21 @@ func (c *CacheWarmupPlanningProcessor) ProcessOperation(ctx context.Context, ope
 		return nil, err
 	}
 
-	_, err = k.NormalizeVariables()
+	_, _, err = k.NormalizeVariables()
 	if err != nil {
 		return nil, err
 	}
 
-	err = k.RemapVariables(c.disableVariablesRemapping)
+	_, err = k.RemapVariables(c.disableVariablesRemapping)
 	if err != nil {
 		return nil, err
 	}
+
+	// NOTE: we do not validate query complexity here, because queries come from analytics, so they should be valid
 
 	_, err = k.Validate(true, k.parsedOperation.RemapVariables, nil)
 	if err != nil {
 		return nil, err
-	}
-
-	if c.complexityLimits != nil {
-		_, _, _ = k.ValidateQueryComplexity(c.complexityLimits, k.kit.doc, c.routerSchema, k.parsedOperation.IsPersistedOperation)
 	}
 
 	planOptions := PlanOptions{
@@ -336,6 +388,7 @@ func (c *CacheWarmupPlanningProcessor) ProcessOperation(ctx context.Context, ope
 		internalHash: k.parsedOperation.InternalID,
 	}
 
+	opContext.variablesHash = k.parsedOperation.VariablesHash
 	opContext.variables, err = astjson.ParseBytes(k.parsedOperation.Request.Variables)
 	if err != nil {
 		return nil, err
@@ -355,5 +408,6 @@ func (c *CacheWarmupPlanningProcessor) ProcessOperation(ctx context.Context, ope
 		ClientName:    item.Client.Name,
 		ClientVersion: item.Client.Version,
 		PlanningTime:  time.Since(planningStart),
+		PlanCacheHit:  opContext.planCacheHit,
 	}, nil
 }

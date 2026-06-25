@@ -1,11 +1,14 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"github.com/wundergraph/cosmo/router/internal/expr"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/wundergraph/cosmo/router/internal/expr"
 
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/wundergraph/cosmo/router/internal/requestlogger"
@@ -208,7 +211,7 @@ func getCustomDynamicAttributeValue(
 	attribute *config.CustomDynamicAttribute,
 	reqContext *requestContext,
 	err any,
-) interface{} {
+) any {
 	if attribute == nil || attribute.ContextField == "" {
 		return ""
 	}
@@ -290,4 +293,21 @@ func getCustomDynamicAttributeValue(
 	}
 
 	return ""
+}
+
+func LogLevelHandler(r *http.Request) zapcore.Level {
+	if r == nil {
+		return zapcore.InfoLevel
+	}
+
+	reqContext := getRequestContext(r.Context())
+	if reqContext == nil {
+		return zapcore.InfoLevel
+	}
+
+	if reqContext.error != nil && !errors.Is(reqContext.error, context.Canceled) {
+		return zapcore.ErrorLevel
+	}
+
+	return zapcore.InfoLevel
 }

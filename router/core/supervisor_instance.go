@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/KimMachineGun/automemlimit/memlimit"
 	"github.com/dustin/go-humanize"
@@ -15,6 +16,7 @@ import (
 	"github.com/wundergraph/cosmo/router/pkg/logging"
 	"go.uber.org/automaxprocs/maxprocs"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // newRouter creates a new router instance.
@@ -39,7 +41,7 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 		// More details: https://tip.golang.org/doc/gc-guide#Memory_limit
 		mLimit, err := memlimit.SetGoMemLimitWithOpts(
 			memlimit.WithRatio(0.9),
-			memlimit.WithProvider(memlimit.FromCgroupHybrid),
+			memlimit.WithProvider(memlimit.FromCgroup),
 		)
 		if err == nil {
 			params.Logger.Info("GOMEMLIMIT set automatically", zap.String("limit", humanize.Bytes(uint64(mLimit))))
@@ -48,7 +50,7 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 		}
 	}
 
-	options := optionsFromResources(logger, cfg)
+	options := optionsFromResources(logger, cfg, params.ReloadPersistentState)
 	options = append(options, additionalOptions...)
 
 	authenticators, err := setupAuthenticators(ctx, logger, cfg)
@@ -57,7 +59,27 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 	}
 
 	if len(authenticators) > 0 {
-		options = append(options, WithAccessController(NewAccessController(authenticators, cfg.Authorization.RequireAuthentication)))
+		accessController, err := NewAccessController(AccessControllerOptions{
+			Authenticators:           authenticators,
+			AuthenticationRequired:   cfg.Authorization.RequireAuthentication,
+			SkipIntrospectionQueries: cfg.Authentication.IgnoreIntrospection,
+			IntrospectionSkipSecret:  cfg.IntrospectionConfig.Secret,
+			ScopeClaim:               cfg.Authentication.JWT.ScopeClaim,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("could not create access controller: %w", err)
+		}
+
+		options = append(options, WithAccessController(accessController))
+	}
+
+	if cfg.Authentication.IgnoreIntrospection && cfg.IntrospectionConfig.Secret == "" {
+		params.Logger.Warn("introspection operations are not authenticated. " +
+			"Consider setting introspection.secret configuration parameter or set authentication.ignore_introspection to false. Do not use this in production.")
+	}
+
+	if !cfg.Authentication.IgnoreIntrospection && cfg.IntrospectionConfig.Secret != "" {
+		params.Logger.Warn("introspection.secret configuration parameter is ignored because authentication.ignore_introspection is false.")
 	}
 
 	// HTTP_PROXY, HTTPS_PROXY and NO_PROXY
@@ -67,13 +89,23 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 
 	if cfg.AccessLogs.Enabled {
 		c := &AccessLogsConfig{
-			Attributes:         cfg.AccessLogs.Router.Fields,
-			SubgraphEnabled:    cfg.AccessLogs.Subgraphs.Enabled,
-			SubgraphAttributes: cfg.AccessLogs.Subgraphs.Fields,
+			Attributes:            cfg.AccessLogs.Router.Fields,
+			IgnoreQueryParamsList: cfg.AccessLogs.Router.IgnoreQueryParamsList,
+			SubgraphEnabled:       cfg.AccessLogs.Subgraphs.Enabled,
+			SubgraphAttributes:    cfg.AccessLogs.Subgraphs.Fields,
+		}
+
+		var level zapcore.Level
+		if cfg.AccessLogs.Level == "" {
+			level = zapcore.InfoLevel
+		} else {
+			if err := level.Set(strings.ToUpper(cfg.AccessLogs.Level)); err != nil {
+				return nil, fmt.Errorf("could not parse log level: %w for access logs", err)
+			}
 		}
 
 		if cfg.AccessLogs.Output.File.Enabled {
-			f, err := logging.NewLogFile(cfg.AccessLogs.Output.File.Path)
+			f, err := logging.NewLogFile(cfg.AccessLogs.Output.File.Path, os.FileMode(cfg.AccessLogs.Output.File.Mode))
 			if err != nil {
 				return nil, fmt.Errorf("could not create log file: %w", err)
 			}
@@ -83,7 +115,8 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 					BufferSize:    int(cfg.AccessLogs.Buffer.Size.Uint64()),
 					FlushInterval: cfg.AccessLogs.Buffer.FlushInterval,
 					Development:   cfg.DevelopmentMode,
-					Level:         zap.InfoLevel,
+					Level:         level,
+					StackTrace:    cfg.AccessLogs.AddStacktrace,
 					Pretty:        !cfg.JSONLog,
 				})
 				if err != nil {
@@ -91,7 +124,7 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 				}
 				c.Logger = bl.Logger
 			} else {
-				c.Logger = logging.NewZapAccessLogger(f, cfg.DevelopmentMode, !cfg.JSONLog)
+				c.Logger = logging.NewZapAccessLogger(f, level, cfg.DevelopmentMode, !cfg.JSONLog, cfg.AccessLogs.AddStacktrace)
 			}
 		} else if cfg.AccessLogs.Output.Stdout.Enabled {
 			if cfg.AccessLogs.Buffer.Enabled {
@@ -100,7 +133,8 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 					BufferSize:    int(cfg.AccessLogs.Buffer.Size.Uint64()),
 					FlushInterval: cfg.AccessLogs.Buffer.FlushInterval,
 					Development:   cfg.DevelopmentMode,
-					Level:         zap.InfoLevel,
+					Level:         level,
+					StackTrace:    cfg.AccessLogs.AddStacktrace,
 					Pretty:        !cfg.JSONLog,
 				})
 				if err != nil {
@@ -108,7 +142,7 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 				}
 				c.Logger = bl.Logger
 			} else {
-				c.Logger = logging.NewZapAccessLogger(os.Stdout, cfg.DevelopmentMode, !cfg.JSONLog)
+				c.Logger = logging.NewZapAccessLogger(os.Stdout, level, cfg.DevelopmentMode, !cfg.JSONLog, cfg.AccessLogs.AddStacktrace)
 			}
 		}
 
@@ -125,36 +159,58 @@ func newRouter(ctx context.Context, params RouterResources, additionalOptions ..
 		options = append(options, WithSelfRegistration(selfRegister))
 	}
 
-	executionConfigPath := cfg.ExecutionConfig.File.Path
+	if opt := optionFromExecutionConfig(&cfg.ExecutionConfig, cfg.RouterConfigPath); opt != nil {
+		options = append(options, opt)
+	} else {
+		options = append(options, WithConfigPollerConfig(&RouterConfigPollerConfig{
+			GraphSignKey:      cfg.Graph.SignKey,
+			PollInterval:      cfg.PollInterval,
+			PollJitter:        cfg.PollJitter,
+			ExecutionConfig:   cfg.ExecutionConfig,
+			SplitConfigPoller: cfg.SplitConfigPoller,
+		}))
+	}
+
+	return NewRouter(ctx, options...)
+}
+
+// optionFromExecutionConfig returns an Option that configures the router with the execution config.
+// It checks for both the static execution config and the manifest execution config
+// and returns the appropriate Option.
+func optionFromExecutionConfig(cfg *config.ExecutionConfig, routerConfigPath string) Option {
+	executionConfigPath := cfg.File.Path
 	if executionConfigPath == "" {
-		executionConfigPath = cfg.RouterConfigPath
+		executionConfigPath = routerConfigPath
 	}
 
 	if executionConfigPath != "" {
-		options = append(options, WithExecutionConfig(&ExecutionConfig{
-			Watch:         cfg.ExecutionConfig.File.Watch,
-			WatchInterval: cfg.ExecutionConfig.File.WatchInterval,
+		return WithExecutionConfig(&ExecutionConfig{
+			Watch:         cfg.File.Watch,
+			WatchInterval: cfg.File.WatchInterval,
 			Path:          executionConfigPath,
-		}))
-	} else {
-		options = append(options, WithConfigPollerConfig(&RouterConfigPollerConfig{
-			GraphSignKey:    cfg.Graph.SignKey,
-			PollInterval:    cfg.PollInterval,
-			PollJitter:      cfg.PollJitter,
-			ExecutionConfig: cfg.ExecutionConfig,
-		}))
+		})
 	}
 
-	return NewRouter(options...)
+	if cfg.Manifest.Path != "" {
+		return WithManifestConfig(&ManifestConfig{
+			Path:                    cfg.Manifest.Path,
+			SkipMissingFeatureFlags: cfg.Manifest.SkipMissingFeatureFlags,
+			IgnoredFeatureFlags:     cfg.Manifest.IgnoredFeatureFlags,
+			Watch:                   cfg.Manifest.Watch,
+			WatchInterval:           cfg.Manifest.WatchInterval,
+		})
+	}
+
+	return nil
 }
 
-func optionsFromResources(logger *zap.Logger, config *config.Config) []Option {
+func optionsFromResources(logger *zap.Logger, config *config.Config, reloadPersistentState *ReloadPersistentState) []Option {
 	options := []Option{
 		WithListenerAddr(config.ListenAddr),
 		WithOverrideRoutingURL(config.OverrideRoutingURL),
 		WithOverrides(config.Overrides),
 		WithLogger(logger),
-		WithIntrospection(config.IntrospectionEnabled),
+		WithIntrospection(config.IntrospectionEnabled, config.IntrospectionConfig),
 		WithQueryPlans(config.QueryPlansEnabled),
 		WithPlayground(config.PlaygroundEnabled),
 		WithGraphApiToken(config.Graph.Token),
@@ -194,9 +250,12 @@ func optionsFromResources(logger *zap.Logger, config *config.Config) []Option {
 		WithSubgraphCircuitBreakerOptions(NewSubgraphCircuitBreakerOptions(config.TrafficShaping)),
 		WithSubgraphRetryOptions(
 			config.TrafficShaping.All.BackoffJitterRetry.Enabled,
+			config.TrafficShaping.All.BackoffJitterRetry.Algorithm,
 			config.TrafficShaping.All.BackoffJitterRetry.MaxAttempts,
 			config.TrafficShaping.All.BackoffJitterRetry.MaxDuration,
 			config.TrafficShaping.All.BackoffJitterRetry.Interval,
+			config.TrafficShaping.All.BackoffJitterRetry.Expression,
+			nil,
 		),
 		WithCors(&cors.Config{
 			Enabled:          config.CORS.Enabled,
@@ -206,15 +265,7 @@ func optionsFromResources(logger *zap.Logger, config *config.Config) []Option {
 			AllowHeaders:     config.CORS.AllowHeaders,
 			MaxAge:           config.CORS.MaxAge,
 		}),
-		WithTLSConfig(&TlsConfig{
-			Enabled:  config.TLS.Server.Enabled,
-			CertFile: config.TLS.Server.CertFile,
-			KeyFile:  config.TLS.Server.KeyFile,
-			ClientAuth: &TlsClientAuthConfig{
-				CertFile: config.TLS.Server.ClientAuth.CertFile,
-				Required: config.TLS.Server.ClientAuth.Required,
-			},
-		}),
+		WithTLSConfig(config.TLS),
 		WithDevelopmentMode(config.DevelopmentMode),
 		WithTracing(TraceConfigFromTelemetry(&config.Telemetry)),
 		WithMetrics(MetricConfigFromTelemetry(&config.Telemetry)),
@@ -226,6 +277,7 @@ func optionsFromResources(logger *zap.Logger, config *config.Config) []Option {
 		WithAuthorizationConfig(&config.Authorization),
 		WithWebSocketConfiguration(&config.WebSocket),
 		WithSubgraphErrorPropagation(config.SubgraphErrorPropagation),
+		WithSubgraphExtensionPropagation(config.SubgraphExtensionPropagation),
 		WithLocalhostFallbackInsideDocker(config.LocalhostFallbackInsideDocker),
 		WithCDN(config.CDN),
 		WithEvents(config.Events),
@@ -233,8 +285,11 @@ func optionsFromResources(logger *zap.Logger, config *config.Config) []Option {
 		WithClientHeader(config.ClientHeader),
 		WithCacheWarmupConfig(&config.CacheWarmup),
 		WithMCP(config.MCP),
+		WithConnectRPC(config.ConnectRPC),
 		WithPlugins(config.Plugins),
 		WithDemoMode(config.DemoMode),
+		WithStreamsHandlerConfiguration(config.Events.Handlers),
+		WithReloadPersistentState(reloadPersistentState),
 	}
 
 	return options
@@ -255,6 +310,19 @@ func setupAuthenticators(ctx context.Context, logger *zap.Logger, cfg *config.Co
 			URL:               jwks.URL,
 			RefreshInterval:   jwks.RefreshInterval,
 			AllowedAlgorithms: jwks.Algorithms,
+			AllowedUse:        jwks.AllowedUse,
+
+			Secret:    jwks.Secret,
+			Algorithm: jwks.Algorithm,
+			KeyId:     jwks.KeyId,
+
+			Audiences: jwks.Audiences,
+			RefreshUnknownKID: authentication.RefreshUnknownKIDConfig{
+				Enabled:  jwks.RefreshUnknownKID.Enabled,
+				MaxWait:  jwks.RefreshUnknownKID.MaxWait,
+				Interval: jwks.RefreshUnknownKID.Interval,
+				Burst:    jwks.RefreshUnknownKID.Burst,
+			},
 		})
 	}
 

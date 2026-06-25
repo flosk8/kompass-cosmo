@@ -1,13 +1,15 @@
 import { ExpiresAt } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, count, eq } from 'drizzle-orm';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import * as schema from '../../db/schema.js';
 import { apiKeyPermissions, apiKeyResources, apiKeys, users } from '../../db/schema.js';
 import { APIKeyDTO } from '../../types/index.js';
+import { traced } from '../tracing.js';
 
 /**
  * Repository for organization related operations.
  */
+@traced
 export class ApiKeyRepository {
   constructor(private db: PostgresJsDatabase<typeof schema>) {}
 
@@ -19,6 +21,7 @@ export class ApiKeyRepository {
     expiresAt: ExpiresAt;
     groupId: string;
     permissions: string[];
+    isExternal: boolean;
   }) {
     let expiresAtDate: Date | undefined;
     const present = new Date();
@@ -53,6 +56,7 @@ export class ApiKeyRepository {
           name: input.name,
           organizationId: input.organizationID,
           userId: input.userID,
+          external: input.isExternal,
           groupId: input.groupId,
           expiresAt: expiresAtDate,
         })
@@ -84,9 +88,11 @@ export class ApiKeyRepository {
         name: apiKeys.name,
         createdAt: apiKeys.createdAt,
         lastUsedAt: apiKeys.lastUsedAt,
+        external: apiKeys.external,
         expiresAt: apiKeys.expiresAt,
         createdBy: users.email,
         creatorUserID: users.id,
+        groupId: apiKeys.groupId,
       })
       .from(apiKeys)
       .innerJoin(users, eq(users.id, apiKeys.userId))
@@ -103,19 +109,22 @@ export class ApiKeyRepository {
       createdAt: key[0].createdAt.toISOString(),
       lastUsedAt: key[0].lastUsedAt?.toISOString() ?? '',
       expiresAt: key[0].expiresAt?.toISOString() ?? '',
+      external: key[0].external,
       createdBy: key[0].createdBy,
       creatorUserID: key[0].creatorUserID,
+      group: { id: key[0].groupId },
     } as APIKeyDTO;
   }
 
-  public async getAPIKeys(input: { organizationID: string }): Promise<APIKeyDTO[]> {
-    const keys = await this.db
+  public async getAPIKeys(input: { organizationID: string; limit: number; offset: number }): Promise<APIKeyDTO[]> {
+    const query = this.db
       .select({
         id: apiKeys.id,
         name: apiKeys.name,
         createdAt: apiKeys.createdAt,
         lastUsedAt: apiKeys.lastUsedAt,
         expiresAt: apiKeys.expiresAt,
+        external: apiKeys.external,
         createdBy: users.email,
         groupId: schema.organizationGroups.id,
         groupName: schema.organizationGroups.name,
@@ -125,8 +134,17 @@ export class ApiKeyRepository {
       .innerJoin(users, eq(users.id, apiKeys.userId))
       .leftJoin(schema.organizationGroups, eq(schema.organizationGroups.id, apiKeys.groupId))
       .where(eq(apiKeys.organizationId, input.organizationID))
-      .orderBy(asc(apiKeys.createdAt))
-      .execute();
+      .orderBy(asc(apiKeys.createdAt));
+
+    if (input.limit) {
+      query.limit(input.limit);
+    }
+
+    if (input.offset) {
+      query.offset(input.offset);
+    }
+
+    const keys = await query.execute();
 
     return keys.map(
       ({ groupId, groupName, ...key }) =>
@@ -136,11 +154,25 @@ export class ApiKeyRepository {
           createdAt: key.createdAt.toISOString(),
           lastUsedAt: key.lastUsedAt?.toISOString() ?? '',
           expiresAt: key.expiresAt?.toISOString() ?? '',
+          external: key.external,
           group: groupId ? { id: groupId, name: groupName } : undefined,
           createdBy: key.createdBy,
           creatorUserID: key.creatorUserID,
         }) as APIKeyDTO,
     );
+  }
+
+  public async getAPIKeysCount(input: { organizationID: string; includeExternal: boolean }): Promise<number> {
+    const condition = eq(apiKeys.organizationId, input.organizationID);
+    const result = await this.db
+      .select({
+        count: count(),
+      })
+      .from(apiKeys)
+      .where(input.includeExternal ? condition : and(condition, eq(apiKeys.external, false)))
+      .execute();
+
+    return result[0]?.count ?? 0;
   }
 
   public updateAPIKeyGroup(input: { apiKeyId: string; groupId: string }) {

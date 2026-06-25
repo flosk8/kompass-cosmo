@@ -3,6 +3,7 @@ package events_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,42 +20,38 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/wundergraph/cosmo/router/pkg/config"
+	"github.com/wundergraph/cosmo/router/pkg/controlplane/configpoller"
+	"github.com/wundergraph/cosmo/router/pkg/routerconfig"
 
 	"github.com/hasura/go-graphql-client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wundergraph/cosmo/router-tests/testenv"
+	nodev1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/node/v1"
 )
 
-const NatsWaitTimeout = time.Second * 30
+var _ configpoller.ConfigPoller = (*ConfigPollerMock)(nil)
 
-func assertNatsLineEquals(t *testing.T, reader *bufio.Reader, expected string) {
-	t.Helper()
-	line, _, err := reader.ReadLine()
-	assert.NoError(t, err)
-	assert.Equal(t, expected, string(line))
+type ConfigPollerMock struct {
+	initConfig   *nodev1.RouterConfig
+	updateConfig func(newConfig *routerconfig.Response) error
+	ready        chan struct{}
 }
 
-func assertNatsMultipartPrefix(t *testing.T, reader *bufio.Reader) {
-	t.Helper()
-	assertNatsLineEquals(t, reader, "")
-	assertNatsLineEquals(t, reader, "--graphql")
-	assertNatsLineEquals(t, reader, "Content-Type: application/json")
-	assertNatsLineEquals(t, reader, "")
+func (c *ConfigPollerMock) Subscribe(_ context.Context, handler func(newConfig *routerconfig.Response) error) {
+	c.updateConfig = handler
+	close(c.ready)
 }
 
-func assertNatsMultipartValueEventually(t *testing.T, reader *bufio.Reader, expected string) {
-	t.Helper()
-	assert.Eventually(t, func() bool {
-		assertNatsMultipartPrefix(t, reader)
-		line, _, err := reader.ReadLine()
-		assert.NoError(t, err)
-		if string(line) == "{}" {
-			return false
-		}
-		assert.Equal(t, expected, string(line))
-		return true
-	}, NatsWaitTimeout, time.Millisecond*100)
+func (c *ConfigPollerMock) GetRouterConfig(_ context.Context) (*routerconfig.Response, error) {
+	result := &routerconfig.Response{
+		Config: c.initConfig,
+	}
+	return result, nil
+}
+
+func (c *ConfigPollerMock) Stop(_ context.Context) error {
+	return nil
 }
 
 type natsSubscriptionArgs struct {
@@ -106,7 +103,8 @@ func TestNatsEvents(t *testing.T) {
 				clientRunErrCh <- clientErr
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Send a mutation to trigger the first subscription
 			resOne := xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
@@ -114,7 +112,7 @@ func TestNatsEvents(t *testing.T) {
 			})
 			require.JSONEq(t, `{"data":{"updateAvailability":{"id":3}}}`, resOne.Body)
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
 				require.NoError(t, args.errValue)
 				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
 			})
@@ -126,110 +124,23 @@ func TestNatsEvents(t *testing.T) {
 			err = xEnv.NatsConnectionDefault.Flush()
 			require.NoError(t, err)
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
 				require.NoError(t, args.errValue)
 				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
 			})
 
 			require.NoError(t, client.Close())
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
 				require.NoError(t, err)
 			}, "unable to close client before timeout")
 
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
-			xEnv.WaitForConnectionCount(0, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
+			xEnv.WaitForConnectionCount(0, EventWaitTimeout)
 
 			natsLogs := xEnv.Observer().FilterMessageSnippet("Nats").All()
 			require.Len(t, natsLogs, 2)
 			providerIDFields := xEnv.Observer().FilterField(zap.String("provider_id", "my-nats")).All()
 			require.Len(t, providerIDFields, 3)
-		})
-	})
-
-	t.Run("message and resolve errors should not abort the subscription", func(t *testing.T) {
-		t.Parallel()
-
-		testenv.Run(t, &testenv.Config{
-			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
-			EnableNats:               true,
-		}, func(t *testing.T, xEnv *testenv.Environment) {
-			var subscriptionOne struct {
-				employeeUpdated struct {
-					ID      float64 `graphql:"id"`
-					Details struct {
-						Forename string `graphql:"forename"`
-						Surname  string `graphql:"surname"`
-					} `graphql:"details"`
-				} `graphql:"employeeUpdated(employeeID: 3)"`
-			}
-
-			surl := xEnv.GraphQLWebSocketSubscriptionURL()
-			client := graphql.NewSubscriptionClient(surl)
-			subscriptionArgsCh := make(chan natsSubscriptionArgs)
-
-			subscriptionOneID, err := client.Subscribe(&subscriptionOne, nil, func(dataValue []byte, errValue error) error {
-				subscriptionArgsCh <- natsSubscriptionArgs{
-					dataValue: dataValue,
-					errValue:  errValue,
-				}
-				return nil
-			})
-			require.NoError(t, err)
-			require.NotEqual(t, "", subscriptionOneID)
-
-			clientRunErrCh := make(chan error)
-
-			go func() {
-				clientErr := client.Run()
-				clientRunErrCh <- clientErr
-			}()
-
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(``)) // Empty message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
-				var gqlErr graphql.Errors
-				require.ErrorAs(t, args.errValue, &gqlErr)
-				require.Equal(t, "Invalid message received", gqlErr[0].Message)
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
-				require.NoError(t, args.errValue)
-				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","update":{"name":"foo"}}`)) // Missing id
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
-				require.ErrorContains(t, args.errValue, "Cannot return null for non-nullable field 'Subscription.employeeUpdated.id'.")
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
-				require.NoError(t, args.errValue)
-				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
-			})
-
-			require.NoError(t, client.Close())
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
-				require.NoError(t, err)
-			}, "unable to close client before timeout")
-
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
-			xEnv.WaitForConnectionCount(0, NatsWaitTimeout)
 		})
 	})
 
@@ -241,10 +152,9 @@ func TestNatsEvents(t *testing.T) {
 			EnableNats:               true,
 			ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
 				engineExecutionConfiguration.EnableNetPoll = false
-				engineExecutionConfiguration.WebSocketClientReadTimeout = time.Second
+				engineExecutionConfiguration.WebSocketServerReadTimeout = time.Second
 			},
 		}, func(t *testing.T, xEnv *testenv.Environment) {
-
 			var subscription struct {
 				employeeUpdated struct {
 					ID      float64 `graphql:"id"`
@@ -274,7 +184,8 @@ func TestNatsEvents(t *testing.T) {
 				clientRunErrCh <- client.Run()
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Send a mutation to trigger the subscription
 
@@ -293,23 +204,23 @@ func TestNatsEvents(t *testing.T) {
 			err = xEnv.NatsConnectionDefault.Flush()
 			require.NoError(t, err)
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
 				require.NoError(t, args.errValue)
 				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
 			})
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
 				require.NoError(t, args.errValue)
 				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
 			})
 
 			require.NoError(t, client.Close())
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
 				require.NoError(t, err)
 			}, "unable to close client before timeout")
 
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
-			xEnv.WaitForConnectionCount(0, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
+			xEnv.WaitForConnectionCount(0, EventWaitTimeout)
 		})
 	})
 
@@ -324,16 +235,17 @@ func TestNatsEvents(t *testing.T) {
 			testenv.Run(t, &testenv.Config{
 				RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 				RouterOptions: []core.Option{
-					core.WithMultipartHeartbeatInterval(heartbeatInterval),
+					core.WithSubscriptionHeartbeatInterval(heartbeatInterval),
 				},
 				EnableNats: true,
-				TLSConfig: &core.TlsConfig{
-					Enabled:  true,
-					CertFile: "../testdata/tls/cert.pem",
-					KeyFile:  "../testdata/tls/key.pem",
+				TLSConfig: config.TLSConfiguration{
+					Server: config.TLSServerConfiguration{
+						Enabled:  true,
+						CertFile: "../testdata/tls/cert.pem",
+						KeyFile:  "../testdata/tls/key.pem",
+					},
 				},
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { employeeUpdated(employeeID: 3) { id details { forename surname } } }"}`)
 
 				req := xEnv.MakeGraphQLMultipartRequest(http.MethodPost, bytes.NewReader(subscribePayload))
@@ -349,7 +261,8 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Send a mutation to trigger the subscription
 
@@ -358,7 +271,7 @@ func TestNatsEvents(t *testing.T) {
 				})
 				require.JSONEq(t, `{"data":{"updateAvailability":{"id":3}}}`, res.Body)
 
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}}")
 
 				// Trigger the subscription via NATS
 				err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"id":3,"__typename": "Employee"}`))
@@ -366,7 +279,7 @@ func TestNatsEvents(t *testing.T) {
 
 				err = xEnv.NatsConnectionDefault.Flush()
 				require.NoError(t, err)
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}}")
 			})
 		})
 
@@ -376,12 +289,11 @@ func TestNatsEvents(t *testing.T) {
 			testenv.Run(t, &testenv.Config{
 				RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 				EnableNats:               true,
-				TLSConfig:                nil, // Force Http/1
+				TLSConfig:                config.TLSConfiguration{}, // empty to force HTTP/1
 				RouterOptions: []core.Option{
-					core.WithMultipartHeartbeatInterval(heartbeatInterval),
+					core.WithSubscriptionHeartbeatInterval(heartbeatInterval),
 				},
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { employeeUpdated(employeeID: 3) { id details { forename surname } } }"}`)
 
 				client := &http.Client{}
@@ -396,16 +308,16 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Read the first part
-				assertNatsMultipartPrefix(t, reader)
-				assertNatsLineEquals(t, reader, "{}")
+				assertMultipartPrefix(t, reader)
+				assertLineEquals(t, reader, "{}")
 			})
 		})
 
 		t.Run("subscribe with closing channel", func(t *testing.T) {
-
 			testenv.Run(t, &testenv.Config{
 				RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 				EnableNats:               true,
@@ -421,14 +333,15 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Read the first part
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":0}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":1}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":2}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":3}}}")
-				assertNatsLineEquals(t, reader, "--graphql--")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":0}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":1}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":2}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":3}}}")
+				assertLineEquals(t, reader, "--graphql--")
 			})
 		})
 
@@ -461,7 +374,7 @@ func TestNatsEvents(t *testing.T) {
 					defer resp.Body.Close()
 					reader := bufio.NewReader(resp.Body)
 
-					assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}}")
+					assertMultipartValueEventually(t, reader, "{\"payload\":{\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}}")
 				}
 			})
 		})
@@ -480,7 +393,6 @@ func TestNatsEvents(t *testing.T) {
 				},
 				EnableNats: true,
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { countFor(count: 0) }"}`)
 
 				client := http.Client{}
@@ -492,7 +404,8 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Read the first part
 
@@ -511,7 +424,6 @@ func TestNatsEvents(t *testing.T) {
 				RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 				EnableNats:               true,
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { countFor(count: 3) }"}`)
 				client := http.Client{}
 				req := xEnv.MakeGraphQLMultipartRequest(http.MethodPost, bytes.NewReader(subscribePayload))
@@ -522,7 +434,8 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				assert.Eventually(t, func() bool {
 					allData, err := io.ReadAll(reader)
@@ -546,7 +459,7 @@ func TestNatsEvents(t *testing.T) {
 						}
 					}
 					return true
-				}, NatsWaitTimeout, time.Millisecond*100)
+				}, EventWaitTimeout, time.Millisecond*100)
 			})
 		})
 	})
@@ -568,7 +481,6 @@ func TestNatsEvents(t *testing.T) {
 				},
 				EnableNats: true,
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { countFor(count: 0) }"}`)
 
 				client := http.Client{}
@@ -580,7 +492,8 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Read the first part
 
@@ -606,7 +519,6 @@ func TestNatsEvents(t *testing.T) {
 				},
 				EnableNats: true,
 			}, func(t *testing.T, xEnv *testenv.Environment) {
-
 				subscribePayload := []byte(`{"query":"subscription { countFor(count: 3) }"}`)
 
 				client := http.Client{}
@@ -618,15 +530,16 @@ func TestNatsEvents(t *testing.T) {
 
 				reader := bufio.NewReader(resp.Body)
 
-				xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+				xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+				xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 				// Read the first part
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":0}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":1}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":2}}}")
-				assertNatsMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":3}}}")
-				assertNatsLineEquals(t, reader, "")
-				assertNatsLineEquals(t, reader, "--graphql--")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":0}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":1}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":2}}}")
+				assertMultipartValueEventually(t, reader, "{\"payload\":{\"data\":{\"countFor\":3}}}")
+				assertLineEquals(t, reader, "")
+				assertLineEquals(t, reader, "--graphql--")
 			})
 		})
 	})
@@ -638,7 +551,6 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 		}, func(t *testing.T, xEnv *testenv.Environment) {
-
 			subscribePayload := []byte(`{"query":"subscription { employeeUpdated(employeeID: 3) { id details { forename surname } } }"}`)
 
 			client := http.Client{}
@@ -653,7 +565,7 @@ func TestNatsEvents(t *testing.T) {
 			req.Header.Set("Connection", "keep-alive")
 			req.Header.Set("Cache-Control", "no-cache")
 
-			var clientDoCh = make(chan struct {
+			clientDoCh := make(chan struct {
 				resp *http.Response
 				err  error
 			})
@@ -666,7 +578,8 @@ func TestNatsEvents(t *testing.T) {
 				}{resp: resp, err: err}
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Send a mutation to trigger the subscription
 			res := xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
@@ -676,14 +589,14 @@ func TestNatsEvents(t *testing.T) {
 
 			// Wait for the client to get the response
 			var resp *http.Response
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
 				resp *http.Response
 				err  error
-			}) {
+			},
+			) {
 				require.NoError(t, clientDo.err)
 				require.Equal(t, http.StatusOK, clientDo.resp.StatusCode)
 				resp = clientDo.resp
-
 			})
 			defer resp.Body.Close()
 			reader := bufio.NewReader(resp.Body)
@@ -717,7 +630,6 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 		}, func(t *testing.T, xEnv *testenv.Environment) {
-
 			subscribePayload := []byte(`{"query":"subscription { employeeUpdated(employeeID: 3) { id details { forename surname } } }"}`)
 
 			client := http.Client{}
@@ -729,7 +641,7 @@ func TestNatsEvents(t *testing.T) {
 			req.Header.Set("Connection", "keep-alive")
 			req.Header.Set("Cache-Control", "no-cache")
 
-			var clientDoCh = make(chan struct {
+			clientDoCh := make(chan struct {
 				resp *http.Response
 				err  error
 			})
@@ -742,7 +654,8 @@ func TestNatsEvents(t *testing.T) {
 				}{resp: resp, err: err}
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Send a mutation to trigger the subscription
 			res := xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
@@ -754,10 +667,11 @@ func TestNatsEvents(t *testing.T) {
 
 			// Wait for the client to get the response
 			var resp *http.Response
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
 				resp *http.Response
 				err  error
-			}) {
+			},
+			) {
 				require.NoError(t, clientDo.err)
 				require.Equal(t, http.StatusOK, clientDo.resp.StatusCode)
 				resp = clientDo.resp
@@ -766,15 +680,10 @@ func TestNatsEvents(t *testing.T) {
 			defer resp.Body.Close()
 			reader := bufio.NewReader(resp.Body)
 
-			eventNext, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "event: next", string(eventNext))
-			data, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", string(data))
-			line, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "", string(line))
+			eventNext := testenv.ReadSSEField(t, reader)
+			require.Equal(t, "event: next", eventNext)
+			data := testenv.ReadSSEField(t, reader)
+			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", data)
 
 			// Trigger the subscription via NATS
 			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"id":3,"__typename": "Employee"}`))
@@ -783,15 +692,10 @@ func TestNatsEvents(t *testing.T) {
 			err = xEnv.NatsConnectionDefault.Flush()
 			require.NoError(t, err)
 
-			eventNext, _, err = reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "event: next", string(eventNext))
-			data, _, err = reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", string(data))
-			line, _, err = reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "", string(line))
+			eventNext = testenv.ReadSSEField(t, reader)
+			require.Equal(t, "event: next", eventNext)
+			data = testenv.ReadSSEField(t, reader)
+			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", data)
 		})
 	})
 
@@ -831,12 +735,10 @@ func TestNatsEvents(t *testing.T) {
 
 			readerOne := bufio.NewReader(respOne.Body)
 
-			eventNextOne, _, err := readerOne.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "event: next", string(eventNextOne))
-			dataOne, _, err := readerOne.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "data: {\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}", string(dataOne))
+			eventNextOne := testenv.ReadSSELine(t, readerOne)
+			require.Equal(t, "event: next", eventNextOne)
+			dataOne := testenv.ReadSSELine(t, readerOne)
+			require.Equal(t, "data: {\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}", dataOne)
 
 			reqTwo, err := http.NewRequest(http.MethodPost, xEnv.GraphQLRequestURL(), bytes.NewReader(subscribePayloadTwo))
 			require.NoError(t, err)
@@ -852,12 +754,10 @@ func TestNatsEvents(t *testing.T) {
 			defer respTwo.Body.Close()
 			readerTwo := bufio.NewReader(respTwo.Body)
 
-			eventNextTwo, _, err := readerTwo.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "event: next", string(eventNextTwo))
-			dataTwo, _, err := readerTwo.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "data: {\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}", string(dataTwo))
+			eventNextTwo := testenv.ReadSSELine(t, readerTwo)
+			require.Equal(t, "event: next", eventNextTwo)
+			dataTwo := testenv.ReadSSELine(t, readerTwo)
+			require.Equal(t, "data: {\"errors\":[{\"message\":\"operation type 'subscription' is blocked\"}]}", dataTwo)
 		})
 	})
 
@@ -868,7 +768,6 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 		}, func(t *testing.T, xEnv *testenv.Environment) {
-
 			firstSubscribePayload := []byte(`{"query":"subscription { employeeUpdated(employeeID: 3) { id details { forename surname } }}"}`)
 
 			client := http.Client{}
@@ -880,7 +779,7 @@ func TestNatsEvents(t *testing.T) {
 			req.Header.Set("Connection", "keep-alive")
 			req.Header.Set("Cache-Control", "no-cache")
 
-			var clientDoCh = make(chan struct {
+			clientDoCh := make(chan struct {
 				resp *http.Response
 				err  error
 			})
@@ -893,7 +792,8 @@ func TestNatsEvents(t *testing.T) {
 				}{resp: resp, err: err}
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Send a mutation to trigger the subscription
 			res := xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
@@ -902,10 +802,11 @@ func TestNatsEvents(t *testing.T) {
 			require.JSONEq(t, `{"data":{"updateAvailability":{"id":3}}}`, res.Body)
 
 			var resp *http.Response
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
 				resp *http.Response
 				err  error
-			}) {
+			},
+			) {
 				require.NoError(t, clientDo.err)
 				require.Equal(t, http.StatusOK, clientDo.resp.StatusCode)
 				resp = clientDo.resp
@@ -918,9 +819,8 @@ func TestNatsEvents(t *testing.T) {
 
 			reader := bufio.NewReader(resp.Body)
 
-			eventNext, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "event: next", string(eventNext))
+			eventNext := testenv.ReadSSEField(t, reader)
+			require.Equal(t, "event: next", eventNext)
 
 			// Trigger the subscription via NATS
 			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"id":3,"__typename": "Employee"}`))
@@ -929,12 +829,8 @@ func TestNatsEvents(t *testing.T) {
 			err = xEnv.NatsConnectionDefault.Flush()
 			require.NoError(t, err)
 
-			data, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", string(data))
-			line, _, err := reader.ReadLine()
-			require.NoError(t, err)
-			require.Equal(t, "", string(line))
+			data := testenv.ReadSSEField(t, reader)
+			require.Equal(t, "data: {\"data\":{\"employeeUpdated\":{\"id\":3,\"details\":{\"forename\":\"Stefan\",\"surname\":\"Avram\"}}}}", data)
 		})
 	})
 
@@ -945,7 +841,6 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 		}, func(t *testing.T, xEnv *testenv.Environment) {
-
 			firstSub, err := xEnv.NatsConnectionDefault.Subscribe(xEnv.GetPubSubName("getEmployee.3"), func(msg *nats.Msg) {
 				err := msg.Respond([]byte(`{"id": 3, "__typename": "Employee"}`))
 				require.NoError(t, err)
@@ -984,7 +879,7 @@ func TestNatsEvents(t *testing.T) {
 		})
 	})
 
-	t.Run("publish", func(t *testing.T) {
+	t.Run("mutate", func(t *testing.T) {
 		t.Parallel()
 
 		testenv.Run(t, &testenv.Config{
@@ -1034,6 +929,31 @@ func TestNatsEvents(t *testing.T) {
 		})
 	})
 
+	t.Run("mutate returns correct typename", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			sub, err := xEnv.NatsConnectionDefault.SubscribeSync(xEnv.GetPubSubName("employeeUpdatedMyNats.3"))
+			require.NoError(t, err)
+			require.NoError(t, xEnv.NatsConnectionDefault.Flush())
+
+			t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+			resOne := xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+				Query: `mutation UpdateEmployeeNats($update: UpdateEmployeeInput!) {
+							updateEmployeeMyNats(id: 3, update: $update) {__typename success}
+						}`,
+				Variables: json.RawMessage(`{"update":{"name":"Stefan Avramovic","email":"avramovic@wundergraph.com"}}`),
+			})
+
+			// Send a query to receive the response from the NATS message
+			require.Equal(t, `{"data":{"updateEmployeeMyNats":{"__typename":"edfs__PublishResult","success":true}}}`, resOne.Body)
+		})
+	})
+
 	t.Run("subscribe with stream and consumer", func(t *testing.T) {
 		t.Parallel()
 
@@ -1041,7 +961,7 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 			ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
-				engineExecutionConfiguration.WebSocketClientReadTimeout = time.Second
+				engineExecutionConfiguration.WebSocketServerReadTimeout = time.Second
 			},
 		}, func(t *testing.T, xEnv *testenv.Environment) {
 			type subscriptionPayload struct {
@@ -1074,16 +994,13 @@ func TestNatsEvents(t *testing.T) {
 			var msg testenv.WebSocketMessage
 			var payload subscriptionPayload
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
 			// Trigger the first subscription via NATS
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.12"), []byte(`{"id":13,"__typename":"Employee"}`))
-			require.NoError(t, err)
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.12"), []byte(`{"id":13,"__typename":"Employee"}`), 1, EventWaitTimeout)
 
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-
-			err = conn.ReadJSON(&msg)
+			err = testenv.WSReadJSON(t, conn, &msg)
 			require.NoError(t, err)
 			require.Equal(t, "1", msg.ID)
 			require.Equal(t, "next", msg.Type)
@@ -1097,10 +1014,10 @@ func TestNatsEvents(t *testing.T) {
 				Type: "complete",
 			})
 			require.NoError(t, err)
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
 
 			var complete testenv.WebSocketMessage
-			err = conn.ReadJSON(&complete)
+			err = testenv.WSReadJSON(t, conn, &complete)
 			require.NoError(t, err)
 			require.Equal(t, "1", complete.ID)
 			require.Equal(t, "complete", complete.Type)
@@ -1118,9 +1035,10 @@ func TestNatsEvents(t *testing.T) {
 				Payload: []byte(`{"query":"subscription { employeeUpdatedNatsStream(id: 12) { id }}"}`),
 			})
 			require.NoError(t, err)
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
-			err = conn.ReadJSON(&msg)
+			err = testenv.WSReadJSON(t, conn, &msg)
 			require.NoError(t, err)
 			require.Equal(t, "2", msg.ID)
 			require.Equal(t, "next", msg.Type)
@@ -1129,13 +1047,9 @@ func TestNatsEvents(t *testing.T) {
 			require.Equal(t, float64(14), payload.Data.EmployeeUpdatedNatsStream.ID)
 
 			// Publish the third event while the subscription is subscribed
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.12"), []byte(`{"id":15,"__typename":"Employee"}`))
-			require.NoError(t, err)
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.12"), []byte(`{"id":15,"__typename":"Employee"}`), 1, EventWaitTimeout)
 
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-
-			err = conn.ReadJSON(&msg)
+			err = testenv.WSReadJSON(t, conn, &msg)
 			require.NoError(t, err)
 			require.Equal(t, "2", msg.ID)
 			require.Equal(t, "next", msg.Type)
@@ -1143,6 +1057,128 @@ func TestNatsEvents(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, float64(15), payload.Data.EmployeeUpdatedNatsStream.ID)
 		})
+	})
+
+	t.Run("durable consumer is deleted from nats server on router shutdown", func(t *testing.T) {
+		t.Parallel()
+
+		env, err := testenv.CreateTestEnv(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+			ModifyRouterConfig: func(routerConfig *nodev1.RouterConfig) {
+				// Remove feature flag configs to work around a bug where buildGraphMux
+				// overwrites s.pubSubProviders on each call, orphaning the base providers.
+				routerConfig.FeatureFlagConfigs = nil
+			},
+			ModifyEventsConfiguration: func(cfg *config.EventsConfiguration) {
+				for i := range cfg.Providers.Nats {
+					cfg.Providers.Nats[i].DeleteDurableConsumersOnShutdown = true
+				}
+			},
+		})
+		require.NoError(t, err)
+		t.Cleanup(env.Shutdown)
+
+		js, err := jetstream.New(env.NatsConnectionDefault)
+		require.NoError(t, err)
+
+		streamName := env.GetPubSubName("streamName")
+		_, err = js.CreateOrUpdateStream(env.Context, jetstream.StreamConfig{
+			Name:     streamName,
+			Subjects: []string{env.GetPubSubName("employeeUpdated.>")},
+			Storage:  jetstream.MemoryStorage,
+		})
+		require.NoError(t, err)
+
+		conn := env.InitGraphQLWebSocketConnection(nil, nil, nil)
+		err = conn.WriteJSON(&testenv.WebSocketMessage{
+			ID:      "1",
+			Type:    "subscribe",
+			Payload: []byte(`{"query":"subscription { employeeUpdatedNatsStream(id: 12) { id }}"}`),
+		})
+		require.NoError(t, err)
+		env.WaitForSubscriptionCount(1, EventWaitTimeout)
+		// Make sure to wait for the trigger count because we might already have the
+		// subscription count incremented before the trigger was actually created.
+		// In that case we wouldn't yet have a durable consumer on the NATS server.
+		env.WaitForTriggerCount(1, EventWaitTimeout)
+
+		// Verify the durable consumer was created on the stream
+		stream, err := js.Stream(env.Context, streamName)
+		require.NoError(t, err)
+		streamInfo, err := stream.Info(env.Context)
+		require.NoError(t, err)
+		require.Equal(t, 1, streamInfo.State.Consumers, "expected one consumer before shutdown")
+
+		// Shut down the router; this should trigger deletion of durable consumers
+		env.Shutdown()
+
+		// env.Context is cancelled by Shutdown, so use a fresh context for JetStream queries
+		ctx := context.Background()
+		streamInfo, err = stream.Info(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 0, streamInfo.State.Consumers, "expected no consumers after shutdown with delete_on_shutdown enabled")
+	})
+
+	t.Run("durable consumer is not deleted from nats server on router shutdown", func(t *testing.T) {
+		t.Parallel()
+
+		env, err := testenv.CreateTestEnv(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+			ModifyRouterConfig: func(routerConfig *nodev1.RouterConfig) {
+				// Remove feature flag configs to work around a bug where buildGraphMux
+				// overwrites s.pubSubProviders on each call, orphaning the base providers.
+				routerConfig.FeatureFlagConfigs = nil
+			},
+			ModifyEventsConfiguration: func(cfg *config.EventsConfiguration) {
+				for i := range cfg.Providers.Nats {
+					cfg.Providers.Nats[i].DeleteDurableConsumersOnShutdown = false
+				}
+			},
+		})
+		require.NoError(t, err)
+		t.Cleanup(env.Shutdown)
+
+		js, err := jetstream.New(env.NatsConnectionDefault)
+		require.NoError(t, err)
+
+		streamName := env.GetPubSubName("streamName")
+		_, err = js.CreateOrUpdateStream(env.Context, jetstream.StreamConfig{
+			Name:     streamName,
+			Subjects: []string{env.GetPubSubName("employeeUpdated.>")},
+			Storage:  jetstream.MemoryStorage,
+		})
+		require.NoError(t, err)
+
+		conn := env.InitGraphQLWebSocketConnection(nil, nil, nil)
+		err = conn.WriteJSON(&testenv.WebSocketMessage{
+			ID:      "1",
+			Type:    "subscribe",
+			Payload: []byte(`{"query":"subscription { employeeUpdatedNatsStream(id: 12) { id }}"}`),
+		})
+		require.NoError(t, err)
+		env.WaitForSubscriptionCount(1, EventWaitTimeout)
+		// Make sure to wait for the trigger count because we might already have the
+		// subscription count incremented before the trigger was actually created.
+		// In that case we wouldn't yet have a durable consumer on the NATS server.
+		env.WaitForTriggerCount(1, EventWaitTimeout)
+
+		// Verify the durable consumer was created on the stream
+		stream, err := js.Stream(env.Context, streamName)
+		require.NoError(t, err)
+		streamInfo, err := stream.Info(env.Context)
+		require.NoError(t, err)
+		require.Equal(t, 1, streamInfo.State.Consumers, "expected one consumer before shutdown")
+
+		// Shut down the router; this should trigger deletion of durable consumers
+		env.Shutdown()
+
+		// env.Context is cancelled by Shutdown, so use a fresh context for JetStream queries
+		ctx := context.Background()
+		streamInfo, err = stream.Info(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 1, streamInfo.State.Consumers, "expected one consumer after shutdown with delete_on_shutdown disabled")
 	})
 
 	t.Run("subscribing to a non-existent stream returns an error", func(t *testing.T) {
@@ -1178,12 +1214,12 @@ func TestNatsEvents(t *testing.T) {
 			})
 			require.NoError(t, err)
 
-			var clientRunCh = make(chan error)
+			clientRunCh := make(chan error)
 			go func() {
 				clientRunCh <- client.Run()
 			}()
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, gotError, func(t *testing.T, clientErr error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, gotError, func(t *testing.T, clientErr error) {
 				require.ErrorContains(t, clientErr, fmt.Sprintf(
 					"EDFS error: failed to create or update consumer for stream \"%s\"",
 					xEnv.GetPubSubName("streamName"),
@@ -1202,270 +1238,8 @@ func TestNatsEvents(t *testing.T) {
 			err = client.Close()
 			require.NoError(t, err)
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunCh, func(t *testing.T, clientErr error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunCh, func(t *testing.T, clientErr error) {
 				require.NoError(t, clientErr, "unexpected client run error, this used to be flaky")
-			}, "unable to close client before timeout")
-		})
-	})
-
-	t.Run("subscribe ws with filter", func(t *testing.T) {
-		t.Parallel()
-
-		testenv.Run(t, &testenv.Config{
-			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
-			EnableNats:               true,
-			ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
-				engineExecutionConfiguration.WebSocketClientReadTimeout = time.Second
-			},
-		}, func(t *testing.T, xEnv *testenv.Environment) {
-			type subscriptionPayload struct {
-				Data struct {
-					FilteredEmployeeUpdated struct {
-						ID      float64 `graphql:"id"`
-						Details struct {
-							Forename string `graphql:"forename"`
-							Surname  string `graphql:"surname"`
-						} `graphql:"details"`
-					} `graphql:"filteredEmployeeUpdated(id: 1)"`
-				} `json:"data"`
-			}
-
-			// conn.Close() is called in a cleanup defined in the function
-			conn := xEnv.InitGraphQLWebSocketConnection(nil, nil, nil)
-			err := conn.WriteJSON(&testenv.WebSocketMessage{
-				ID:      "1",
-				Type:    "subscribe",
-				Payload: []byte(`{"query":"subscription { filteredEmployeeUpdated(id: 1) { id details { forename, surname } } }"}`),
-			})
-
-			require.NoError(t, err)
-
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
-
-			testData := map[uint32]struct{ forename, surname string }{
-				1:  {forename: "Jens", surname: "Neuse"},
-				3:  {forename: "Stefan", surname: "Avram"},
-				4:  {forename: "Björn", surname: "Schwenzer"},
-				5:  {forename: "Sergiy", surname: "Petrunin"},
-				7:  {forename: "Suvij", surname: "Surya"},
-				8:  {forename: "Nithin", surname: "Kumar"},
-				11: {forename: "Alexandra", surname: "Neuse"},
-			}
-
-			var msg testenv.WebSocketMessage
-			var payload subscriptionPayload
-			// This loop is used to test the filter
-			// It will emit 12 events, and only 7 of them should be included:
-			// 1, 3, 4, 5, 7, 8, and 11
-			for i := uint32(1); i < 13; i++ {
-				err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.1"), []byte(fmt.Sprintf(`{"id":%d,"__typename":"Employee"}`, i)))
-				require.NoError(t, err)
-				err = xEnv.NatsConnectionDefault.Flush()
-				require.NoError(t, err)
-
-				// Should get the message only for the events that should be included
-				// if some message is not filtered out, the test will fail
-				switch i {
-				case 1, 3, 4, 5, 7, 8, 11:
-					gErr := conn.ReadJSON(&msg)
-					require.NoError(t, gErr)
-					require.Equal(t, "1", msg.ID)
-					require.Equal(t, "next", msg.Type)
-					gErr = json.Unmarshal(msg.Payload, &payload)
-					require.NoError(t, gErr)
-					require.Equal(t, float64(i), payload.Data.FilteredEmployeeUpdated.ID)
-					require.Equal(t, testData[i].forename, payload.Data.FilteredEmployeeUpdated.Details.Forename)
-					require.Equal(t, testData[i].surname, payload.Data.FilteredEmployeeUpdated.Details.Surname)
-				}
-			}
-		})
-	})
-
-	t.Run("subscribe sse with filter", func(t *testing.T) {
-		t.Parallel()
-
-		testenv.Run(t, &testenv.Config{
-			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
-			EnableNats:               true,
-		}, func(t *testing.T, xEnv *testenv.Environment) {
-
-			subscribePayload := []byte(`{"query":"subscription { filteredEmployeeUpdated(id: 1) { id details { forename surname } } }"}`)
-
-			client := http.Client{}
-			req, gErr := http.NewRequest(http.MethodPost, xEnv.GraphQLRequestURL(), bytes.NewReader(subscribePayload))
-			require.NoError(t, gErr)
-
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "text/event-stream")
-			req.Header.Set("Connection", "keep-alive")
-			req.Header.Set("Cache-Control", "no-cache")
-
-			var clientDoCh = make(chan struct {
-				resp *http.Response
-				err  error
-			})
-			go func() {
-				resp, gErr := client.Do(req)
-				clientDoCh <- struct {
-					resp *http.Response
-					err  error
-				}{resp, gErr}
-			}()
-
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
-
-			// Trigger the subscription via NATS
-			err := xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.1"), []byte(`{"id":1,"__typename": "Employee"}`))
-			require.NoError(t, err)
-
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-
-			var resp *http.Response
-
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
-				resp *http.Response
-				err  error
-			}) {
-				resp = clientDo.resp
-				require.NoError(t, clientDo.err)
-			})
-
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-			defer resp.Body.Close()
-
-			require.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
-			require.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
-			require.Equal(t, "keep-alive", resp.Header.Get("Connection"))
-			require.Equal(t, "no", resp.Header.Get("X-Accel-Buffering"))
-
-			reader := bufio.NewReader(resp.Body)
-
-			testData := map[int]struct{ forename, surname string }{
-				1:  {forename: "Jens", surname: "Neuse"},
-				3:  {forename: "Stefan", surname: "Avram"},
-				4:  {forename: "Björn", surname: "Schwenzer"},
-				5:  {forename: "Sergiy", surname: "Petrunin"},
-				7:  {forename: "Suvij", surname: "Surya"},
-				8:  {forename: "Nithin", surname: "Kumar"},
-				11: {forename: "Alexandra", surname: "Neuse"},
-			}
-
-			eventNext, _, gErr := reader.ReadLine()
-			require.NoError(t, gErr)
-			require.Equal(t, "event: next", string(eventNext))
-			data, _, gErr := reader.ReadLine()
-			require.NoError(t, gErr)
-			require.Equal(t, fmt.Sprintf("data: {\"data\":{\"filteredEmployeeUpdated\":{\"id\":%d,\"details\":{\"forename\":\"%s\",\"surname\":\"%s\"}}}}", 1, testData[1].forename, testData[1].surname), string(data))
-			line, _, gErr := reader.ReadLine()
-			require.NoError(t, gErr)
-			require.Equal(t, "", string(line))
-
-			// This loop is used to test the filter
-			// It will emit 12 events, and only 7 of them should be included:
-			// 1, 3, 4, 5, 7, 8, and 11
-			for i := 1; i < 13; i++ {
-				err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.1"), []byte(fmt.Sprintf(`{"id":%d,"__typename": "Employee"}`, i)))
-				require.NoError(t, err)
-
-				err = xEnv.NatsConnectionDefault.Flush()
-				require.NoError(t, err)
-
-				// Should get the message only for the events that should be included
-				// if some message is not filtered out, the test will fail
-				switch i {
-				case 1, 3, 4, 5, 7, 8, 11:
-					eventNext, _, gErr = reader.ReadLine()
-					require.NoError(t, gErr)
-					require.Equal(t, "event: next", string(eventNext))
-					data, _, gErr = reader.ReadLine()
-					require.NoError(t, gErr)
-					require.Equal(t, fmt.Sprintf("data: {\"data\":{\"filteredEmployeeUpdated\":{\"id\":%d,\"details\":{\"forename\":\"%s\",\"surname\":\"%s\"}}}}", i, testData[i].forename, testData[i].surname), string(data))
-					line, _, gErr = reader.ReadLine()
-					require.NoError(t, gErr)
-					require.Equal(t, "", string(line))
-				}
-			}
-		})
-	})
-
-	t.Run("message with invalid JSON should give a specific error", func(t *testing.T) {
-		t.Parallel()
-
-		testenv.Run(t, &testenv.Config{
-			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
-			EnableNats:               true,
-		}, func(t *testing.T, xEnv *testenv.Environment) {
-			var subscriptionOne struct {
-				employeeUpdated struct {
-					ID      float64 `graphql:"id"`
-					Details struct {
-						Forename string `graphql:"forename"`
-						Surname  string `graphql:"surname"`
-					} `graphql:"details"`
-				} `graphql:"employeeUpdated(employeeID: 3)"`
-			}
-
-			surl := xEnv.GraphQLWebSocketSubscriptionURL()
-			client := graphql.NewSubscriptionClient(surl)
-
-			subscriptionArgsCh := make(chan natsSubscriptionArgs)
-
-			subscriptionOneID, err := client.Subscribe(&subscriptionOne, nil, func(dataValue []byte, errValue error) error {
-				subscriptionArgsCh <- natsSubscriptionArgs{
-					dataValue: dataValue,
-					errValue:  errValue,
-				}
-				return nil
-			})
-			require.NoError(t, err)
-			require.NotEqual(t, "", subscriptionOneID)
-
-			clientRunCh := make(chan error)
-			go func() {
-				clientRunCh <- client.Run()
-			}()
-
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{asas`)) // Invalid message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
-				assert.ErrorContains(t, subscriptionArgs.errValue, "Invalid message received")
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
-				assert.NoError(t, subscriptionArgs.errValue)
-				assert.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(subscriptionArgs.dataValue))
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","update":{"name":"foo"}}`)) // Missing id
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
-				assert.ErrorContains(t, subscriptionArgs.errValue, "Cannot return null for non-nullable field 'Subscription.employeeUpdated.id'.")
-			})
-
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
-			require.NoError(t, err)
-			err = xEnv.NatsConnectionDefault.Flush()
-			require.NoError(t, err)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
-				assert.NoError(t, subscriptionArgs.errValue)
-				assert.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(subscriptionArgs.dataValue))
-			})
-
-			require.NoError(t, client.Close())
-
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunCh, func(t *testing.T, clientRunErr error) {
-				require.NoError(t, clientRunErr)
 			}, "unable to close client before timeout")
 		})
 	})
@@ -1511,16 +1285,20 @@ func TestNatsEvents(t *testing.T) {
 				clientRunCh <- client.Run()
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
-			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
+			// Direct publish is correct here: the subgraph has a 1-minute delay,
+			// so SubscriptionUpdateSent will never fire. We only need to trigger
+			// the slow fetch, then verify shutdown doesn't hang.
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`))
 			require.NoError(t, err)
 			err = xEnv.NatsConnectionDefault.Flush()
 			require.NoError(t, err)
 
 			assert.NoError(t, client.Close())
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, clientRunCh, func(t *testing.T, clientRunErr error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunCh, func(t *testing.T, clientRunErr error) {
 				require.NoError(t, clientRunErr)
 			})
 
@@ -1531,7 +1309,7 @@ func TestNatsEvents(t *testing.T) {
 				completedCh <- true
 			}()
 
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, completedCh, func(t *testing.T, completed bool) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, completedCh, func(t *testing.T, completed bool) {
 				require.True(t, completed)
 			}, "unable to shutdown environment before timeout")
 		})
@@ -1610,11 +1388,11 @@ func TestNatsEvents(t *testing.T) {
 				client1RunCh <- client1.Run()
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
 
 			errUnsubscribeOne := client1.Unsubscribe(subscriptionOneID)
 			require.NoError(t, errUnsubscribeOne)
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
 
 			subscriptionTwoID, err := client2.Subscribe(&subscriptionTwo, nil, func(dataValue []byte, errValue error) error {
 				// Do nothing, it will be never be called
@@ -1628,24 +1406,24 @@ func TestNatsEvents(t *testing.T) {
 				client2RunCh <- client2.Run()
 			}()
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
 
 			// Unsubscribe from the second subscription
 			errUnsubscribeTwo := client2.Unsubscribe(subscriptionTwoID)
 			require.NoError(t, errUnsubscribeTwo)
-			xEnv.WaitForSubscriptionCount(0, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
 
 			// close the first client
 			errClose1 := client1.Close()
 			require.NoError(t, errClose1)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, client1RunCh, func(t *testing.T, client1RunErr error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, client1RunCh, func(t *testing.T, client1RunErr error) {
 				require.NoError(t, client1RunErr)
 			})
 
 			// close the second client
 			errClose2 := client2.Close()
 			require.NoError(t, errClose2)
-			testenv.AwaitChannelWithT(t, NatsWaitTimeout, client2RunCh, func(t *testing.T, client2RunErr error) {
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, client2RunCh, func(t *testing.T, client2RunErr error) {
 				require.NoError(t, client2RunErr)
 			})
 		})
@@ -1658,7 +1436,7 @@ func TestNatsEvents(t *testing.T) {
 			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
 			EnableNats:               true,
 			ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
-				engineExecutionConfiguration.WebSocketClientReadTimeout = time.Second
+				engineExecutionConfiguration.WebSocketServerReadTimeout = time.Second
 			},
 		}, func(t *testing.T, xEnv *testenv.Environment) {
 			type subscriptionPayload struct {
@@ -1680,18 +1458,17 @@ func TestNatsEvents(t *testing.T) {
 			var msg testenv.WebSocketMessage
 			var payload subscriptionPayload
 
-			xEnv.WaitForSubscriptionCount(1, NatsWaitTimeout)
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
 
-			// Trigger the first subscription via NATS
-			err = xEnv.NatsConnectionMyNats.Publish(xEnv.GetPubSubName("employeeUpdatedMyNats.12"), []byte(`{"id":13,"__typename":"Employee"}`))
+			// Warm-up: confirm the subscription pipeline is fully active
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionMyNats, xEnv.GetPubSubName("employeeUpdatedMyNats.12"), []byte(`{"id":13,"__typename":"Employee"}`), 1, EventWaitTimeout)
+
+			err = conn.SetReadDeadline(time.Now().Add(EventWaitTimeout))
 			require.NoError(t, err)
-
-			err = xEnv.NatsConnectionMyNats.Flush()
-			require.NoError(t, err)
-
-			xEnv.WaitForMessagesSent(1, NatsWaitTimeout)
-
 			err = conn.ReadJSON(&msg)
+			require.NoError(t, err)
+			err = conn.SetReadDeadline(time.Time{})
 			require.NoError(t, err)
 			require.Equal(t, "1", msg.ID)
 			require.Equal(t, "next", msg.Type)
@@ -1699,22 +1476,567 @@ func TestNatsEvents(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, float64(13), payload.Data.EmployeeUpdatedMyNats.ID)
 
-			// Trigger the first subscription via NATS
-			err = xEnv.NatsConnectionMyNats.Publish(xEnv.GetPubSubName("employeeUpdatedMyNatsTwo.12"), []byte(`{"id":99,"__typename":"Employee"}`))
+			// Trigger second subscription via NATS on different subject
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionMyNats, xEnv.GetPubSubName("employeeUpdatedMyNatsTwo.12"), []byte(`{"id":99,"__typename":"Employee"}`), 2, EventWaitTimeout)
+
+			err = conn.SetReadDeadline(time.Now().Add(EventWaitTimeout))
 			require.NoError(t, err)
-
-			err = xEnv.NatsConnectionMyNats.Flush()
-			require.NoError(t, err)
-
-			xEnv.WaitForMessagesSent(2, NatsWaitTimeout)
-
 			err = conn.ReadJSON(&msg)
+			require.NoError(t, err)
+			err = conn.SetReadDeadline(time.Time{})
 			require.NoError(t, err)
 			require.Equal(t, "1", msg.ID)
 			require.Equal(t, "next", msg.Type)
 			err = json.Unmarshal(msg.Payload, &payload)
 			require.NoError(t, err)
 			require.Equal(t, float64(99), payload.Data.EmployeeUpdatedMyNats.ID)
+		})
+	})
+
+	t.Run("start multiple subscriptions and hot reload should stop all the subscriptions and after restart they should work", func(t *testing.T) {
+		pm := ConfigPollerMock{
+			ready: make(chan struct{}),
+		}
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+			LogObservation: testenv.LogObservationConfig{
+				Enabled:  true,
+				LogLevel: zapcore.InfoLevel,
+			},
+			NoRetryClient: true,
+			RouterConfig: &testenv.RouterConfig{
+				ConfigPollerFactory: func(config *nodev1.RouterConfig) configpoller.ConfigPoller {
+					pm.initConfig = config
+					return &pm
+				},
+			},
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			// Wait for the config poller to be ready
+			<-pm.ready
+
+			var subscriptionMyNats struct {
+				employeeUpdatedMyNats struct {
+					ID      float64 `graphql:"id"`
+					Details struct {
+						Surname string `graphql:"surname"`
+					} `graphql:"details"`
+				} `graphql:"employeeUpdatedMyNats(id: 1)"`
+			}
+
+			var subscriptionNats struct {
+				employeeUpdated struct {
+					ID      float64 `graphql:"id"`
+					Details struct {
+						Surname string `graphql:"surname"`
+					} `graphql:"details"`
+				} `graphql:"employeeUpdated(employeeID: 1)"`
+			}
+
+			var subscriptionNats2 struct {
+				employeeUpdated struct {
+					ID      float64 `graphql:"id"`
+					Details struct {
+						Surname string `graphql:"surname"`
+					} `graphql:"details"`
+				} `graphql:"employeeUpdated(employeeID: 2)"`
+			}
+
+			surl := xEnv.GraphQLWebSocketSubscriptionURL()
+			client1 := graphql.NewSubscriptionClient(surl)
+			client2 := graphql.NewSubscriptionClient(surl)
+			client3 := graphql.NewSubscriptionClient(surl)
+			sub1DataCh := make(chan natsSubscriptionArgs)
+			subscription1ID, err := client1.Subscribe(&subscriptionMyNats, nil, func(dataValue []byte, errValue error) error {
+				sub1DataCh <- natsSubscriptionArgs{
+					dataValue,
+					errValue,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscription1ID)
+
+			client1Done := testenv.Go(client1.Run)
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+
+			sub2DataCh := make(chan natsSubscriptionArgs)
+			subscription2ID, err := client2.Subscribe(&subscriptionNats, nil, func(dataValue []byte, errValue error) error {
+				sub2DataCh <- natsSubscriptionArgs{
+					dataValue,
+					errValue,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscription2ID)
+
+			client2Done := testenv.Go(client2.Run)
+
+			xEnv.WaitForSubscriptionCount(2, EventWaitTimeout)
+
+			sub3DataCh := make(chan natsSubscriptionArgs)
+			subscription3ID, err := client3.Subscribe(&subscriptionNats2, nil, func(dataValue []byte, errValue error) error {
+				sub3DataCh <- natsSubscriptionArgs{
+					dataValue,
+					errValue,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscription3ID)
+
+			client3Done := testenv.Go(client3.Run)
+
+			xEnv.WaitForSubscriptionCount(3, EventWaitTimeout)
+
+			// Swap config
+			require.NoError(t, pm.updateConfig(&routerconfig.Response{Config: pm.initConfig}))
+
+			// Wait for all providers to shut down and restart
+			require.Eventually(t, func() bool {
+				defaultLogs := xEnv.Observer().FilterField(zapcore.Field{
+					Type:   zapcore.StringType,
+					Key:    "provider_id",
+					String: "default",
+				})
+				myNatsLogs := xEnv.Observer().FilterField(zapcore.Field{
+					Type:   zapcore.StringType,
+					Key:    "provider_id",
+					String: "my-nats",
+				})
+				return myNatsLogs.FilterMessage("NATS connection established").Len() == 4 &&
+					myNatsLogs.FilterMessage("NATS disconnected").Len() == 1 &&
+					myNatsLogs.FilterMessage("NATS connection closed").Len() == 1 &&
+					defaultLogs.FilterMessage("NATS connection established").Len() == 4 &&
+					defaultLogs.FilterMessage("NATS disconnected").Len() == 1 &&
+					defaultLogs.FilterMessage("NATS connection closed").Len() == 1
+			}, EventWaitTimeout, time.Second)
+
+			// Then wait for subscriptions to be started again
+			xEnv.WaitForSubscriptionCount(3, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(3, EventWaitTimeout)
+
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.1"), []byte(`{"id":1,"__typename":"Employee"}`), 1, EventWaitTimeout)
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.2"), []byte(`{"id":2,"__typename":"Employee"}`), 1, EventWaitTimeout)
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionMyNats, xEnv.GetPubSubName("employeeUpdatedMyNats.1"), []byte(`{"id":1,"__typename":"Employee"}`), 1, EventWaitTimeout)
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, sub1DataCh, func(t *testing.T, data natsSubscriptionArgs) {
+				assert.NoError(t, data.errValue)
+				assert.Equal(t, data.dataValue, []byte(`{"employeeUpdatedMyNats":{"id":1,"details":{"surname":"Neuse"}}}`))
+			}, "unable to receive data on subscription 1 before timeout")
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, sub2DataCh, func(t *testing.T, data natsSubscriptionArgs) {
+				assert.NoError(t, data.errValue)
+				assert.Equal(t, data.dataValue, []byte(`{"employeeUpdated":{"id":1,"details":{"surname":"Neuse"}}}`))
+			}, "unable to receive data on subscription 2 before timeout")
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, sub3DataCh, func(t *testing.T, data natsSubscriptionArgs) {
+				assert.NoError(t, data.errValue)
+				assert.Equal(t, data.dataValue, []byte(`{"employeeUpdated":{"id":2,"details":{"surname":"Deus"}}}`))
+			}, "unable to receive data on subscription 3 before timeout")
+
+			// Unsubscribe from all the subscriptions
+			errUnsubscribeOne := client1.Unsubscribe(subscription1ID)
+			require.NoError(t, errUnsubscribeOne)
+			errUnsubscribeTwo := client2.Unsubscribe(subscription2ID)
+			require.NoError(t, errUnsubscribeTwo)
+			errUnsubscribeThree := client3.Unsubscribe(subscription3ID)
+			require.NoError(t, errUnsubscribeThree)
+
+			// close the first client
+			errClose1 := client1.Close()
+			require.NoError(t, errClose1)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, client1Done, func(t *testing.T, client1RunErr error) {
+				require.NoError(t, client1RunErr)
+			})
+
+			// close the second client
+			errClose2 := client2.Close()
+			require.NoError(t, errClose2)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, client2Done, func(t *testing.T, client2RunErr error) {
+				require.NoError(t, client2RunErr)
+			})
+
+			// close the third client
+			errClose3 := client3.Close()
+			require.NoError(t, errClose3)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, client3Done, func(t *testing.T, client3RunErr error) {
+				require.NoError(t, client3RunErr)
+			})
+		})
+	})
+
+	t.Run("message and resolve errors should not abort the subscription", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			var subscriptionOne struct {
+				employeeUpdated struct {
+					ID      float64 `graphql:"id"`
+					Details struct {
+						Forename string `graphql:"forename"`
+						Surname  string `graphql:"surname"`
+					} `graphql:"details"`
+				} `graphql:"employeeUpdated(employeeID: 3)"`
+			}
+
+			surl := xEnv.GraphQLWebSocketSubscriptionURL()
+			client := graphql.NewSubscriptionClient(surl)
+			subscriptionArgsCh := make(chan natsSubscriptionArgs)
+
+			subscriptionOneID, err := client.Subscribe(&subscriptionOne, nil, func(dataValue []byte, errValue error) error {
+				subscriptionArgsCh <- natsSubscriptionArgs{
+					dataValue: dataValue,
+					errValue:  errValue,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscriptionOneID)
+
+			clientRunErrCh := make(chan error)
+
+			go func() {
+				clientErr := client.Run()
+				clientRunErrCh <- clientErr
+			}()
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
+
+			// Warm-up: confirm the subscription pipeline is fully active
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`), 1, EventWaitTimeout)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+				require.NoError(t, args.errValue)
+				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(``)) // Empty message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+				var gqlErr graphql.Errors
+				require.ErrorAs(t, args.errValue, &gqlErr)
+				require.Equal(t, "Invalid message received", gqlErr[0].Message)
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+				require.NoError(t, args.errValue)
+				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","update":{"name":"foo"}}`)) // Missing id
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+				require.ErrorContains(t, args.errValue, "Cannot return null for non-nullable field 'Subscription.employeeUpdated.id'.")
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, args natsSubscriptionArgs) {
+				require.NoError(t, args.errValue)
+				require.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(args.dataValue))
+			})
+
+			require.NoError(t, client.Close())
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunErrCh, func(t *testing.T, err error) {
+				require.NoError(t, err)
+			}, "unable to close client before timeout")
+
+			xEnv.WaitForSubscriptionCount(0, EventWaitTimeout)
+			xEnv.WaitForConnectionCount(0, EventWaitTimeout)
+		})
+	})
+
+	t.Run("message with invalid JSON should give a specific error", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			var subscriptionOne struct {
+				employeeUpdated struct {
+					ID      float64 `graphql:"id"`
+					Details struct {
+						Forename string `graphql:"forename"`
+						Surname  string `graphql:"surname"`
+					} `graphql:"details"`
+				} `graphql:"employeeUpdated(employeeID: 3)"`
+			}
+
+			surl := xEnv.GraphQLWebSocketSubscriptionURL()
+			client := graphql.NewSubscriptionClient(surl)
+
+			subscriptionArgsCh := make(chan natsSubscriptionArgs)
+
+			subscriptionOneID, err := client.Subscribe(&subscriptionOne, nil, func(dataValue []byte, errValue error) error {
+				subscriptionArgsCh <- natsSubscriptionArgs{
+					dataValue: dataValue,
+					errValue:  errValue,
+				}
+				return nil
+			})
+			require.NoError(t, err)
+			require.NotEqual(t, "", subscriptionOneID)
+
+			clientRunCh := make(chan error)
+			go func() {
+				clientRunCh <- client.Run()
+			}()
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
+
+			// Warm-up: confirm the subscription pipeline is fully active
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`), 1, EventWaitTimeout)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
+				assert.NoError(t, subscriptionArgs.errValue)
+				assert.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(subscriptionArgs.dataValue))
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{asas`)) // Invalid message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
+				assert.ErrorContains(t, subscriptionArgs.errValue, "Invalid message received")
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
+				assert.NoError(t, subscriptionArgs.errValue)
+				assert.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(subscriptionArgs.dataValue))
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","update":{"name":"foo"}}`)) // Missing id
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
+				assert.ErrorContains(t, subscriptionArgs.errValue, "Cannot return null for non-nullable field 'Subscription.employeeUpdated.id'.")
+			})
+
+			err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.3"), []byte(`{"__typename":"Employee","id": 3,"update":{"name":"foo"}}`)) // Correct message
+			require.NoError(t, err)
+			err = xEnv.NatsConnectionDefault.Flush()
+			require.NoError(t, err)
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, subscriptionArgsCh, func(t *testing.T, subscriptionArgs natsSubscriptionArgs) {
+				assert.NoError(t, subscriptionArgs.errValue)
+				assert.JSONEq(t, `{"employeeUpdated":{"id":3,"details":{"forename":"Stefan","surname":"Avram"}}}`, string(subscriptionArgs.dataValue))
+			})
+
+			require.NoError(t, client.Close())
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientRunCh, func(t *testing.T, clientRunErr error) {
+				require.NoError(t, clientRunErr)
+			}, "unable to close client before timeout")
+		})
+	})
+}
+
+func TestFlakyNatsEvents(t *testing.T) {
+	t.Parallel()
+
+	t.Run("subscribe sse with filter", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			subscribePayload := []byte(`{"query":"subscription { filteredEmployeeUpdated(id: 1) { id details { forename surname } } }"}`)
+
+			// Use a context with timeout to prevent SSE reads from blocking
+			// for the full 8-minute Go test timeout if a message is lost.
+			ctx, cancel := context.WithTimeout(xEnv.Context, EventWaitTimeout)
+			defer cancel()
+
+			client := http.Client{}
+			req, gErr := http.NewRequestWithContext(ctx, http.MethodPost, xEnv.GraphQLRequestURL(), bytes.NewReader(subscribePayload))
+			require.NoError(t, gErr)
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "text/event-stream")
+			req.Header.Set("Connection", "keep-alive")
+			req.Header.Set("Cache-Control", "no-cache")
+
+			clientDoCh := make(chan struct {
+				resp *http.Response
+				err  error
+			})
+			go func() {
+				resp, gErr := client.Do(req)
+				clientDoCh <- struct {
+					resp *http.Response
+					err  error
+				}{resp, gErr}
+			}()
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
+
+			// Warm-up: confirm subscription pipeline is fully active
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.1"), []byte(`{"id":1,"__typename": "Employee"}`), 1, EventWaitTimeout)
+
+			var resp *http.Response
+
+			testenv.AwaitChannelWithT(t, EventWaitTimeout, clientDoCh, func(t *testing.T, clientDo struct {
+				resp *http.Response
+				err  error
+			},
+			) {
+				resp = clientDo.resp
+				require.NoError(t, clientDo.err)
+			})
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			defer resp.Body.Close()
+
+			require.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+			require.Equal(t, "no-cache", resp.Header.Get("Cache-Control"))
+			require.Equal(t, "keep-alive", resp.Header.Get("Connection"))
+			require.Equal(t, "no", resp.Header.Get("X-Accel-Buffering"))
+
+			reader := bufio.NewReader(resp.Body)
+
+			testData := map[int]struct{ forename, surname string }{
+				1:  {forename: "Jens", surname: "Neuse"},
+				3:  {forename: "Stefan", surname: "Avram"},
+				4:  {forename: "Björn", surname: "Schwenzer"},
+				5:  {forename: "Sergiy", surname: "Petrunin"},
+				7:  {forename: "Suvij", surname: "Surya"},
+				8:  {forename: "Nithin", surname: "Kumar"},
+				11: {forename: "Alexandra", surname: "Neuse"},
+			}
+
+			eventNext := testenv.ReadSSEField(t, reader)
+			require.Equal(t, "event: next", eventNext)
+			data := testenv.ReadSSEField(t, reader)
+			require.Equal(t, fmt.Sprintf("data: {\"data\":{\"filteredEmployeeUpdated\":{\"id\":%d,\"details\":{\"forename\":\"%s\",\"surname\":\"%s\"}}}}", 1, testData[1].forename, testData[1].surname), data)
+
+			// This loop tests the filter with events 2-12.
+			// Of these, 6 should be included: 3, 4, 5, 7, 8, and 11.
+			for i := 2; i < 13; i++ {
+				err := xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.1"), []byte(fmt.Sprintf(`{"id":%d,"__typename": "Employee"}`, i)))
+				require.NoError(t, err)
+
+				err = xEnv.NatsConnectionDefault.Flush()
+				require.NoError(t, err)
+
+				switch i {
+				case 3, 4, 5, 7, 8, 11:
+					eventNext = testenv.ReadSSEField(t, reader)
+					require.Equal(t, "event: next", eventNext)
+					data = testenv.ReadSSEField(t, reader)
+					require.Equal(t, fmt.Sprintf("data: {\"data\":{\"filteredEmployeeUpdated\":{\"id\":%d,\"details\":{\"forename\":\"%s\",\"surname\":\"%s\"}}}}", i, testData[i].forename, testData[i].surname), data)
+				}
+			}
+		})
+	})
+
+	t.Run("subscribe ws with filter", func(t *testing.T) {
+		t.Parallel()
+
+		testenv.Run(t, &testenv.Config{
+			RouterConfigJSONTemplate: testenv.ConfigWithEdfsNatsJSONTemplate,
+			EnableNats:               true,
+			ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
+				engineExecutionConfiguration.WebSocketServerReadTimeout = time.Second
+			},
+		}, func(t *testing.T, xEnv *testenv.Environment) {
+			type subscriptionPayload struct {
+				Data struct {
+					FilteredEmployeeUpdated struct {
+						ID      float64 `graphql:"id"`
+						Details struct {
+							Forename string `graphql:"forename"`
+							Surname  string `graphql:"surname"`
+						} `graphql:"details"`
+					} `graphql:"filteredEmployeeUpdated(id: 1)"`
+				} `json:"data"`
+			}
+
+			// conn.Close() is called in a cleanup defined in the function
+			conn := xEnv.InitGraphQLWebSocketConnection(nil, nil, nil)
+			err := conn.WriteJSON(&testenv.WebSocketMessage{
+				ID:      "1",
+				Type:    "subscribe",
+				Payload: []byte(`{"query":"subscription { filteredEmployeeUpdated(id: 1) { id details { forename, surname } } }"}`),
+			})
+
+			require.NoError(t, err)
+
+			xEnv.WaitForSubscriptionCount(1, EventWaitTimeout)
+			xEnv.WaitForTriggerCount(1, EventWaitTimeout)
+
+			testData := map[uint32]struct{ forename, surname string }{
+				1:  {forename: "Jens", surname: "Neuse"},
+				3:  {forename: "Stefan", surname: "Avram"},
+				4:  {forename: "Björn", surname: "Schwenzer"},
+				5:  {forename: "Sergiy", surname: "Petrunin"},
+				7:  {forename: "Suvij", surname: "Surya"},
+				8:  {forename: "Nithin", surname: "Kumar"},
+				11: {forename: "Alexandra", surname: "Neuse"},
+			}
+
+			var msg testenv.WebSocketMessage
+			var payload subscriptionPayload
+
+			// Warm-up: confirm subscription pipeline is fully active
+			xEnv.NATSPublishUntilReceived(xEnv.NatsConnectionDefault, xEnv.GetPubSubName("employeeUpdated.1"), []byte(`{"id":1,"__typename":"Employee"}`), 1, EventWaitTimeout)
+			conn.SetReadDeadline(time.Now().Add(EventWaitTimeout))
+			gErr := conn.ReadJSON(&msg)
+			require.NoError(t, gErr)
+			require.Equal(t, "1", msg.ID)
+			require.Equal(t, "next", msg.Type)
+			gErr = json.Unmarshal(msg.Payload, &payload)
+			require.NoError(t, gErr)
+			require.Equal(t, float64(1), payload.Data.FilteredEmployeeUpdated.ID)
+			require.Equal(t, testData[1].forename, payload.Data.FilteredEmployeeUpdated.Details.Forename)
+			require.Equal(t, testData[1].surname, payload.Data.FilteredEmployeeUpdated.Details.Surname)
+
+			// This loop tests the filter with events 2-12.
+			// Of these, 6 should be included: 3, 4, 5, 7, 8, and 11.
+			for i := uint32(2); i < 13; i++ {
+				err = xEnv.NatsConnectionDefault.Publish(xEnv.GetPubSubName("employeeUpdated.1"), []byte(fmt.Sprintf(`{"id":%d,"__typename":"Employee"}`, i)))
+				require.NoError(t, err)
+				err = xEnv.NatsConnectionDefault.Flush()
+				require.NoError(t, err)
+
+				switch i {
+				case 3, 4, 5, 7, 8, 11:
+					conn.SetReadDeadline(time.Now().Add(EventWaitTimeout))
+					gErr = conn.ReadJSON(&msg)
+					require.NoError(t, gErr)
+					require.Equal(t, "1", msg.ID)
+					require.Equal(t, "next", msg.Type)
+					gErr = json.Unmarshal(msg.Payload, &payload)
+					require.NoError(t, gErr)
+					require.Equal(t, float64(i), payload.Data.FilteredEmployeeUpdated.ID)
+					require.Equal(t, testData[i].forename, payload.Data.FilteredEmployeeUpdated.Details.Forename)
+					require.Equal(t, testData[i].surname, payload.Data.FilteredEmployeeUpdated.Details.Surname)
+				}
+			}
 		})
 	})
 }

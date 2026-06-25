@@ -90,6 +90,77 @@ message DataSourceConfiguration {
   DataSourceCustomEvents custom_events = 13;
   repeated EntityInterfaceConfiguration entity_interfaces = 14;
   repeated EntityInterfaceConfiguration interface_objects = 15;
+  CostConfiguration cost_configuration = 16;
+  // Entity caching configuration (e.g. request-scoped fields from @openfed__requestScoped).
+  EntityCachingConfiguration entity_caching_configuration = 17;
+}
+
+// Entity caching configuration for a subgraph data source.
+message EntityCachingConfiguration {
+  // Per-entity cache configurations (from @openfed__entityCache directive)
+  repeated EntityCacheConfiguration entity_cache_configurations = 1;
+  // Per-Mutation/Subscription-field cache eviction configs (from @openfed__cacheInvalidate)
+  repeated CacheInvalidateConfiguration cache_invalidate_configurations = 2;
+  // Per-Mutation/Subscription-field cache population configs (from @openfed__cachePopulate)
+  repeated CachePopulateConfiguration cache_populate_configurations = 3;
+}
+
+// Per-entity declaration for @openfed__entityCache. Marks a @key entity type as cacheable so the
+// router can store/serve resolved entities from an external store (e.g. Redis).
+message EntityCacheConfiguration {
+  string type_name = 1;
+  // TTL for cached entity values. Required: composition rejects values <= 0,
+  // so omit (zero) does not occur in practice. Interpreted in seconds.
+  int64 max_age_seconds = 2;
+  bool include_headers = 3;
+  bool partial_cache_load = 4;
+  bool shadow_mode = 5;
+  // TTL for caching "not found" entity responses (entity returned null from
+  // _entities without errors). Omit or 0 disables negative caching and null
+  // responses are not cached. Positive values are seconds. Composition rejects
+  // negative values at schema validation time.
+  int64 not_found_cache_ttl_seconds = 6;
+}
+
+// Per-field declaration for @openfed__cacheInvalidate. Tells the router to evict the returned
+// entity from the cache after the (Mutation/Subscription) operation completes.
+message CacheInvalidateConfiguration {
+  string field_name = 1;
+  string operation_type = 2;
+  string entity_type_name = 3;
+}
+
+// Per-field declaration for @openfed__cachePopulate. Tells the router to populate the entity cache
+// with the (Mutation/Subscription) operation's return value.
+message CachePopulateConfiguration {
+  string field_name = 1;
+  string operation_type = 2;
+  int64 max_age_seconds = 3;
+  string entity_type_name = 4;
+}
+
+message CostConfiguration {
+  repeated FieldWeightConfiguration field_weights = 1;
+  repeated FieldListSizeConfiguration list_sizes = 2;
+  map<string, int32> type_weights = 3;
+  map<string, int32> directive_argument_weights = 4;
+}
+
+message FieldWeightConfiguration {
+  string type_name = 1;
+  string field_name = 2;
+  optional int32 weight = 3;
+  map<string, int32> argument_weights = 4;
+  map<string, int32> directive_argument_weights = 5;
+}
+
+message FieldListSizeConfiguration {
+  string type_name = 1;
+  string field_name = 2;
+  optional int32 assumed_size = 3;
+  repeated string slicing_arguments = 4;
+  repeated string sized_fields = 5;
+  optional bool require_one_slicing_argument = 6;
 }
 
 message ArgumentConfiguration {
@@ -141,6 +212,7 @@ message TypeField {
   string type_name = 1;
   repeated string field_names = 2;
   repeated string external_field_names = 3;
+  repeated string require_fetch_reasons_field_names = 4;
 }
 
 message FieldCoordinates {
@@ -208,11 +280,17 @@ message GRPCConfiguration {
   PluginConfiguration plugin = 3;
 }
 
+message ImageReference {
+  string repository = 1; // {organization_id}/{subgraph_id}
+  string reference = 2; // v1
+}
+
 message PluginConfiguration {
   // Plugin name
   string name = 1;
   // Plugin version
   string version = 2;
+  optional ImageReference image_reference = 3;
 }
 
 message SSLConfiguration {
@@ -220,6 +298,7 @@ message SSLConfiguration {
   bool enabled = 1;
 }
 
+// Defines mapping for a gRPC service
 message GRPCMapping {
   // Version of the mapping format
   int32 version = 1;
@@ -233,6 +312,40 @@ message GRPCMapping {
   repeated TypeFieldMapping type_field_mappings = 5;
   // Mappings for GraphQL enum values to gRPC enum values
   repeated EnumMapping enum_mappings = 6;
+  // Mappings for GraphQL resolve operations to gRPC service methods
+  repeated LookupMapping resolve_mappings = 7;
+}
+
+// Defines mapping for a lookup operation
+message LookupMapping {
+  // Type of lookup operation
+  LookupType type = 1;
+  // Mappings for GraphQL type fields to gRPC message fields
+  LookupFieldMapping lookup_mapping = 2;
+  // Mapped gRPC method name
+  string rpc = 3;
+  // Mapped gRPC request message type name
+  string request = 4;
+  // Mapped gRPC response message type name
+  string response = 5;
+}
+
+// Defines mapping for a lookup field
+message LookupFieldMapping {
+  // GraphQL type name
+  string type = 1;
+  // Mapping for the lookup field
+  FieldMapping field_mapping = 2;
+}
+
+// Defines the type of lookup operation
+enum LookupType {
+  // Unspecified lookup type
+  LOOKUP_TYPE_UNSPECIFIED = 0;
+  // Lookup type for field resolution
+  LOOKUP_TYPE_RESOLVE = 1;
+  // Lookup type for the @requires directive
+  LOOKUP_TYPE_REQUIRES = 2;
 }
 
 // Defines the type of GraphQL operation
@@ -274,6 +387,19 @@ message EntityMapping {
   string request = 5;
   // gRPC response message type name
   string response = 6;
+  // Mappings for required fields
+  repeated RequiredFieldMapping required_field_mappings = 7;
+}
+
+// Defines mapping for required fields
+message RequiredFieldMapping {
+  FieldMapping field_mapping = 1;
+  // Mapped gRPC method name
+  string rpc = 2;
+  // gRPC request message type name
+  string request = 3;
+  // gRPC response message type name
+  string response = 4;
 }
 
 // Defines mapping between GraphQL type fields and gRPC message fields

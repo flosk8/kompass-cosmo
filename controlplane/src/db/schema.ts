@@ -1,6 +1,7 @@
 import { relations, sql } from 'drizzle-orm';
 import {
   boolean,
+  check,
   integer,
   bigint,
   pgEnum,
@@ -15,8 +16,13 @@ import {
   json,
   real,
 } from 'drizzle-orm/pg-core';
-import type { JSONContent } from '@tiptap/core';
 import { AxiosHeaderValue } from 'axios';
+import type { PlainMessage } from '@bufbuild/protobuf';
+import type {
+  CompositionError,
+  CompositionWarning,
+  DeploymentError,
+} from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { FeatureIds } from '../types/index.js';
 import { AuditableType, AuditActorType, AuditLogAction, AuditLogFullAction } from './models.js';
 
@@ -213,6 +219,8 @@ export const websocketSubprotocolEnum = pgEnum('websocket_subprotocol', [
   'graphql-transport-ws',
 ] as const);
 
+export const subgraphTypeEnum = pgEnum('subgraph_type', ['standard', 'grpc_plugin', 'grpc_service'] as const);
+
 export const subgraphs = pgTable(
   'subgraphs', // subgraphs
   {
@@ -232,11 +240,43 @@ export const subgraphs = pgTable(
       }),
     isFeatureSubgraph: boolean('is_feature_subgraph').notNull().default(false),
     isEventDrivenGraph: boolean('is_event_driven_graph').notNull().default(false),
+    type: subgraphTypeEnum('type').notNull().default('standard'),
   },
   (t) => {
     return {
       targetIdIndex: index('subgraphs_target_id_idx').on(t.targetId),
       schemaVersionIdIndex: index('subgraphs_schema_version_id_idx').on(t.schemaVersionId),
+    };
+  },
+);
+
+// The link is a one way link from source to target.
+// The source subgraph can be linked only to one target subgraph, thats why we have a unique constraint on the source subgraph.
+export const linkedSubgraphs = pgTable(
+  'linked_subgraphs', // ls
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sourceSubgraphId: uuid('source_subgraph_id')
+      .notNull()
+      .references(() => subgraphs.id, {
+        onDelete: 'cascade',
+      })
+      .unique(),
+    targetSubgraphId: uuid('target_subgraph_id')
+      .notNull()
+      .references(() => subgraphs.id, {
+        onDelete: 'cascade',
+      }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    createdById: uuid('created_by_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+  },
+  (t) => {
+    return {
+      sourceSubgraphIdIndex: index('ls_source_subgraph_id_idx').on(t.sourceSubgraphId),
+      targetSubgraphIdIndex: index('ls_target_subgraph_id_idx').on(t.targetSubgraphId),
+      createdByIdIndex: index('ls_created_by_id_idx').on(t.createdById),
     };
   },
 );
@@ -494,6 +534,7 @@ export const namespaceConfig = pgTable(
     enableCacheWarming: boolean('enable_cache_warming').default(false).notNull(),
     checksTimeframeInDays: integer('checks_timeframe_in_days'),
     enableProposals: boolean('enable_proposals').default(false).notNull(),
+    enableSubgraphCheckExtensions: boolean('enable_subgraph_check_extensions').default(false).notNull(),
   },
   (t) => {
     return {
@@ -784,10 +825,42 @@ export const schemaChecks = pgTable(
     }>(),
     // this is used to store the error message of a non check policy
     errorMessage: text('error_message'),
+    checkExtensionDeliveryId: uuid('check_extension_delivery_id').references(() => webhookDeliveries.id, {
+      onDelete: 'set null',
+    }),
+    checkExtensionErrorMessage: text('check_extension_error_message'),
   },
   (t) => {
     return {
       targetIdIndex: index('sc_target_id_idx').on(t.targetId),
+      sceWebhookDeliveryIdIndex: index('sce_webhook_delivery_id_idx').on(t.checkExtensionDeliveryId),
+    };
+  },
+);
+
+export const linkedSchemaChecks = pgTable(
+  'linked_schema_checks', // lsc
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    schemaCheckId: uuid('schema_check_id')
+      .references(() => schemaChecks.id, {
+        onDelete: 'cascade',
+      })
+      .notNull(),
+    linkedSchemaCheckId: uuid('linked_schema_check_id')
+      .references(() => schemaChecks.id, {
+        onDelete: 'cascade',
+      })
+      .notNull(),
+  },
+  (t) => {
+    return {
+      uniqueLinkedSchemaCheck: uniqueIndex('lsc_schema_check_id_linked_schema_check_id_unique').on(
+        t.schemaCheckId,
+        t.linkedSchemaCheckId,
+      ),
+      schemaCheckIdIndex: index('lsc_schema_check_id_idx').on(t.schemaCheckId),
+      linkedSchemaCheckIdIndex: index('lsc_linked_schema_check_id_idx').on(t.linkedSchemaCheckId),
     };
   },
 );
@@ -817,9 +890,21 @@ export const schemaCheckSubgraphs = pgTable(
     return {
       schemaCheckIdIndex: index('scs_schema_check_id_idx').on(t.schemaCheckId),
       subgraphIdIndex: index('scs_subgraph_id_idx').on(t.subgraphId),
+      namespaceIdIndex: index('scs_namespace_id_idx').on(t.namespaceId),
     };
   },
 );
+
+export const schemaCheckSubgraphRelations = relations(schemaCheckSubgraphs, ({ one }) => ({
+  schemaCheck: one(schemaChecks, {
+    fields: [schemaCheckSubgraphs.schemaCheckId],
+    references: [schemaChecks.id],
+  }),
+  namespace: one(namespaces, {
+    fields: [schemaCheckSubgraphs.namespaceId],
+    references: [namespaces.id],
+  }),
+}));
 
 export const schemaCheckChangeActionOperationUsage = pgTable(
   'schema_check_change_operation_usage', // sccou
@@ -883,7 +968,7 @@ export const schemaCheckFederatedGraphs = pgTable(
   },
 );
 
-export const schemaCheckFederatedGraphsRelations = relations(schemaCheckFederatedGraphs, ({ one }) => ({
+export const schemaCheckFederatedGraphsRelations = relations(schemaCheckFederatedGraphs, ({ one, many }) => ({
   schemaCheck: one(schemaChecks, {
     fields: [schemaCheckFederatedGraphs.checkId],
     references: [schemaChecks.id],
@@ -892,7 +977,53 @@ export const schemaCheckFederatedGraphsRelations = relations(schemaCheckFederate
     fields: [schemaCheckFederatedGraphs.federatedGraphId],
     references: [federatedGraphs.id],
   }),
+  composedSchemaChanges: many(schemaCheckFederatedGraphChanges),
 }));
+
+// Maps schema check change actions to federated graphs (for federated graph level changes)
+export const schemaCheckFederatedGraphChanges = pgTable(
+  'schema_check_federated_graph_changes', // scfgc
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    schemaCheckFederatedGraphId: uuid('schema_check_federated_graph_id')
+      .notNull()
+      .references(() => schemaCheckFederatedGraphs.id, {
+        onDelete: 'cascade',
+      }),
+    schemaCheckChangeActionId: uuid('schema_check_change_action_id')
+      .notNull()
+      .references(() => schemaCheckChangeAction.id, {
+        onDelete: 'cascade',
+      }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => {
+    return {
+      schemaCheckFederatedGraphIdIndex: index('scfgsc_schema_check_federated_graph_id_idx').on(
+        t.schemaCheckFederatedGraphId,
+      ),
+      schemaCheckChangeActionIdIndex: index('scfgsc_schema_check_change_action_id_idx').on(t.schemaCheckChangeActionId),
+      uniqueFedGraphChange: uniqueIndex('scfgc_fed_graph_change_action_unique').on(
+        t.schemaCheckFederatedGraphId,
+        t.schemaCheckChangeActionId,
+      ),
+    };
+  },
+);
+
+export const schemaCheckFederatedGraphSchemaChangesRelations = relations(
+  schemaCheckFederatedGraphChanges,
+  ({ one }) => ({
+    schemaCheckFederatedGraph: one(schemaCheckFederatedGraphs, {
+      fields: [schemaCheckFederatedGraphChanges.schemaCheckFederatedGraphId],
+      references: [schemaCheckFederatedGraphs.id],
+    }),
+    changeAction: one(schemaCheckChangeAction, {
+      fields: [schemaCheckFederatedGraphChanges.schemaCheckChangeActionId],
+      references: [schemaCheckChangeAction.id],
+    }),
+  }),
+);
 
 // a join table between schema check subgraphs and schema check fed graphs
 export const schemaCheckSubgraphsFederatedGraphs = pgTable(
@@ -961,10 +1092,12 @@ export const schemaCheckChangeAction = pgTable(
     schemaCheckSubgraphId: uuid('schema_check_subgraph_id').references(() => schemaCheckSubgraphs.id, {
       onDelete: 'set null',
     }),
+    isFedGraphChange: boolean('is_fed_graph_change').default(false),
   },
   (t) => {
     return {
       schemaCheckIdIndex: index('scca_schema_check_id_idx').on(t.schemaCheckId),
+      schemaCheckSubgraphIdIndex: index('scca_schema_check_subgraph_id_idx').on(t.schemaCheckSubgraphId),
     };
   },
 );
@@ -979,6 +1112,7 @@ export const schemaCheckChangeActionRelations = relations(schemaCheckChangeActio
     fields: [schemaCheckChangeAction.schemaCheckSubgraphId],
     references: [schemaCheckSubgraphs.id],
   }),
+  federatedGraphMappings: many(schemaCheckFederatedGraphChanges),
 }));
 
 export const operationChangeOverrides = pgTable(
@@ -1080,6 +1214,7 @@ export const sessions = pgTable(
     accessToken: text('access_token').notNull(),
     refreshToken: text('refresh_token').notNull(),
     idToken: text('id_token').notNull(),
+    idpAlias: text('idp_alias'),
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }),
@@ -1114,6 +1249,7 @@ export const apiKeys = pgTable(
     groupId: uuid('group_id').references(() => organizationGroups.id, {
       onDelete: 'set null',
     }),
+    external: boolean('external').notNull().default(false),
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
@@ -1324,6 +1460,7 @@ export const organizationsMembers = pgTable(
       .references(() => organizations.id, {
         onDelete: 'cascade',
       }),
+    active: boolean('active').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => {
@@ -1346,6 +1483,7 @@ export const organizationRoleEnum = pgEnum('organization_role', [
   'graph-viewer',
   'subgraph-admin',
   'subgraph-publisher',
+  'subgraph-checker',
   'subgraph-viewer',
 ] as const);
 
@@ -1528,6 +1666,7 @@ export const organizationInvitations = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     invitedBy: uuid('invited_by').references(() => users.id, { onDelete: 'cascade' }),
     accepted: boolean('accepted').default(false),
+    lastSentAt: timestamp('last_sent_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => {
@@ -1625,7 +1764,12 @@ export const webhookProposalStateUpdate = pgTable(
   },
 );
 
-export const webhookDeliveryType = pgEnum('webhook_delivery_type', ['webhook', 'slack', 'admission'] as const);
+export const webhookDeliveryType = pgEnum('webhook_delivery_type', [
+  'webhook',
+  'slack',
+  'admission',
+  'check-extension',
+] as const);
 
 export const webhookDeliveries = pgTable(
   'webhook_deliveries', // webhd
@@ -1840,10 +1984,79 @@ export const oidcProviders = pgTable(
     name: text('name').notNull(),
     alias: text('alias').notNull().unique(),
     endpoint: text('endpoint').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => {
     return {
       organizationIdIndex: index('oidcp_organization_id_idx').on(t.organizationId),
+    };
+  },
+);
+
+export const namespaceLoginMethods = pgTable(
+  'namespace_login_methods', // nlm
+  {
+    id: uuid('id').notNull().primaryKey().defaultRandom(),
+    namespaceId: uuid('namespace_id')
+      .notNull()
+      .references(() => namespaces.id, { onDelete: 'cascade' }),
+    ssoProviderId: uuid('sso_provider_id').references(() => oidcProviders.id, { onDelete: 'cascade' }),
+    isPasswordLogin: boolean('is_password_login').notNull().default(false),
+    isGoogleLogin: boolean('is_google_login').notNull().default(false),
+    isGithubLogin: boolean('is_github_login').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => {
+    return {
+      namespaceIdIndex: index('nlm_namespace_id_idx').on(t.namespaceId),
+      ssoProviderIdIndex: index('nlm_sso_provider_id_idx').on(t.ssoProviderId),
+      uniqueSsoPerNamespace: uniqueIndex('nlm_unique_sso')
+        .on(t.namespaceId, t.ssoProviderId)
+        .where(sql`${t.ssoProviderId} IS NOT NULL`),
+      // At most one built-in-methods row (password/google/github) per namespace.
+      uniqueBuiltinPerNamespace: uniqueIndex('nlm_unique_builtin')
+        .on(t.namespaceId)
+        .where(sql`${t.ssoProviderId} IS NULL`),
+      // A row is either an SSO-provider row (provider id, no built-in flags) or a
+      // built-in-methods row (no provider id, at least one flag) — never both, never neither.
+      builtinXorSsoCheck: check(
+        'nlm_builtin_xor_sso_check',
+        sql`(${t.ssoProviderId} IS NOT NULL) <> (${t.isPasswordLogin} OR ${t.isGoogleLogin} OR ${t.isGithubLogin})`,
+      ),
+    };
+  },
+);
+
+export const organizationLoginMethods = pgTable(
+  'organization_login_methods', // olm
+  {
+    id: uuid('id').notNull().primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    ssoProviderId: uuid('sso_provider_id').references(() => oidcProviders.id, { onDelete: 'cascade' }),
+    isPasswordLogin: boolean('is_password_login').notNull().default(false),
+    isGoogleLogin: boolean('is_google_login').notNull().default(false),
+    isGithubLogin: boolean('is_github_login').notNull().default(false),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => {
+    return {
+      organizationIdIndex: index('olm_organization_id_idx').on(t.organizationId),
+      ssoProviderIdIndex: index('olm_sso_provider_id_idx').on(t.ssoProviderId),
+      // At most one row per allowed SSO app per org.
+      uniqueSsoPerOrg: uniqueIndex('olm_unique_sso')
+        .on(t.organizationId, t.ssoProviderId)
+        .where(sql`${t.ssoProviderId} IS NOT NULL`),
+      // At most one built-in-methods row (password/google/github) per org.
+      uniqueBuiltinPerOrg: uniqueIndex('olm_unique_builtin')
+        .on(t.organizationId)
+        .where(sql`${t.ssoProviderId} IS NULL`),
+      // A row is either an SSO-provider row or a built-in-methods row, never both, never neither.
+      builtinXorSsoCheck: check(
+        'olm_builtin_xor_sso_check',
+        sql`(${t.ssoProviderId} IS NOT NULL) <> (${t.isPasswordLogin} OR ${t.isGoogleLogin} OR ${t.isGithubLogin})`,
+      ),
     };
   },
 );
@@ -2025,30 +2238,6 @@ export const subgraphMembers = pgTable(
   },
 );
 
-export const lintRulesEnum = pgEnum('lint_rules', [
-  'FIELD_NAMES_SHOULD_BE_CAMEL_CASE',
-  'TYPE_NAMES_SHOULD_BE_PASCAL_CASE',
-  'SHOULD_NOT_HAVE_TYPE_PREFIX',
-  'SHOULD_NOT_HAVE_TYPE_SUFFIX',
-  'SHOULD_NOT_HAVE_INPUT_PREFIX',
-  'SHOULD_HAVE_INPUT_SUFFIX',
-  'SHOULD_NOT_HAVE_ENUM_PREFIX',
-  'SHOULD_NOT_HAVE_ENUM_SUFFIX',
-  'SHOULD_NOT_HAVE_INTERFACE_PREFIX',
-  'SHOULD_NOT_HAVE_INTERFACE_SUFFIX',
-  'ENUM_VALUES_SHOULD_BE_UPPER_CASE',
-  'ORDER_FIELDS',
-  'ORDER_ENUM_VALUES',
-  'ORDER_DEFINITIONS',
-  'ALL_TYPES_REQUIRE_DESCRIPTION',
-  'DISALLOW_CASE_INSENSITIVE_ENUM_VALUES',
-  'NO_TYPENAME_PREFIX_IN_TYPE_FIELDS',
-  'REQUIRE_DEPRECATION_REASON',
-  // https://github.com/drizzle-team/drizzle-kit-mirror/issues/178 , the below rule is removed and not be used
-  // due to a limitation in postgres, we cant remove a enum value
-  // 'REQUIRE_DEPRECATION_DATE', // @deprecated
-] as const);
-
 export const lintSeverityEnum = pgEnum('lint_severity', ['warn', 'error'] as const);
 
 export const namespaceLintCheckConfig = pgTable(
@@ -2060,7 +2249,7 @@ export const namespaceLintCheckConfig = pgTable(
       .references(() => namespaces.id, {
         onDelete: 'cascade',
       }),
-    lintRule: lintRulesEnum('lint_rule').notNull(),
+    lintRule: text('lint_rule').notNull(),
     severityLevel: lintSeverityEnum('severity_level').notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -2146,7 +2335,7 @@ export const schemaCheckLintAction = pgTable(
       .references(() => schemaChecks.id, {
         onDelete: 'cascade',
       }),
-    lintRuleType: lintRulesEnum('lint_rule_type'),
+    lintRuleType: text('lint_rule_type'),
     message: text('message'),
     isError: boolean('is_error').default(false),
     location: json('location')
@@ -2160,6 +2349,7 @@ export const schemaCheckLintAction = pgTable(
   (t) => {
     return {
       schemaCheckIdIndex: index('sclact_schema_check_id_idx').on(t.schemaCheckId),
+      schemaCheckSubgraphIdIndex: index('sclact_schema_check_subgraph_id_idx').on(t.schemaCheckSubgraphId),
     };
   },
 );
@@ -2205,6 +2395,7 @@ export const schemaCheckGraphPruningAction = pgTable(
     return {
       schemaCheckIdIndex: index('scgpa_schema_check_id_idx').on(t.schemaCheckId),
       federatedGraphIdIndex: index('scgpa_federated_graph_id_idx').on(t.federatedGraphId),
+      schemaCheckSubgraphIdIndex: index('scgpa_schema_check_subgraph_id_idx').on(t.schemaCheckSubgraphId),
     };
   },
 );
@@ -2369,6 +2560,8 @@ export const namespaceCacheWarmerConfigRelations = relations(namespaceCacheWarme
 
 export const proposalStateEnum = pgEnum('proposal_state', ['DRAFT', 'APPROVED', 'PUBLISHED', 'CLOSED'] as const);
 
+export const proposalOriginEnum = pgEnum('proposal_origin', ['INTERNAL', 'EXTERNAL'] as const);
+
 export const proposals = pgTable(
   'proposals', // pr
   {
@@ -2384,6 +2577,7 @@ export const proposals = pgTable(
       onDelete: 'set null',
     }),
     state: proposalStateEnum('state').notNull(),
+    origin: proposalOriginEnum('origin').notNull().default('INTERNAL'),
   },
   (t) => ({
     uniqueFederatedGraphClientName: unique('federated_graph_proposal_name').on(t.federatedGraphId, t.name),
@@ -2467,3 +2661,131 @@ export const schemaCheckProposalMatchRelations = relations(schemaCheckProposalMa
     references: [proposals.id],
   }),
 }));
+
+export const protobufSchemaVersions = pgTable('protobuf_schema_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  schemaVersionId: uuid('schema_version_id')
+    .notNull()
+    .references(() => schemaVersion.id, { onDelete: 'cascade' }),
+  protoSchema: text('proto_schema').notNull(),
+  protoMappings: text('proto_mappings').notNull(),
+  protoLock: text('proto_lock').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const protobufSchemaVersionsRelations = relations(protobufSchemaVersions, ({ one }) => ({
+  schemaVersion: one(schemaVersion, {
+    fields: [protobufSchemaVersions.schemaVersionId],
+    references: [schemaVersion.id],
+  }),
+}));
+
+export const pluginImageVersions = pgTable('plugin_image_versions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  schemaVersionId: uuid('schema_version_id')
+    .notNull()
+    .references(() => schemaVersion.id, { onDelete: 'cascade' }),
+  version: text('version').notNull(),
+  platform: text('platform').array().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const pluginImageVersionsRelations = relations(pluginImageVersions, ({ one }) => ({
+  schemaVersion: one(schemaVersion, {
+    fields: [pluginImageVersions.schemaVersionId],
+    references: [schemaVersion.id],
+  }),
+}));
+
+export const namespaceSubgraphCheckExtensionConfig = pgTable(
+  'namespace_subgraph_check_extensions_config',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    namespaceId: uuid('namespace_id')
+      .notNull()
+      .unique()
+      .references(() => namespaces.id, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull(),
+    secretKey: text('secret_key'),
+    includeComposedSdl: boolean('include_composed_sdl').notNull().default(false),
+    includeLintingIssues: boolean('include_linting_issues').notNull().default(false),
+    includePruningIssues: boolean('include_pruning_issues').notNull().default(false),
+    includeSchemaChanges: boolean('include_schema_changes').notNull().default(false),
+    includeAffectedOperations: boolean('include_affected_operations').notNull().default(false),
+  },
+  (t) => {
+    return {
+      namespaceIdIndex: index('nsce_namespace_id_idx').on(t.namespaceId),
+    };
+  },
+);
+
+export const routerConfigHash = pgTable(
+  'router_config_hash',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    federatedGraphId: uuid('federated_graph_id')
+      .notNull()
+      .references(() => federatedGraphs.id, { onDelete: 'cascade' }),
+    featureFlagId: uuid('feature_flag_id').references(() => featureFlags.id, { onDelete: 'cascade' }),
+    hash: text('hash').notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at'),
+  },
+  (t) => {
+    return {
+      graphFlagIndex: unique('fed_graph_feature_flag_idx').on(t.federatedGraphId, t.featureFlagId).nullsNotDistinct(),
+    };
+  },
+);
+
+export const onboarding = pgTable(
+  'onboarding',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    finishedAt: timestamp('finished_at', { withTimezone: true }),
+    version: integer('version').notNull().default(1),
+    slack: boolean('slack').notNull().default(true),
+    email: boolean('email').notNull().default(true),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+  },
+  (t) => {
+    return {
+      uniqueUserOrgVersion: unique('onboarding_user_id_organization_id_version_unique').on(
+        t.userId,
+        t.organizationId,
+        t.version,
+      ),
+    };
+  },
+);
+
+export const batchPublishJobStatusEnum = pgEnum('batch_publish_job_status', [
+  'pending',
+  'processing',
+  'failed',
+  'completed',
+] as const);
+
+export const batchPublishJobDetails = pgTable('batch_publish_job_details', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  status: batchPublishJobStatusEnum('status').notNull(),
+  organizationId: uuid('organization_id')
+    .notNull()
+    .references(() => organizations.id, { onDelete: 'cascade' }),
+  failureReason: text('failure_reason'),
+  compositionResult: json('composition_result').$type<{
+    deploymentErrors: PlainMessage<DeploymentError>[];
+    compositionWarnings: PlainMessage<CompositionWarning>[];
+    compositionErrors: PlainMessage<CompositionError>[];
+    updatedSubgraphNames: string[];
+  }>(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }),
+});

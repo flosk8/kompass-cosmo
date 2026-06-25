@@ -8,7 +8,7 @@ import {
   UpdateProposalResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { OrganizationEventName } from '@wundergraph/cosmo-connect/dist/notifications/events_pb';
-import { ProposalState } from '../../../db/models.js';
+import { ProposalOrigin, ProposalState } from '../../../db/models.js';
 import { ProposalRepository } from '../../repositories/ProposalRepository.js';
 import { SubgraphRepository } from '../../repositories/SubgraphRepository.js';
 import type { RouterOptions } from '../../routes.js';
@@ -26,6 +26,7 @@ import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookSe
 import { SchemaUsageTrafficInspector } from '../../services/SchemaUsageTrafficInspector.js';
 import { Composer } from '../../composition/composer.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { hubUserAgent } from '../../constants.js';
 
 export function updateProposal(
   opts: RouterOptions,
@@ -38,7 +39,7 @@ export function updateProposal(
     const authContext = await opts.authenticator.authenticate(ctx.requestHeader);
     logger = enrichLogger(ctx, logger, authContext);
 
-    const proposalRepo = new ProposalRepository(opts.db);
+    const proposalRepo = new ProposalRepository(opts.db, authContext.organizationId);
     const federatedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
     const subgraphRepo = new SubgraphRepository(logger, opts.db, authContext.organizationId);
     const auditLogRepo = new AuditLogRepository(opts.db);
@@ -47,6 +48,7 @@ export function updateProposal(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
     const namespaceRepo = new NamespaceRepository(opts.db, authContext.organizationId);
 
@@ -75,6 +77,7 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     }
 
@@ -96,6 +99,7 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     }
 
@@ -118,6 +122,7 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     }
 
@@ -148,6 +153,31 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
+      };
+    }
+
+    const clientHdr = ctx.requestHeader.get('user-agent')?.toLowerCase() ?? '';
+    const expectedOrigin: ProposalOrigin = clientHdr.includes(hubUserAgent) ? 'EXTERNAL' : 'INTERNAL';
+    if (proposal.proposal.origin !== expectedOrigin) {
+      return {
+        response: {
+          code: EnumStatusCode.ERR_NOT_FOUND,
+          details: `Proposal ${req.proposalName} not found`,
+        },
+        breakingChanges: [],
+        nonBreakingChanges: [],
+        compositionErrors: [],
+        checkId: '',
+        lintWarnings: [],
+        lintErrors: [],
+        graphPruneWarnings: [],
+        graphPruneErrors: [],
+        compositionWarnings: [],
+        lintingSkipped: false,
+        graphPruningSkipped: false,
+        checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     }
 
@@ -222,6 +252,7 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     } else if (req.updateAction.case === 'updatedSubgraphs') {
       if (proposal.proposal.state !== 'DRAFT') {
@@ -242,6 +273,7 @@ export function updateProposal(
           lintingSkipped: false,
           graphPruningSkipped: false,
           checkUrl: '',
+          composedSchemaBreakingChanges: [],
         };
       }
 
@@ -263,6 +295,7 @@ export function updateProposal(
           lintingSkipped: false,
           graphPruningSkipped: false,
           checkUrl: '',
+          composedSchemaBreakingChanges: [],
         };
       }
 
@@ -286,6 +319,7 @@ export function updateProposal(
           lintingSkipped: false,
           graphPruningSkipped: false,
           checkUrl: '',
+          composedSchemaBreakingChanges: [],
         };
       }
 
@@ -330,6 +364,7 @@ export function updateProposal(
               lintingSkipped: false,
               graphPruningSkipped: false,
               checkUrl: '',
+              composedSchemaBreakingChanges: [],
             };
           }
 
@@ -353,6 +388,7 @@ export function updateProposal(
               lintingSkipped: false,
               graphPruningSkipped: false,
               checkUrl: '',
+              composedSchemaBreakingChanges: [],
             };
           }
 
@@ -375,6 +411,7 @@ export function updateProposal(
               lintingSkipped: false,
               graphPruningSkipped: false,
               checkUrl: '',
+              composedSchemaBreakingChanges: [],
             };
           }
         }
@@ -426,6 +463,7 @@ export function updateProposal(
         contractRepo,
         graphCompostionRepo,
         opts.chClient,
+        opts.webhookProxyUrl,
       );
 
       const {
@@ -440,8 +478,15 @@ export function updateProposal(
         graphPruneErrors,
         compositionWarnings,
         operationUsageStats,
+        isLinkedTrafficCheckFailed,
+        isLinkedPruningCheckFailed,
+        composedSchemaBreakingChanges,
       } = await schemaCheckRepo.checkMultipleSchemas({
+        actorId: authContext.userId,
+        blobStorage: opts.blobStorage,
+        admissionConfig: { cdnBaseUrl: opts.cdnBaseUrl, jwtSecret: opts.jwtSecret },
         organizationId: authContext.organizationId,
+        organizationSlug: authContext.organizationSlug,
         orgRepo,
         subgraphRepo,
         fedGraphRepo,
@@ -464,6 +509,14 @@ export function updateProposal(
         logger,
         chClient: opts.chClient,
         skipProposalMatchCheck: true,
+        webhookService: new OrganizationWebhookService(
+          opts.db,
+          authContext.organizationId,
+          opts.logger,
+          opts.billingDefaultPlanId,
+          opts.webhookProxyUrl,
+        ),
+        webhookProxyUrl: opts.webhookProxyUrl,
       });
 
       if (checkId) {
@@ -488,6 +541,9 @@ export function updateProposal(
         lintingSkipped: !namespace.enableLinting,
         graphPruningSkipped: !namespace.enableGraphPruning,
         checkUrl: `${process.env.WEB_BASE_URL}/${authContext.organizationSlug}/${namespace.name}/graph/${federatedGraph.name}/checks/${checkId}`,
+        isLinkedPruningCheckFailed,
+        isLinkedTrafficCheckFailed,
+        composedSchemaBreakingChanges,
       };
     } else {
       return {
@@ -507,6 +563,7 @@ export function updateProposal(
         lintingSkipped: false,
         graphPruningSkipped: false,
         checkUrl: '',
+        composedSchemaBreakingChanges: [],
       };
     }
   });

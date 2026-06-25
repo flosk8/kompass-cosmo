@@ -5,25 +5,71 @@
 
 version: '1'
 
+#graphql_metrics:
+#  enabled: true
+#  collector_endpoint: http://localhost:4005
+
 execution_config:
   file:
     path: './__schemas/config.json'
+    # watch: true
+
+router_registration: false
 
 log_level: debug
 
+headers:
+  all:
+    request:
+      - op: propagate
+        named: X-User-Id
+
 watch_config:
-  enabled: true
+  enabled: false
   interval: '10s'
 
   startup_delay:
     enabled: false
     maximum: '10s'
 
+access_logs:
+  enabled: false
+  level: info
+  add_stacktrace: true
+
+telemetry:
+  metrics:
+    prometheus:
+      enabled: true
+      connection_stats: true
+      engine_stats:
+        subscriptions: true
+  tracing:
+    enabled: true
+    sampling_rate: 1
+    operation_content_attributes: true
+
+    exporters:
+      - exporter: http
+        endpoint: http://localhost:4318
+        headers:
+          Authorization: Bearer ${GRAPH_API_TOKEN}
+        batch_timeout: '10s'
+        export_timeout: '30s'
+      - exporter: http
+        endpoint: http://localhost:4319
+        batch_timeout: '10s'
+        export_timeout: '30s'
+
+plugins:
+  enabled: true
+
 engine:
   max_concurrent_resolvers: 1024
+  enable_single_flight: true
   debug:
     report_websocket_connections: true
-    report_memory_usage: true
+    report_memory_usage: false
 
 events:
   providers:

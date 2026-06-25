@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"mime/multipart"
 	"net"
@@ -31,16 +30,17 @@ import (
 
 	"github.com/cloudflare/backoff"
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/go-retryablehttp"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -52,18 +52,23 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/wundergraph/cosmo/demo/pkg/subgraphs"
 	projects "github.com/wundergraph/cosmo/demo/pkg/subgraphs/projects/generated"
 	"github.com/wundergraph/cosmo/demo/pkg/subgraphs/projects/src/service"
+	"github.com/wundergraph/cosmo/router-tests/freeport"
 	"github.com/wundergraph/cosmo/router/core"
 	nodev1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/node/v1"
 	"github.com/wundergraph/cosmo/router/pkg/config"
 	"github.com/wundergraph/cosmo/router/pkg/controlplane/configpoller"
 	"github.com/wundergraph/cosmo/router/pkg/logging"
 	rmetric "github.com/wundergraph/cosmo/router/pkg/metric"
+	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
 	pubsubNats "github.com/wundergraph/cosmo/router/pkg/pubsub/nats"
+	"github.com/wundergraph/cosmo/router/pkg/statistics"
+	rtrace "github.com/wundergraph/cosmo/router/pkg/trace"
 )
 
 var ErrEnvironmentClosed = errors.New("test environment closed")
@@ -91,6 +96,11 @@ var (
 	//go:embed testdata/configWithGRPC.json
 	ConfigWithGRPCJSONTemplate string
 
+	// routerTestsDir is the absolute path to the router-tests directory,
+	// derived from this source file's location. Used internally by testexec.go
+	// to locate the router binary.
+	routerTestsDir string
+
 	DemoNatsProviders  = []string{natsDefaultSourceName, myNatsProviderID}
 	DemoKafkaProviders = []string{myKafkaProviderID}
 	DemoRedisProviders = []string{myRedisProviderID}
@@ -98,6 +108,9 @@ var (
 
 func init() {
 	freeport.SetLogLevel(freeport.ERROR)
+
+	_, thisFile, _, _ := runtime.Caller(0)
+	routerTestsDir = filepath.Dir(filepath.Dir(thisFile))
 }
 
 // Run runs the test and fails the test if an error occurs
@@ -160,6 +173,7 @@ func Bench(b *testing.B, cfg *Config, f func(b *testing.B, xEnv *Environment)) {
 	}
 	b.StartTimer()
 	f(b, env)
+	b.StopTimer()
 	if cfg.AssertCacheMetrics != nil {
 		assertCacheMetrics(b, env, cfg.AssertCacheMetrics.BaseGraphAssertions, "")
 
@@ -167,6 +181,7 @@ func Bench(b *testing.B, cfg *Config, f func(b *testing.B, xEnv *Environment)) {
 			assertCacheMetrics(b, env, v, ff)
 		}
 	}
+	b.StartTimer()
 }
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -259,6 +274,13 @@ type EngineStatOptions struct {
 	EnableSubscription bool
 }
 
+type MetricsLogExporterOptions struct {
+	Enabled        bool
+	ExcludeMetrics []*regexp.Regexp
+	IncludeMetrics []*regexp.Regexp
+	ExportInterval time.Duration
+}
+
 type MetricOptions struct {
 	MetricExclusions                      MetricExclusions
 	EnableRuntimeMetrics                  bool
@@ -269,13 +291,28 @@ type MetricOptions struct {
 	PrometheusSchemaFieldUsage            PrometheusSchemaFieldUsage
 	EnableOTLPConnectionMetrics           bool
 	EnableOTLPCircuitBreakerMetrics       bool
+	EnableOTLPStreamMetrics               bool
 	EnablePrometheusConnectionMetrics     bool
 	EnablePrometheusCircuitBreakerMetrics bool
+	EnablePrometheusStreamMetrics         bool
+	LogExporter                           MetricsLogExporterOptions
+	OTLPCostStats                         config.CostStats
+	PrometheusCostStats                   config.CostStats
+	OTLPExemplarFilter                    config.ExemplarFilter
+	PrometheusExemplarFilter              config.ExemplarFilter
 }
 
 type PrometheusSchemaFieldUsage struct {
 	Enabled             bool
 	IncludeOperationSha bool
+	Exporter            *PrometheusSchemaFieldUsageExporter
+}
+
+type PrometheusSchemaFieldUsageExporter struct {
+	BatchSize     int
+	QueueSize     int
+	Interval      time.Duration
+	ExportTimeout time.Duration
 }
 
 type Config struct {
@@ -289,18 +326,22 @@ type Config struct {
 	ModifyEngineExecutionConfiguration func(engineExecutionConfiguration *config.EngineExecutionConfiguration)
 	ModifySecurityConfiguration        func(securityConfiguration *config.SecurityConfiguration)
 	ModifySubgraphErrorPropagation     func(subgraphErrorPropagation *config.SubgraphErrorPropagationConfiguration)
+	ModifySubgraphExtensionPropagation func(subgraphExtensionPropagation *config.SubgraphExtensionPropagationConfiguration)
 	ModifyWebsocketConfiguration       func(websocketConfiguration *config.WebSocketConfiguration)
 	ModifyCDNConfig                    func(cdnConfig *config.CDNConfiguration)
 	DemoMode                           bool
 	KafkaSeeds                         []string
 	DisableWebSockets                  bool
 	DisableParentBasedSampler          bool
-	TLSConfig                          *core.TlsConfig
+	TLSConfig                          config.TLSConfiguration
 	TraceExporter                      trace.SpanExporter
+	TracingSanitizeUTF8                *config.SanitizeUTF8Config
+	IPAnonymization                    *core.IPAnonymizationConfig
 	CustomMetricAttributes             []config.CustomAttribute
 	CustomTelemetryAttributes          []config.CustomAttribute
 	CustomTracingAttributes            []config.CustomAttribute
 	CustomResourceAttributes           []config.CustomStaticAttribute
+	OperationContentAttributes         bool
 	MetricReader                       metric.Reader
 	PrometheusRegistry                 *prometheus.Registry
 	PrometheusPort                     int
@@ -329,15 +370,19 @@ type Config struct {
 	UseVersionedGraph                  bool
 	NoShutdownTestServer               bool
 	MCP                                config.MCPConfiguration
+	MCPOperationsPath                  string
+	MCPAuthToken                       string // Optional Bearer token for MCP authentication
 	EnableRedis                        bool
 	EnableRedisCluster                 bool
 	Plugins                            PluginConfig
 	EnableGRPC                         bool
+	IgnoreQueryParamsList              []string
 }
 
 type PluginConfig struct {
-	Path    string
-	Enabled bool
+	Path        string
+	Enabled     bool
+	RegistryURL string // for OCI plugin tests
 }
 
 type CacheMetricsAssertions struct {
@@ -374,9 +419,18 @@ type SubgraphsConfig struct {
 }
 
 type SubgraphConfig struct {
-	Middleware   func(http.Handler) http.Handler
-	Delay        time.Duration
-	CloseOnStart bool
+	Middleware      func(http.Handler) http.Handler
+	GRPCInterceptor grpc.UnaryServerInterceptor
+	Delay           time.Duration
+	CloseOnStart    bool
+
+	// TLSConfig enables TLS on this subgraph server. When set, the subgraph uses StartTLS()
+	// instead of Start(). This is useful for testing mTLS between the router and subgraphs.
+	TLSConfig *tls.Config
+
+	// GRPCTLSConfig enables TLS on the gRPC subgraph server. When set, the gRPC server
+	// uses TLS credentials instead of plain connections.
+	GRPCTLSConfig *tls.Config
 }
 
 type LogObservationConfig struct {
@@ -389,8 +443,10 @@ type MCPConfig struct {
 	Port    int
 }
 
-var redisHost = "redis://localhost:6379"
-var redisClusterHost = "redis://localhost:7001"
+var (
+	redisHost        = "redis://localhost:6379"
+	redisClusterHost = "redis://localhost:7001"
+)
 
 // CreateTestSupervisorEnv is currently tailored specifically for /lifecycle/supervisor_test.go, refer to that test
 // for usage example. CreateTestSupervisorEnv is not a drop-in replacement for CreateTestEnv!
@@ -412,6 +468,14 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		)
 		if err != nil {
 			return nil, err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		err = client.Ping(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("could not connect to kafka: %w", err)
 		}
 
 		kafkaClient = client
@@ -438,14 +502,14 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	if oc := cfg.LogObservation; oc.Enabled {
 		var zCore zapcore.Core
 		zCore, logObserver = observer.New(oc.LogLevel)
-		cfg.Logger = logging.NewZapLoggerWithCore(zCore, true)
+		cfg.Logger = logging.NewZapLoggerWithCore(zCore, true, true)
 	} else {
 		ec := zap.NewProductionEncoderConfig()
 		ec.EncodeDuration = zapcore.SecondsDurationEncoder
 		ec.TimeKey = "time"
 
 		syncer := zapcore.AddSync(os.Stderr)
-		cfg.Logger = logging.NewZapLogger(syncer, false, true, zapcore.ErrorLevel)
+		cfg.Logger = logging.NewZapLogger(syncer, false, true, true, zapcore.ErrorLevel)
 	}
 
 	if cfg.AccessLogger == nil {
@@ -464,10 +528,6 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		Mood:         atomic.NewInt64(0),
 		Countries:    atomic.NewInt64(0),
 	}
-
-	requiredPorts := 2
-
-	ports := freeport.GetN(t, requiredPorts)
 
 	getPubSubName := GetPubSubNameFn(pubSubPrefix)
 
@@ -563,15 +623,15 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		localDelay:       cfg.Subgraphs.Countries.Delay,
 	}
 
-	employeesServer := makeSafeHttpTestServer(t, employees)
-	familyServer := makeSafeHttpTestServer(t, family)
-	hobbiesServer := makeSafeHttpTestServer(t, hobbies)
-	productsServer := makeSafeHttpTestServer(t, products)
-	test1Server := makeSafeHttpTestServer(t, test1)
-	availabilityServer := makeSafeHttpTestServer(t, availability)
-	moodServer := makeSafeHttpTestServer(t, mood)
-	countriesServer := makeSafeHttpTestServer(t, countries)
-	productFgServer := makeSafeHttpTestServer(t, productsFg)
+	employeesServer := makeSubgraphTestServer(t, employees, cfg.Subgraphs.Employees.TLSConfig)
+	familyServer := makeSubgraphTestServer(t, family, cfg.Subgraphs.Family.TLSConfig)
+	hobbiesServer := makeSubgraphTestServer(t, hobbies, cfg.Subgraphs.Hobbies.TLSConfig)
+	productsServer := makeSubgraphTestServer(t, products, cfg.Subgraphs.Products.TLSConfig)
+	test1Server := makeSubgraphTestServer(t, test1, cfg.Subgraphs.Test1.TLSConfig)
+	availabilityServer := makeSubgraphTestServer(t, availability, cfg.Subgraphs.Availability.TLSConfig)
+	moodServer := makeSubgraphTestServer(t, mood, cfg.Subgraphs.Mood.TLSConfig)
+	countriesServer := makeSubgraphTestServer(t, countries, cfg.Subgraphs.Countries.TLSConfig)
+	productFgServer := makeSubgraphTestServer(t, productsFg, cfg.Subgraphs.ProductsFg.TLSConfig)
 
 	var (
 		projectServer *grpc.Server
@@ -579,19 +639,19 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	)
 
 	if cfg.EnableGRPC {
-		projectServer, endpoint = makeSafeGRPCServer(t, &projects.ProjectsService_ServiceDesc, &service.ProjectsService{})
+		projectServer, endpoint = makeSafeGRPCServer(t, &projects.ProjectsService_ServiceDesc, &service.ProjectsService{}, cfg.Subgraphs.Projects.GRPCInterceptor, cfg.Subgraphs.Projects.GRPCTLSConfig)
 	}
 
 	replacements := map[string]string{
-		subgraphs.EmployeesDefaultDemoURL:    gqlURL(employeesServer),
-		subgraphs.FamilyDefaultDemoURL:       gqlURL(familyServer),
-		subgraphs.HobbiesDefaultDemoURL:      gqlURL(hobbiesServer),
-		subgraphs.ProductsDefaultDemoURL:     gqlURL(productsServer),
-		subgraphs.Test1DefaultDemoURL:        gqlURL(test1Server),
-		subgraphs.AvailabilityDefaultDemoURL: gqlURL(availabilityServer),
-		subgraphs.MoodDefaultDemoURL:         gqlURL(moodServer),
-		subgraphs.CountriesDefaultDemoURL:    gqlURL(countriesServer),
-		subgraphs.ProductsFgDefaultDemoURL:   gqlURL(productFgServer),
+		subgraphs.EmployeesDefaultDemoURL:    GqlURL(employeesServer),
+		subgraphs.FamilyDefaultDemoURL:       GqlURL(familyServer),
+		subgraphs.HobbiesDefaultDemoURL:      GqlURL(hobbiesServer),
+		subgraphs.ProductsDefaultDemoURL:     GqlURL(productsServer),
+		subgraphs.Test1DefaultDemoURL:        GqlURL(test1Server),
+		subgraphs.AvailabilityDefaultDemoURL: GqlURL(availabilityServer),
+		subgraphs.MoodDefaultDemoURL:         GqlURL(moodServer),
+		subgraphs.CountriesDefaultDemoURL:    GqlURL(countriesServer),
+		subgraphs.ProductsFgDefaultDemoURL:   GqlURL(productFgServer),
 		subgraphs.ProjectsDefaultDemoURL:     grpcURL(endpoint),
 	}
 
@@ -621,14 +681,12 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 
 	cdnServer := cfg.CdnSever
 	if cfg.CdnSever == nil {
-		cdnServer = SetupCDNServer(t, freeport.GetOne(t))
+		cdnServer, _ = SetupCDNServer(t)
 	}
 
 	if cfg.PrometheusRegistry != nil {
-		cfg.PrometheusPort = ports[0]
+		cfg.PrometheusPort = freeport.GetOne(t)
 	}
-
-	listenerAddr := fmt.Sprintf("localhost:%d", ports[1])
 
 	client := &http.Client{}
 
@@ -643,8 +701,12 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 
 	if cfg.MCP.Enabled {
 		cfg.MCP.Server.ListenAddr = fmt.Sprintf("localhost:%d", freeport.GetOne(t))
+		if cfg.MCP.OAuth.Enabled && cfg.MCP.Server.BaseURL == "" {
+			cfg.MCP.Server.BaseURL = fmt.Sprintf("http://%s", cfg.MCP.Server.ListenAddr)
+		}
 	}
 
+	listenerAddr := fmt.Sprintf("localhost:%d", freeport.GetOne(t))
 	baseURL := fmt.Sprintf("http://%s", listenerAddr)
 
 	rs, err := core.NewRouterSupervisor(&core.RouterSupervisorOpts{
@@ -653,7 +715,7 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 			return &config.Config{}, nil
 		},
 		RouterFactory: func(ctx context.Context, res *core.RouterResources) (*core.Router, error) {
-			rr, err := configureRouter(listenerAddr, cfg, &routerConfig, cdnServer, natsSetup)
+			rr, err := configureRouter(ctx, listenerAddr, cfg, &routerConfig, cdnServer, natsSetup)
 			if err != nil {
 				cancel(err)
 				return nil, err
@@ -663,20 +725,15 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		},
 	})
 
-	if cfg.TLSConfig != nil && cfg.TLSConfig.Enabled {
-
-		cert, err := tls.LoadX509KeyPair(cfg.TLSConfig.CertFile, cfg.TLSConfig.KeyFile)
+	if cfg.TLSConfig.Server.Enabled {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSConfig.Server.CertFile, cfg.TLSConfig.Server.KeyFile)
 		require.NoError(t, err)
 
-		caCert, err := os.ReadFile(cfg.TLSConfig.CertFile)
-		if err != nil {
-			log.Fatal(err)
-		}
+		caCert, err := os.ReadFile(cfg.TLSConfig.Server.CertFile)
+		require.NoError(t, err)
 
 		caCertPool := x509.NewCertPool()
-		if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-			t.Fatalf("could not append ca cert to pool")
-		}
+		require.True(t, caCertPool.AppendCertsFromPEM(caCert), "could not append ca cert to pool")
 
 		// Retain the default transport settings
 		httpClient := cleanhttp.DefaultPooledClient()
@@ -805,7 +862,17 @@ func CreateTestSupervisorEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	if cfg.MCP.Enabled {
 		// Create MCP client connecting to the MCP server
 		mcpAddr := fmt.Sprintf("http://%s/mcp", cfg.MCP.Server.ListenAddr)
-		client, err := mcpclient.NewSSEMCPClient(mcpAddr)
+
+		// Add authentication headers if token is provided
+		var clientOpts []transport.StreamableHTTPCOption
+		if cfg.MCPAuthToken != "" {
+			headers := map[string]string{
+				"Authorization": fmt.Sprintf("Bearer %s", cfg.MCPAuthToken),
+			}
+			clientOpts = append(clientOpts, transport.WithHTTPHeaders(headers))
+		}
+
+		client, err := mcpclient.NewStreamableHttpClient(mcpAddr, clientOpts...)
 		if err != nil {
 			t.Fatalf("Failed to create MCP client: %v", err)
 		}
@@ -841,6 +908,14 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 			return nil, err
 		}
 
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		err = client.Ping(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("could not connect to kafka: %w", err)
+		}
+
 		kafkaClient = client
 		kafkaAdminClient = kadm.NewClient(kafkaClient)
 	}
@@ -865,14 +940,14 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	if oc := cfg.LogObservation; oc.Enabled {
 		var zCore zapcore.Core
 		zCore, logObserver = observer.New(oc.LogLevel)
-		cfg.Logger = logging.NewZapLoggerWithCore(zCore, true)
+		cfg.Logger = logging.NewZapLoggerWithCore(zCore, true, true)
 	} else {
 		ec := zap.NewProductionEncoderConfig()
 		ec.EncodeDuration = zapcore.SecondsDurationEncoder
 		ec.TimeKey = "time"
 
 		syncer := zapcore.AddSync(os.Stderr)
-		cfg.Logger = logging.NewZapLogger(syncer, false, true, zapcore.ErrorLevel)
+		cfg.Logger = logging.NewZapLogger(syncer, false, true, true, zapcore.ErrorLevel)
 	}
 
 	if cfg.AccessLogger == nil {
@@ -891,10 +966,6 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		Mood:         atomic.NewInt64(0),
 		Countries:    atomic.NewInt64(0),
 	}
-
-	requiredPorts := 2
-
-	ports := freeport.GetN(t, requiredPorts)
 
 	getPubSubName := GetPubSubNameFn(pubSubPrefix)
 
@@ -990,15 +1061,15 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 		localDelay:       cfg.Subgraphs.Countries.Delay,
 	}
 
-	employeesServer := makeSafeHttpTestServer(t, employees)
-	familyServer := makeSafeHttpTestServer(t, family)
-	hobbiesServer := makeSafeHttpTestServer(t, hobbies)
-	productsServer := makeSafeHttpTestServer(t, products)
-	test1Server := makeSafeHttpTestServer(t, test1)
-	availabilityServer := makeSafeHttpTestServer(t, availability)
-	moodServer := makeSafeHttpTestServer(t, mood)
-	countriesServer := makeSafeHttpTestServer(t, countries)
-	productFgServer := makeSafeHttpTestServer(t, productsFg)
+	employeesServer := makeSubgraphTestServer(t, employees, cfg.Subgraphs.Employees.TLSConfig)
+	familyServer := makeSubgraphTestServer(t, family, cfg.Subgraphs.Family.TLSConfig)
+	hobbiesServer := makeSubgraphTestServer(t, hobbies, cfg.Subgraphs.Hobbies.TLSConfig)
+	productsServer := makeSubgraphTestServer(t, products, cfg.Subgraphs.Products.TLSConfig)
+	test1Server := makeSubgraphTestServer(t, test1, cfg.Subgraphs.Test1.TLSConfig)
+	availabilityServer := makeSubgraphTestServer(t, availability, cfg.Subgraphs.Availability.TLSConfig)
+	moodServer := makeSubgraphTestServer(t, mood, cfg.Subgraphs.Mood.TLSConfig)
+	countriesServer := makeSubgraphTestServer(t, countries, cfg.Subgraphs.Countries.TLSConfig)
+	productFgServer := makeSubgraphTestServer(t, productsFg, cfg.Subgraphs.ProductsFg.TLSConfig)
 
 	var (
 		projectServer *grpc.Server
@@ -1006,19 +1077,19 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	)
 
 	if cfg.EnableGRPC {
-		projectServer, endpoint = makeSafeGRPCServer(t, &projects.ProjectsService_ServiceDesc, &service.ProjectsService{})
+		projectServer, endpoint = makeSafeGRPCServer(t, &projects.ProjectsService_ServiceDesc, &service.ProjectsService{}, cfg.Subgraphs.Projects.GRPCInterceptor, cfg.Subgraphs.Projects.GRPCTLSConfig)
 	}
 
 	replacements := map[string]string{
-		subgraphs.EmployeesDefaultDemoURL:    gqlURL(employeesServer),
-		subgraphs.FamilyDefaultDemoURL:       gqlURL(familyServer),
-		subgraphs.HobbiesDefaultDemoURL:      gqlURL(hobbiesServer),
-		subgraphs.ProductsDefaultDemoURL:     gqlURL(productsServer),
-		subgraphs.Test1DefaultDemoURL:        gqlURL(test1Server),
-		subgraphs.AvailabilityDefaultDemoURL: gqlURL(availabilityServer),
-		subgraphs.MoodDefaultDemoURL:         gqlURL(moodServer),
-		subgraphs.CountriesDefaultDemoURL:    gqlURL(countriesServer),
-		subgraphs.ProductsFgDefaultDemoURL:   gqlURL(productFgServer),
+		subgraphs.EmployeesDefaultDemoURL:    GqlURL(employeesServer),
+		subgraphs.FamilyDefaultDemoURL:       GqlURL(familyServer),
+		subgraphs.HobbiesDefaultDemoURL:      GqlURL(hobbiesServer),
+		subgraphs.ProductsDefaultDemoURL:     GqlURL(productsServer),
+		subgraphs.Test1DefaultDemoURL:        GqlURL(test1Server),
+		subgraphs.AvailabilityDefaultDemoURL: GqlURL(availabilityServer),
+		subgraphs.MoodDefaultDemoURL:         GqlURL(moodServer),
+		subgraphs.CountriesDefaultDemoURL:    GqlURL(countriesServer),
+		subgraphs.ProductsFgDefaultDemoURL:   GqlURL(productFgServer),
 		subgraphs.ProjectsDefaultDemoURL:     grpcURL(endpoint),
 	}
 
@@ -1048,14 +1119,12 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 
 	cdnServer := cfg.CdnSever
 	if cfg.CdnSever == nil {
-		cdnServer = SetupCDNServer(t, freeport.GetOne(t))
+		cdnServer, _ = SetupCDNServer(t)
 	}
 
 	if cfg.PrometheusRegistry != nil {
-		cfg.PrometheusPort = ports[0]
+		cfg.PrometheusPort = freeport.GetOne(t)
 	}
-
-	listenerAddr := fmt.Sprintf("localhost:%d", ports[1])
 
 	client := &http.Client{}
 
@@ -1070,28 +1139,27 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 
 	if cfg.MCP.Enabled {
 		cfg.MCP.Server.ListenAddr = fmt.Sprintf("localhost:%d", freeport.GetOne(t))
+		if cfg.MCP.OAuth.Enabled && cfg.MCP.Server.BaseURL == "" {
+			cfg.MCP.Server.BaseURL = fmt.Sprintf("http://%s", cfg.MCP.Server.ListenAddr)
+		}
 	}
 
-	rr, err := configureRouter(listenerAddr, cfg, &routerConfig, cdnServer, natsSetup)
+	listenerAddr := fmt.Sprintf("localhost:%d", freeport.GetOne(t))
+	rr, err := configureRouter(ctx, listenerAddr, cfg, &routerConfig, cdnServer, natsSetup)
 	if err != nil {
 		cancel(err)
 		return nil, err
 	}
 
-	if cfg.TLSConfig != nil && cfg.TLSConfig.Enabled {
-
-		cert, err := tls.LoadX509KeyPair(cfg.TLSConfig.CertFile, cfg.TLSConfig.KeyFile)
+	if cfg.TLSConfig.Server.Enabled {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSConfig.Server.CertFile, cfg.TLSConfig.Server.KeyFile)
 		require.NoError(t, err)
 
-		caCert, err := os.ReadFile(cfg.TLSConfig.CertFile)
-		if err != nil {
-			log.Fatal(err)
-		}
+		caCert, err := os.ReadFile(cfg.TLSConfig.Server.CertFile)
+		require.NoError(t, err)
 
 		caCertPool := x509.NewCertPool()
-		if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-			t.Fatalf("could not append ca cert to pool")
-		}
+		require.True(t, caCertPool.AppendCertsFromPEM(caCert), "could not append ca cert to pool")
 
 		// Retain the default transport settings
 		httpClient := cleanhttp.DefaultPooledClient()
@@ -1230,7 +1298,17 @@ func CreateTestEnv(t testing.TB, cfg *Config) (*Environment, error) {
 	if cfg.MCP.Enabled {
 		// Create MCP client connecting to the MCP server
 		mcpAddr := fmt.Sprintf("http://%s/mcp", cfg.MCP.Server.ListenAddr)
-		client, err := mcpclient.NewSSEMCPClient(mcpAddr)
+
+		// Add authentication headers if token is provided
+		var clientOpts []transport.StreamableHTTPCOption
+		if cfg.MCPAuthToken != "" {
+			headers := map[string]string{
+				"Authorization": fmt.Sprintf("Bearer %s", cfg.MCPAuthToken),
+			}
+			clientOpts = append(clientOpts, transport.WithHTTPHeaders(headers))
+		}
+
+		client, err := mcpclient.NewStreamableHttpClient(mcpAddr, clientOpts...)
 		if err != nil {
 			t.Fatalf("Failed to create MCP client: %v", err)
 		}
@@ -1258,7 +1336,7 @@ func GenerateVersionedJwtToken() (string, error) {
 	return jwtToken.SignedString([]byte("hunter2"))
 }
 
-func configureRouter(listenerAddr string, testConfig *Config, routerConfig *nodev1.RouterConfig, cdn *httptest.Server, natsData *NatsData) (*core.Router, error) {
+func configureRouter(ctx context.Context, listenerAddr string, testConfig *Config, routerConfig *nodev1.RouterConfig, cdn *httptest.Server, natsData *NatsData) (*core.Router, error) {
 	cfg := config.Config{
 		Graph: config.Graph{},
 		CDN: config.CDNConfiguration{
@@ -1295,21 +1373,21 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 	}
 
 	engineExecutionConfig := config.EngineExecutionConfiguration{
-		EnableNetPoll:                          true,
-		EnableSingleFlight:                     true,
-		EnableRequestTracing:                   true,
-		EnableExecutionPlanCacheResponseHeader: true,
-		EnableNormalizationCache:               true,
-		NormalizationCacheSize:                 1024,
+		EnableNetPoll:                     true,
+		EnableSingleFlight:                true,
+		EnableInboundRequestDeduplication: false,
+		EnableRequestTracing:              true,
+		EnableNormalizationCache:          true,
+		NormalizationCacheSize:            1024,
 		Debug: config.EngineDebugConfiguration{
-			ReportWebSocketConnections:                   true,
-			PrintQueryPlans:                              false,
-			EnablePersistedOperationsCacheResponseHeader: true,
-			EnableNormalizationCacheResponseHeader:       true,
+			ReportWebSocketConnections: true,
+			PrintQueryPlans:            false,
+			EnableCacheResponseHeaders: true,
 		},
-		WebSocketClientPollTimeout:    300 * time.Millisecond,
-		WebSocketClientConnBufferSize: 1,
-		WebSocketClientReadTimeout:    1 * time.Second,
+		WebSocketServerPollTimeout:    300 * time.Millisecond,
+		WebSocketServerConnBufferSize: 1,
+		WebSocketServerReadTimeout:    1 * time.Second,
+		WebSocketServerWriteTimeout:   2 * time.Second,
 		WebSocketClientWriteTimeout:   2 * time.Second,
 		// Avoid get in conflict with any test that doesn't expect to handle pings
 		WebSocketClientPingInterval:    30 * time.Second,
@@ -1331,6 +1409,10 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 
 	if testConfig.ModifySubgraphErrorPropagation != nil {
 		testConfig.ModifySubgraphErrorPropagation(&cfg.SubgraphErrorPropagation)
+	}
+
+	if testConfig.ModifySubgraphExtensionPropagation != nil {
+		testConfig.ModifySubgraphExtensionPropagation(&cfg.SubgraphExtensionPropagation)
 	}
 
 	var natsEventSources []config.NatsEventSource
@@ -1389,10 +1471,11 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 		core.WithDisableUsageTracking(),
 		core.WithLogger(testConfig.Logger),
 		core.WithAccessLogs(&core.AccessLogsConfig{
-			Logger:             testConfig.AccessLogger,
-			Attributes:         testConfig.AccessLogFields,
-			SubgraphEnabled:    testConfig.SubgraphAccessLogsEnabled,
-			SubgraphAttributes: testConfig.SubgraphAccessLogFields,
+			Logger:                testConfig.AccessLogger,
+			Attributes:            testConfig.AccessLogFields,
+			IgnoreQueryParamsList: testConfig.IgnoreQueryParamsList,
+			SubgraphEnabled:       testConfig.SubgraphAccessLogsEnabled,
+			SubgraphAttributes:    testConfig.SubgraphAccessLogFields,
 		}),
 		core.WithGraphApiToken(graphApiToken),
 		core.WithDevelopmentMode(true),
@@ -1411,10 +1494,13 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 			OmitExtensions:        testConfig.BatchingConfig.OmitExtensions,
 		}),
 		core.WithSubgraphErrorPropagation(cfg.SubgraphErrorPropagation),
+		core.WithSubgraphExtensionPropagation(cfg.SubgraphExtensionPropagation),
 		core.WithTLSConfig(testConfig.TLSConfig),
 		core.WithInstanceID("test-instance"),
 		core.WithGracePeriod(15 * time.Second),
-		core.WithIntrospection(true),
+		core.WithIntrospection(true, config.IntrospectionConfiguration{
+			Enabled: true,
+		}),
 		core.WithQueryPlans(true),
 		core.WithEvents(eventsConfiguration),
 	}
@@ -1434,12 +1520,15 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 	}
 
 	if testConfig.MCP.Enabled {
-		// Add Storage provider
+		mcpOperationsPath := "testdata/mcp_operations"
+		if testConfig.MCPOperationsPath != "" {
+			mcpOperationsPath = testConfig.MCPOperationsPath
+		}
 		routerOpts = append(routerOpts, core.WithStorageProviders(config.StorageProviders{
 			FileSystem: []config.FileSystemStorageProvider{
 				{
 					ID:   "test",
-					Path: "testdata/mcp_operations",
+					Path: mcpOperationsPath,
 				},
 			},
 		}))
@@ -1449,33 +1538,55 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 		routerOpts = append(routerOpts, core.WithMCP(testConfig.MCP))
 	}
 
-	routerOpts = append(routerOpts, core.WithPlugins(config.PluginsConfiguration{
+	pluginsCfg := config.PluginsConfiguration{
 		Path:    testConfig.Plugins.Path,
 		Enabled: testConfig.Plugins.Enabled,
-	}))
+	}
+	if testConfig.Plugins.RegistryURL != "" {
+		if strings.HasPrefix(testConfig.Plugins.RegistryURL, "http://") || strings.HasPrefix(testConfig.Plugins.RegistryURL, "https://") {
+			return nil, fmt.Errorf("RegistryURL must be a host-only OCI registry address (no http:// or https:// scheme), got %q", testConfig.Plugins.RegistryURL)
+		}
+		pluginsCfg.Registry = config.PluginRegistryConfiguration{
+			URL:      testConfig.Plugins.RegistryURL,
+			Insecure: true,
+		}
+	}
+	routerOpts = append(routerOpts, core.WithPlugins(pluginsCfg))
 
 	if testConfig.TraceExporter != nil {
 		testConfig.PropagationConfig.TraceContext = true
 
+		tracingConfig := config.Tracing{
+			Enabled:                    true,
+			SamplingRate:               1,
+			ParentBasedSampler:         !testConfig.DisableParentBasedSampler,
+			OperationContentAttributes: testConfig.OperationContentAttributes,
+			Exporters:                  []config.TracingExporter{},
+			Propagation:                testConfig.PropagationConfig,
+			TracingGlobalFeatures:      config.TracingGlobalFeatures{},
+			ResponseTraceHeader:        testConfig.ResponseTraceHeader,
+		}
+
+		if testConfig.TracingSanitizeUTF8 != nil {
+			tracingConfig.SanitizeUTF8 = *testConfig.TracingSanitizeUTF8
+		}
+
 		c := core.TraceConfigFromTelemetry(&config.Telemetry{
 			ServiceName:        "cosmo-router",
 			ResourceAttributes: testConfig.CustomResourceAttributes,
-			Tracing: config.Tracing{
-				Enabled:               true,
-				SamplingRate:          1,
-				ParentBasedSampler:    !testConfig.DisableParentBasedSampler,
-				Exporters:             []config.TracingExporter{},
-				Propagation:           testConfig.PropagationConfig,
-				TracingGlobalFeatures: config.TracingGlobalFeatures{},
-				ResponseTraceHeader:   testConfig.ResponseTraceHeader,
-			},
+			Tracing:            tracingConfig,
 		})
 
 		c.TestMemoryExporter = testConfig.TraceExporter
+		c.TestErrorHandler = rtrace.NewOtelErrorHandler(testConfig.Logger)
 
 		routerOpts = append(routerOpts,
 			core.WithTracing(c),
 		)
+	}
+
+	if testConfig.IPAnonymization != nil {
+		routerOpts = append(routerOpts, core.WithAnonymization(testConfig.IPAnonymization))
 	}
 
 	if testConfig.CustomTelemetryAttributes != nil {
@@ -1489,8 +1600,36 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 	var prometheusConfig rmetric.PrometheusConfig
 
 	if testConfig.PrometheusRegistry != nil {
+		promSchemaUsage := rmetric.PrometheusSchemaFieldUsage{
+			Enabled:             testConfig.MetricOptions.PrometheusSchemaFieldUsage.Enabled,
+			IncludeOperationSha: testConfig.MetricOptions.PrometheusSchemaFieldUsage.IncludeOperationSha,
+		}
+
+		// Provide defaults for exporter settings if enabled
+		// Use shorter intervals for tests to avoid waiting too long
+		if promSchemaUsage.Enabled {
+			if testConfig.MetricOptions.PrometheusSchemaFieldUsage.Exporter != nil {
+				// Use user-provided exporter settings
+				promSchemaUsage.Exporter = rmetric.PrometheusSchemaFieldUsageExporter{
+					BatchSize:     testConfig.MetricOptions.PrometheusSchemaFieldUsage.Exporter.BatchSize,
+					QueueSize:     testConfig.MetricOptions.PrometheusSchemaFieldUsage.Exporter.QueueSize,
+					Interval:      testConfig.MetricOptions.PrometheusSchemaFieldUsage.Exporter.Interval,
+					ExportTimeout: testConfig.MetricOptions.PrometheusSchemaFieldUsage.Exporter.ExportTimeout,
+				}
+			} else {
+				// Use test-friendly defaults
+				promSchemaUsage.Exporter = rmetric.PrometheusSchemaFieldUsageExporter{
+					BatchSize:     100,                    // Smaller batch size for tests
+					QueueSize:     1000,                   // Smaller queue for tests
+					Interval:      100 * time.Millisecond, // Fast flush for tests
+					ExportTimeout: 5 * time.Second,
+				}
+			}
+		}
+
 		prometheusConfig = rmetric.PrometheusConfig{
 			Enabled:         true,
+			ExemplarFilter:  rmetric.ExemplarFilter(testConfig.MetricOptions.PrometheusExemplarFilter),
 			ListenAddr:      fmt.Sprintf("localhost:%d", testConfig.PrometheusPort),
 			Path:            "/metrics",
 			TestRegistry:    testConfig.PrometheusRegistry,
@@ -1499,14 +1638,13 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 			EngineStats: rmetric.EngineStatsConfig{
 				Subscription: testConfig.MetricOptions.PrometheusEngineStatsOptions.EnableSubscription,
 			},
-			CircuitBreaker:      testConfig.MetricOptions.EnablePrometheusCircuitBreakerMetrics,
-			ExcludeMetrics:      testConfig.MetricOptions.MetricExclusions.ExcludedPrometheusMetrics,
-			ExcludeMetricLabels: testConfig.MetricOptions.MetricExclusions.ExcludedPrometheusMetricLabels,
-			ExcludeScopeInfo:    testConfig.MetricOptions.MetricExclusions.ExcludeScopeInfo,
-			PromSchemaFieldUsage: rmetric.PrometheusSchemaFieldUsage{
-				Enabled:             testConfig.MetricOptions.PrometheusSchemaFieldUsage.Enabled,
-				IncludeOperationSha: testConfig.MetricOptions.PrometheusSchemaFieldUsage.IncludeOperationSha,
-			},
+			CircuitBreaker:       testConfig.MetricOptions.EnablePrometheusCircuitBreakerMetrics,
+			CostStats:            testConfig.MetricOptions.PrometheusCostStats,
+			ExcludeMetrics:       testConfig.MetricOptions.MetricExclusions.ExcludedPrometheusMetrics,
+			ExcludeMetricLabels:  testConfig.MetricOptions.MetricExclusions.ExcludedPrometheusMetricLabels,
+			Streams:              testConfig.MetricOptions.EnablePrometheusStreamMetrics,
+			ExcludeScopeInfo:     testConfig.MetricOptions.MetricExclusions.ExcludeScopeInfo,
+			PromSchemaFieldUsage: promSchemaUsage,
 		}
 	}
 
@@ -1522,21 +1660,30 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 				},
 				OTLP: config.MetricsOTLP{
 					Enabled:         true,
+					ExemplarFilter:  testConfig.MetricOptions.OTLPExemplarFilter,
 					RouterRuntime:   testConfig.MetricOptions.EnableRuntimeMetrics,
 					GraphqlCache:    testConfig.MetricOptions.EnableOTLPRouterCache,
+					Streams:         testConfig.MetricOptions.EnableOTLPStreamMetrics,
 					ConnectionStats: testConfig.MetricOptions.EnableOTLPConnectionMetrics,
 					EngineStats: config.EngineStats{
 						Subscriptions: testConfig.MetricOptions.OTLPEngineStatsOptions.EnableSubscription,
 					},
 					CircuitBreaker:      testConfig.MetricOptions.EnableOTLPCircuitBreakerMetrics,
+					CostStats:           testConfig.MetricOptions.OTLPCostStats,
 					ExcludeMetrics:      testConfig.MetricOptions.MetricExclusions.ExcludedOTLPMetrics,
 					ExcludeMetricLabels: testConfig.MetricOptions.MetricExclusions.ExcludedOTLPMetricLabels,
+					LogExporter: config.MetricsLogExporter{
+						Enabled:        testConfig.MetricOptions.LogExporter.Enabled,
+						ExcludeMetrics: testConfig.MetricOptions.LogExporter.ExcludeMetrics,
+						IncludeMetrics: testConfig.MetricOptions.LogExporter.IncludeMetrics,
+					},
 				},
 			},
 		})
 
 		c.Prometheus = prometheusConfig
 		c.OpenTelemetry.TestReader = testConfig.MetricReader
+		c.OpenTelemetry.LogExporter.ExportInterval = testConfig.MetricOptions.LogExporter.ExportInterval
 		c.IsUsingCloudExporter = !testConfig.DisableSimulateCloudExporter
 
 		routerOpts = append(routerOpts, core.WithMetrics(c))
@@ -1545,6 +1692,9 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 	if testConfig.OverrideGraphQLPath != "" {
 		routerOpts = append(routerOpts, core.WithGraphQLPath(testConfig.OverrideGraphQLPath))
 	}
+
+	syncReporter := NewSyncReporter(context.Background(), testConfig.Logger)
+	routerOpts = append(routerOpts, core.WithEngineStats(syncReporter))
 
 	if !testConfig.DisableWebSockets {
 		wsConfig := &config.WebSocketConfiguration{
@@ -1594,7 +1744,7 @@ func configureRouter(listenerAddr string, testConfig *Config, routerConfig *node
 		routerOpts = append(routerOpts, core.WithWebSocketConfiguration(wsConfig))
 		routerOpts = append(routerOpts, core.WithClientHeader(testConfig.ClientHeader))
 	}
-	return core.NewRouter(routerOpts...)
+	return core.NewRouter(ctx, routerOpts...)
 }
 
 func testTokenClaims() jwt.MapClaims {
@@ -1611,89 +1761,97 @@ func testVersionedTokenClaims() jwt.MapClaims {
 	}
 }
 
-func makeHttpTestServerWithPort(t testing.TB, handler http.Handler, port int) *httptest.Server {
+func makeSubgraphTestServer(_ testing.TB, handler http.Handler, tlsConfig *tls.Config) *httptest.Server {
+	// NewUnstartedServer binds an ephemeral port.
+	// We want to avoid using freeport because it creates too much strain on the network stack:
+	// freeport checks if port is available by listening on it and then closing the listener.
+	// On Linux trying to listen on the just-closed port could lead to the "unable to bind" error.
 	s := httptest.NewUnstartedServer(handler)
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		t.Fatalf("could not listen on port: %s", err.Error())
-	}
-	_ = s.Listener.Close()
-	s.Listener = l
-	s.Start()
 
+	if tlsConfig != nil {
+		s.TLS = tlsConfig
+		s.StartTLS()
+		return s
+	}
+	s.Start()
 	return s
 }
 
-func makeSafeHttpTestServer(t testing.TB, handler http.Handler) *httptest.Server {
-	s := httptest.NewUnstartedServer(handler)
-	port := freeport.GetOne(t)
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		t.Fatalf("could not listen on port: %s", err.Error())
-	}
-	_ = s.Listener.Close()
-	s.Listener = l
-	s.Start()
-
-	return s
-}
-
-func makeSafeGRPCServer(t testing.TB, sd *grpc.ServiceDesc, service any) (*grpc.Server, string) {
+func makeSafeGRPCServer(t testing.TB, sd *grpc.ServiceDesc, service any, interceptor grpc.UnaryServerInterceptor, tlsConfig *tls.Config) (*grpc.Server, string) {
 	t.Helper()
 
-	port := freeport.GetOne(t)
-
-	endpoint := fmt.Sprintf("localhost:%d", port)
-
-	lis, err := net.Listen("tcp", endpoint)
+	// We could use freeport here, but it is easy to use ephemeral port and get the endpoint
+	// easily.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+	endpoint := lis.Addr().String()
 
 	require.NotNil(t, service)
 
-	s := grpc.NewServer()
+	var opts []grpc.ServerOption
+	if interceptor != nil {
+		opts = append(opts, grpc.ChainUnaryInterceptor(interceptor))
+	}
+	if tlsConfig != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+	}
+
+	s := grpc.NewServer(opts...)
 	s.RegisterService(sd, service)
 
 	go func() {
-		err := s.Serve(lis)
-		require.NoError(t, err)
+		if err := s.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			t.Errorf("gRPC test server Serve error: %v", err)
+		}
 	}()
 
 	return s, endpoint
 }
 
-func SetupCDNServer(t testing.TB, port int) *httptest.Server {
+func SetupCDNServer(t testing.TB) (cdnServer *httptest.Server, port int) {
 	_, filePath, _, ok := runtime.Caller(0)
 	require.True(t, ok)
 	baseCdnFile := filepath.Join(path.Dir(filePath), "testdata", "cdn")
 	cdnFileServer := http.FileServer(http.Dir(baseCdnFile))
 	var cdnRequestLog []string
-	cdnServer := makeHttpTestServerWithPort(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			requestLog, err := json.Marshal(cdnRequestLog)
-			require.NoError(t, err)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, err = w.Write(requestLog)
-			require.NoError(t, err)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 			return
 		}
+
 		cdnRequestLog = append(cdnRequestLog, r.Method+" "+r.URL.Path)
 		// Ensure we have an authorization header with a valid token
 		authorization := r.Header.Get("Authorization")
-		if authorization == "" {
-			require.NotEmpty(t, authorization, "missing authorization header")
+		token, ok := strings.CutPrefix(authorization, "Bearer ")
+		if !ok {
+			http.Error(w, "missing or malformed Bearer token", http.StatusUnauthorized)
+			return
 		}
-		token := authorization[len("Bearer "):]
 		parsedClaims := make(jwt.MapClaims)
 		jwtParser := new(jwt.Parser)
-		_, _, err := jwtParser.ParseUnverified(token, parsedClaims)
-		require.NoError(t, err)
+		if _, _, err := jwtParser.ParseUnverified(token, parsedClaims); err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
 		cdnFileServer.ServeHTTP(w, r)
-	}), port)
-
-	return cdnServer
+	})
+	cdnServer = httptest.NewServer(handler)
+	port = cdnServer.Listener.Addr().(*net.TCPAddr).Port
+	return cdnServer, port
 }
 
-func gqlURL(srv *httptest.Server) string {
+func GqlURL(srv *httptest.Server) string {
 	path, err := url.JoinPath(srv.URL, "/graphql")
 	if err != nil {
 		panic(err)
@@ -1705,10 +1863,10 @@ func grpcURL(endpoint string) string {
 	return "dns:///" + endpoint
 }
 
-func ReadAndCheckJSON(t testing.TB, conn *websocket.Conn, v interface{}) (err error) {
+func ReadAndCheckJSON(t testing.TB, conn *websocket.Conn, v any) (err error) {
 	_, payload, err := conn.ReadMessage()
 	if err != nil {
-		return err
+		return fmt.Errorf("read message: %w", err)
 	}
 	if err := json.Unmarshal(payload, &v); err != nil {
 		t.Logf("Failed to decode WebSocket message. Raw payload: %s", string(payload))
@@ -1791,6 +1949,14 @@ func (e *Environment) Observer() *observer.ObservedLogs {
 	return e.logObserver
 }
 
+// GetMCPServerAddr returns the MCP server address for testing
+func (e *Environment) GetMCPServerAddr() string {
+	if e.cfg.MCP.Enabled {
+		return fmt.Sprintf("http://%s/mcp", e.cfg.MCP.Server.ListenAddr)
+	}
+	return ""
+}
+
 // Shutdown closes all resources associated with the test environment. Can be called multiple times but will only
 // shut down resources once.
 func (e *Environment) Shutdown() {
@@ -1823,6 +1989,10 @@ func (e *Environment) Shutdown() {
 		// Do not call s.Close() here, as it will get stuck on connections left open!
 		lErr := s.Listener.Close()
 		if lErr != nil {
+			if errors.Is(lErr, net.ErrClosed) {
+				// skip, server was already closed, e.g. through manual (intentional) intervention
+				continue
+			}
 			e.t.Logf("could not close server listener: %s", lErr)
 		}
 	}
@@ -1910,6 +2080,15 @@ func (e *Environment) WaitForServer(ctx context.Context, url string, timeoutMs i
 	for {
 		if maxAttempts == 0 {
 			return errors.New("max attempts reached, timed out waiting for server to be ready")
+		}
+		// If we're running a router binary process, check if it has exited
+		// by testing the process context (cancelled by cmd.Wait goroutine in testexec.go)
+		if e.routerCmd != nil && e.Context != nil {
+			select {
+			case <-e.Context.Done():
+				return fmt.Errorf("router process exited unexpectedly: %v", context.Cause(e.Context))
+			default:
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -2089,8 +2268,12 @@ func (e *Environment) newGraphQLRequestOverGET(baseURL string, request GraphQLRe
 }
 
 func (e *Environment) MakeGraphQLRequestRaw(request *http.Request) (*TestResponse, error) {
+	return MakeGraphQLRequestRawFromClient(request, e.RouterClient)
+}
+
+func MakeGraphQLRequestRawFromClient(request *http.Request, routerClient *http.Client) (*TestResponse, error) {
 	request.Header.Set("Accept-Encoding", "identity")
-	resp, err := e.RouterClient.Do(request)
+	resp, err := routerClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -2268,8 +2451,9 @@ type WebSocketMessage struct {
 }
 
 type GraphQLResponse struct {
-	Data   json.RawMessage `json:"data,omitempty"`
-	Errors []GraphQLError  `json:"errors,omitempty"`
+	Data       json.RawMessage `json:"data,omitempty"`
+	Errors     []GraphQLError  `json:"errors,omitempty"`
+	Extensions json.RawMessage `json:"extensions,omitempty"`
 }
 
 type GraphQLErrorExtensions struct {
@@ -2465,28 +2649,32 @@ func (e *Environment) InitAbsintheWebSocketConnection(header http.Header, initia
 	return conn
 }
 
+func (e *Environment) syncReporter() *SyncReporter {
+	sr, ok := e.Router.EngineStats.(*SyncReporter)
+	if !ok {
+		e.t.Fatal("EngineStats is not a *SyncReporter; test environment misconfigured")
+		return nil
+	}
+	return sr
+}
+
 func (e *Environment) WaitForSubscriptionCount(desiredCount uint64, timeout time.Duration) {
 	e.t.Helper()
 
 	ctx, cancel := context.WithTimeout(e.Context, timeout)
 	defer cancel()
 
-	report := e.Router.EngineStats.GetReport()
-	if report.Subscriptions == desiredCount {
-		return
-	}
+	sr := e.syncReporter()
+	report := sr.Wait(ctx, func(r *statistics.UsageReport) bool {
+		return r.Subscriptions == desiredCount
+	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			e.t.Fatalf("timed out waiting for subscription count, got %d, want %d", report.Subscriptions, desiredCount)
-			return
-		case <-time.After(100 * time.Millisecond):
-			report = e.Router.EngineStats.GetReport()
-			if report.Subscriptions == desiredCount {
-				return
-			}
+	if report == nil || report.Subscriptions != desiredCount {
+		got := uint64(0)
+		if report != nil {
+			got = report.Subscriptions
 		}
+		e.t.Fatalf("timed out waiting for subscription count, got %d, want %d", got, desiredCount)
 	}
 }
 
@@ -2496,22 +2684,17 @@ func (e *Environment) WaitForConnectionCount(desiredCount uint64, timeout time.D
 	ctx, cancel := context.WithTimeout(e.Context, timeout)
 	defer cancel()
 
-	report := e.Router.EngineStats.GetReport()
-	if report.Connections == desiredCount {
-		return
-	}
+	sr := e.syncReporter()
+	report := sr.Wait(ctx, func(r *statistics.UsageReport) bool {
+		return r.Connections == desiredCount
+	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			e.t.Fatalf("timed out waiting for connection count, got %d, want %d", report.Connections, desiredCount)
-			return
-		case <-time.After(100 * time.Millisecond):
-			report = e.Router.EngineStats.GetReport()
-			if report.Connections == desiredCount {
-				return
-			}
+	if report == nil || report.Connections != desiredCount {
+		got := uint64(0)
+		if report != nil {
+			got = report.Connections
 		}
+		e.t.Fatalf("timed out waiting for connection count, got %d, want %d", got, desiredCount)
 	}
 }
 
@@ -2567,21 +2750,131 @@ func (e *Environment) WaitForMessagesSent(desiredCount uint64, timeout time.Dura
 	ctx, cancel := context.WithTimeout(e.Context, timeout)
 	defer cancel()
 
-	report := e.Router.EngineStats.GetReport()
-	if report.MessagesSent == desiredCount {
-		return
+	sr := e.syncReporter()
+	report := sr.Wait(ctx, func(r *statistics.UsageReport) bool {
+		return r.MessagesSent >= desiredCount
+	})
+
+	if report == nil || report.MessagesSent < desiredCount {
+		got := uint64(0)
+		if report != nil {
+			got = report.MessagesSent
+		}
+		e.t.Fatalf("timed out waiting for messages sent, got %d, want at least %d", got, desiredCount)
 	}
+}
+
+// NATSPublishUntilReceived publishes a NATS message and retries until
+// the subscription processes it. Handles the race between NATS ChanSubscribe
+// (which buffers the SUB command) and server-side subscription registration.
+func (e *Environment) NATSPublishUntilReceived(conn *nats.Conn, subject string, data []byte, _ uint64, timeout time.Duration) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.Context, timeout)
+	defer cancel()
+
+	sr := e.syncReporter()
 
 	for {
-		select {
-		case <-ctx.Done():
-			e.t.Fatalf("timed out waiting for messages sent, got %d, want %d", report.MessagesSent, desiredCount)
+		err := conn.Publish(subject, data)
+		require.NoError(e.t, err)
+		err = conn.Flush()
+		require.NoError(e.t, err)
+
+		// Wait for SubscriptionUpdateSent event confirming message delivery
+		shortCtx, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+		ok := sr.WaitForEvent(shortCtx, EventSubscriptionUpdateSent)
+		shortCancel()
+
+		if ok {
 			return
-		case <-time.After(100 * time.Millisecond):
-			report = e.Router.EngineStats.GetReport()
-			if report.MessagesSent == desiredCount {
-				return
-			}
+		}
+
+		if ctx.Err() != nil {
+			e.t.Fatalf("timed out: no SubscriptionUpdateSent received after publish")
+		}
+	}
+}
+
+// KafkaPublishUntilReceived produces a Kafka message and retries until
+// the subscription processes it. Handles the race between Kafka consumer
+// group join/partition assignment and message production.
+func (e *Environment) KafkaPublishUntilReceived(topicName string, message string, _ uint64, timeout time.Duration) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.Context, timeout)
+	defer cancel()
+
+	sr := e.syncReporter()
+
+	for {
+		pErrCh := make(chan error, 1)
+		e.KafkaClient.Produce(ctx, &kgo.Record{
+			Topic: e.GetPubSubName(topicName),
+			Value: []byte(message),
+		}, func(_ *kgo.Record, err error) {
+			pErrCh <- err
+		})
+
+		select {
+		case pErr := <-pErrCh:
+			require.NoError(e.t, pErr)
+		case <-ctx.Done():
+			e.t.Fatalf("timed out producing Kafka message")
+		}
+
+		// Wait for SubscriptionUpdateSent event confirming message delivery
+		shortCtx, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+		ok := sr.WaitForEvent(shortCtx, EventSubscriptionUpdateSent)
+		shortCancel()
+
+		if ok {
+			return
+		}
+
+		if ctx.Err() != nil {
+			e.t.Fatalf("timed out: no SubscriptionUpdateSent received after Kafka produce")
+		}
+	}
+}
+
+// RedisPublishUntilReceived publishes a Redis message and retries until
+// the subscription processes it. Handles the race between Redis subscription
+// setup and message publishing, similar to NATSPublishUntilReceived.
+func (e *Environment) RedisPublishUntilReceived(topicName string, message string, timeout time.Duration) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.Context, timeout)
+	defer cancel()
+
+	sr := e.syncReporter()
+
+	parsedURL, err := url.Parse(e.RedisHosts[0])
+	require.NoError(e.t, err, "failed to parse Redis URL")
+
+	var redisConn redis.UniversalClient
+	if !e.RedisWithClusterMode {
+		redisConn = redis.NewClient(&redis.Options{
+			Addr: parsedURL.Host,
+		})
+	} else {
+		redisConn = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs: []string{parsedURL.Host},
+		})
+	}
+	defer redisConn.Close()
+
+	for {
+		intCmd := redisConn.Publish(ctx, e.GetPubSubName(topicName), message)
+		require.NoError(e.t, intCmd.Err())
+
+		shortCtx, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+		ok := sr.WaitForEvent(shortCtx, EventSubscriptionUpdateSent)
+		shortCancel()
+
+		if ok {
+			return
+		}
+
+		if ctx.Err() != nil {
+			e.t.Fatalf("timed out: no SubscriptionUpdateSent received after Redis publish")
 		}
 	}
 }
@@ -2592,22 +2885,17 @@ func (e *Environment) WaitForMinMessagesSent(minCount uint64, timeout time.Durat
 	ctx, cancel := context.WithTimeout(e.Context, timeout)
 	defer cancel()
 
-	report := e.Router.EngineStats.GetReport()
-	if report.MessagesSent >= minCount {
-		return
-	}
+	sr := e.syncReporter()
+	report := sr.Wait(ctx, func(r *statistics.UsageReport) bool {
+		return r.MessagesSent >= minCount
+	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			e.t.Fatalf("timed out waiting for messages sent, got %d, want at least %d", report.MessagesSent, minCount)
-			return
-		case <-time.After(100 * time.Millisecond):
-			report = e.Router.EngineStats.GetReport()
-			if report.MessagesSent >= minCount {
-				return
-			}
+	if report == nil || report.MessagesSent < minCount {
+		got := uint64(0)
+		if report != nil {
+			got = report.MessagesSent
 		}
+		e.t.Fatalf("timed out waiting for messages sent, got %d, want at least %d", got, minCount)
 	}
 }
 
@@ -2617,21 +2905,62 @@ func (e *Environment) WaitForTriggerCount(desiredCount uint64, timeout time.Dura
 	ctx, cancel := context.WithTimeout(e.Context, timeout)
 	defer cancel()
 
-	report := e.Router.EngineStats.GetReport()
-	if report.Triggers == desiredCount {
-		return
-	}
+	sr := e.syncReporter()
+	report := sr.Wait(ctx, func(r *statistics.UsageReport) bool {
+		return r.Triggers >= desiredCount
+	})
 
+	if report == nil || report.Triggers < desiredCount {
+		got := uint64(0)
+		if report != nil {
+			got = report.Triggers
+		}
+		e.t.Fatalf("timed out waiting for trigger count, got %d, want at least %d", got, desiredCount)
+	}
+}
+
+// RequireTriggerCount asserts that the current trigger count equals desiredCount exactly.
+// Call this after WaitForSubscriptionCount has confirmed all subscriptions are active;
+// trigger creation is synchronous with subscription registration so no additional waiting is needed.
+func (e *Environment) RequireTriggerCount(desiredCount uint64) {
+	e.t.Helper()
+	report := e.syncReporter().GetReport()
+	require.Equal(e.t, desiredCount, report.Triggers, "expected exactly %d triggers, got %d", desiredCount, report.Triggers)
+}
+
+// NATSPublishUntilMinMessagesSent publishes a NATS message repeatedly until the
+// total MessagesSent count reaches minCount. This handles fan-out scenarios where
+// multiple subscriptions must all receive the message: if some consumers aren't
+// fully wired when the first publish goes out, subsequent publishes cover them.
+func (e *Environment) NATSPublishUntilMinMessagesSent(conn *nats.Conn, subject string, data []byte, minCount uint64, timeout time.Duration) {
+	e.t.Helper()
+	ctx, cancel := context.WithTimeout(e.Context, timeout)
+	defer cancel()
+
+	sr := e.syncReporter()
 	for {
-		select {
-		case <-ctx.Done():
-			e.t.Fatalf("timed out waiting for trigger count, got %d, want %d", report.Triggers, desiredCount)
+		err := conn.Publish(subject, data)
+		require.NoError(e.t, err)
+		err = conn.Flush()
+		require.NoError(e.t, err)
+
+		shortCtx, shortCancel := context.WithTimeout(ctx, 2*time.Second)
+		report := sr.Wait(shortCtx, func(r *statistics.UsageReport) bool {
+			return r.MessagesSent >= minCount
+		})
+		shortCancel()
+
+		if report != nil && report.MessagesSent >= minCount {
 			return
-		case <-time.After(100 * time.Millisecond):
-			report = e.Router.EngineStats.GetReport()
-			if report.Triggers == desiredCount {
-				return
+		}
+
+		if ctx.Err() != nil {
+			got := uint64(0)
+			if report != nil {
+				got = report.MessagesSent
 			}
+			e.t.Fatalf("timed out: messages sent count %d did not reach %d after publishing", got, minCount)
+			return
 		}
 	}
 }
@@ -2679,7 +3008,38 @@ func WSReadMessage(t testing.TB, conn *websocket.Conn) (messageType int, p []byt
 	return 0, nil, fmt.Errorf("failed to read from WebSocket: %w", err)
 }
 
+// ReadSSELine reads the next non-comment line from an SSE stream.
+// SSE comment lines (starting with ':') like heartbeats are silently skipped.
+func ReadSSELine(t testing.TB, reader *bufio.Reader) string {
+	t.Helper()
+	for {
+		line, _, err := reader.ReadLine()
+		require.NoError(t, err)
+		s := string(line)
+		if !strings.HasPrefix(s, ":") {
+			return s
+		}
+	}
+}
+
+// ReadSSEField reads the next SSE field line, skipping comments and empty lines.
+// Use this instead of ReadSSELine when reading "event:" or "data:" fields,
+// as heartbeats produce both a comment line and a trailing empty delimiter.
+func ReadSSEField(t testing.TB, reader *bufio.Reader) string {
+	t.Helper()
+	for {
+		line, _, err := reader.ReadLine()
+		require.NoError(t, err)
+		s := string(line)
+		if s != "" && !strings.HasPrefix(s, ":") {
+			return s
+		}
+	}
+}
+
 func WSReadJSON(t testing.TB, conn *websocket.Conn, v interface{}) (err error) {
+	t.Helper()
+
 	b := backoff.New(5*time.Second, 100*time.Millisecond)
 
 	attempts := 0
@@ -2695,7 +3055,7 @@ func WSReadJSON(t testing.TB, conn *websocket.Conn, v interface{}) (err error) {
 			return err
 		}
 
-		require.NoError(t, ReadAndCheckJSON(t, conn, v))
+		err = ReadAndCheckJSON(t, conn, v)
 
 		// Reset the deadline to prevent future operations from timing out
 		if resetErr := conn.SetReadDeadline(time.Time{}); resetErr != nil {
@@ -2817,7 +3177,9 @@ func subgraphOptions(ctx context.Context, t testing.TB, logger *zap.Logger, nats
 	}
 	natsPubSubByProviderID := make(map[string]pubsubNats.Adapter, len(DemoNatsProviders))
 	for _, sourceName := range DemoNatsProviders {
-		adapter, err := pubsubNats.NewAdapter(ctx, logger, natsData.Params[0].Url, natsData.Params[0].Opts, "hostname", "listenaddr")
+		adapter, err := pubsubNats.NewAdapter(ctx, logger, natsData.Params[0].Url, natsData.Params[0].Opts, "hostname", "listenaddr", false, datasource.ProviderOpts{
+			StreamMetricStore: rmetric.NewNoopStreamMetricStore(),
+		})
 		require.NoError(t, err)
 		require.NoError(t, adapter.Startup(ctx))
 		t.Cleanup(func() {

@@ -7,7 +7,6 @@ import {
   PublishMonographResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { buildSchema } from '../../composition/composition.js';
-import { AuditLogRepository } from '../../repositories/AuditLogRepository.js';
 import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
 import { DefaultNamespace, NamespaceRepository } from '../../repositories/NamespaceRepository.js';
 import { OrganizationRepository } from '../../repositories/OrganizationRepository.js';
@@ -16,6 +15,7 @@ import type { RouterOptions } from '../../routes.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function publishMonograph(
   opts: RouterOptions,
@@ -33,8 +33,8 @@ export function publishMonograph(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
-    const auditLogRepo = new AuditLogRepository(opts.db);
     const namespaceRepo = new NamespaceRepository(opts.db, authContext.organizationId);
     const subgraphRepo = new SubgraphRepository(logger, opts.db, authContext.organizationId);
     const federatedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
@@ -70,7 +70,12 @@ export function publishMonograph(
     let isV2Graph: boolean | undefined;
 
     try {
-      // Here we check if the schema is valid as a subgraph SDL
+      /* Here we check if the schema is valid as a subgraph SDL
+       * `buildSchema` only calls normalization in isolation.
+       * The `disableResolvabilityChecks` flag is only used in the federation step.
+       * The `ignoreExternalKeys` flag is propagated in normalization but only used in the federation step.
+       * Consequently, there is currently no reason to propagate the options within `buildSchema`.
+       */
       const result = buildSchema(subgraphSchemaSDL, true, graph.routerCompatibilityVersion);
       if (!result.success) {
         return {
@@ -135,24 +140,33 @@ export function publishMonograph(
       authContext,
     });
 
-    const { compositionErrors, updatedFederatedGraphs, deploymentErrors, compositionWarnings } =
-      await subgraphRepo.update(
-        {
-          targetId: subgraphs[0].targetId,
-          labels: [],
-          unsetLabels: false,
-          schemaSDL: subgraphSchemaSDL,
-          updatedBy: authContext.userId,
-          namespaceId: namespace.id,
-          isV2Graph,
-        },
-        opts.blobStorage,
-        {
-          cdnBaseUrl: opts.cdnBaseUrl,
-          webhookJWTSecret: opts.admissionWebhookJWTSecret,
-        },
-        opts.chClient!,
-      );
+    const { deploymentErrors, compositionErrors, compositionWarnings, updatedFederatedGraphs } =
+      await opts.db.transaction((tx) => {
+        const subgraphRepo = new SubgraphRepository(logger, tx, authContext.organizationId);
+        const compositionService = new CompositionService(
+          tx,
+          authContext.organizationId,
+          logger,
+          { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+          opts.blobStorage,
+          opts.chClient,
+          opts.webhookProxyUrl,
+          false,
+        );
+
+        return subgraphRepo.update(
+          {
+            targetId: subgraphs[0].targetId,
+            labels: [],
+            unsetLabels: false,
+            schemaSDL: subgraphSchemaSDL,
+            updatedBy: authContext.userId,
+            namespaceId: namespace.id,
+            isV2Graph,
+          },
+          compositionService,
+        );
+      });
 
     for (const graph of updatedFederatedGraphs) {
       orgWebhooks.send(

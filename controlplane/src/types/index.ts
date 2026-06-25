@@ -1,7 +1,17 @@
-import { LintSeverity } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import {
+  CompositionError,
+  CompositionWarning,
+  DeploymentError,
+  LintSeverity,
+} from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { JWTPayload } from 'jose';
-import { GraphPruningRuleEnum, LintRuleEnum, OrganizationRole, ProposalMatch } from '../db/models.js';
+import { PlainMessage } from '@bufbuild/protobuf';
+import { DBSubgraphType, GraphPruningRuleEnum, OrganizationRole, ProposalMatch, ProposalOrigin } from '../db/models.js';
 import { RBACEvaluator } from '../core/services/RBACEvaluator.js';
+import { ComposeGraphsTaskResultItem } from '../core/composition/composeGraphs.types.js';
+
+export const COMPOSITION_IGNORE_EXTERNAL_KEYS_FEATURE_ID = 'composition-ignore-external-keys';
+export const SPLIT_CONFIG_LOADING_FEATURE_ID = 'split-config-loading';
 
 export type FeatureIds =
   | 'users'
@@ -13,17 +23,23 @@ export type FeatureIds =
   | 'trace-sampling-rate'
   | 'requests'
   | 'feature-flags'
+  | 'persisted-operations'
   // Boolean features
-  | 'rbac'
-  | 'sso'
-  | 'security'
-  | 'support'
   | 'ai'
-  | 'oidc'
-  | 'scim'
-  | 'field-pruning-grace-period'
   | 'cache-warmer'
-  | 'proposals';
+  | 'composition-ignore-external-keys' // COMPOSITION_IGNORE_EXTERNAL_KEYS_FEATURE_ID
+  | 'field-pruning-grace-period'
+  | 'login-method-restrictions'
+  | 'oidc'
+  | 'plugins'
+  | 'proposals'
+  | 'rbac'
+  | 'scim'
+  | 'security'
+  | 'sso'
+  | 'subgraph-check-extensions'
+  | 'support'
+  | 'split-config-loading';
 
 export type Features = {
   [key in FeatureIds]: Feature;
@@ -36,7 +52,7 @@ export type Feature = {
 };
 
 export interface ListFilterOptions {
-  namespaceId?: string;
+  namespaceIds?: string[];
   limit: number;
   offset: number;
   query?: string;
@@ -87,6 +103,7 @@ export interface FederatedGraphDTO {
   supportsFederation: boolean;
   contract?: ContractDTO;
   routerCompatibilityVersion: string;
+  organizationId: string;
 }
 
 export interface FederatedGraphChangelogDTO {
@@ -100,6 +117,16 @@ export interface FederatedGraphChangelogDTO {
     createdAt: string;
   }[];
   compositionId: string;
+}
+
+export interface ProtoSubgraph {
+  schema: string;
+  mappings: string;
+  lock: string;
+  pluginData?: {
+    platforms: string[];
+    version: string;
+  };
 }
 
 export interface SubgraphDTO {
@@ -121,6 +148,8 @@ export interface SubgraphDTO {
   readme?: string;
   websocketSubprotocol?: 'auto' | 'graphql-ws' | 'graphql-transport-ws';
   isFeatureSubgraph: boolean;
+  type: DBSubgraphType;
+  proto?: ProtoSubgraph;
 }
 
 export interface FeatureSubgraphDTO extends SubgraphDTO {
@@ -158,6 +187,19 @@ export interface CheckedSubgraphDTO {
   labels: Label[];
 }
 
+export interface LinkedCheckDTO {
+  id: string;
+  affectedGraphNames: string[];
+  subgraphNames: string[];
+  namespace: string;
+  isCheckSuccessful: boolean;
+  hasClientTraffic: boolean;
+  hasGraphPruningErrors: boolean;
+  clientTrafficCheckSkipped: boolean;
+  graphPruningCheckSkipped: boolean;
+  isForcedSuccess: boolean;
+}
+
 export interface SchemaCheckDTO {
   id: string;
   targetID?: string;
@@ -189,6 +231,9 @@ export interface SchemaCheckDTO {
   compositionSkipped: boolean;
   breakingChangesSkipped: boolean;
   errorMessage?: string;
+  linkedChecks: LinkedCheckDTO[];
+  checkExtensionDeliveryId: string | undefined;
+  checkExtensionErrorMessage: string | undefined;
 }
 
 export interface SchemaCheckSummaryDTO extends SchemaCheckDTO {
@@ -215,6 +260,14 @@ export interface SchemaCheckDetailsDTO {
   }[];
   compositionErrors: string[];
   compositionWarnings: string[];
+  composedSchemaBreakingChanges: {
+    id: string;
+    message: string;
+    changeType: string;
+    path?: string;
+    isBreaking: boolean;
+    federatedGraphName: string;
+  }[];
 }
 
 export interface OrganizationDTO {
@@ -280,6 +333,7 @@ export interface OrganizationInvitationDTO {
   email: string;
   invitedBy?: string;
   groups: { groupId: string; kcGroupId: string | null }[];
+  lastSentAt?: Date;
 }
 
 export interface APIKeyDTO {
@@ -287,6 +341,7 @@ export interface APIKeyDTO {
   name: string;
   createdAt: string;
   lastUsedAt: string;
+  external: boolean;
   expiresAt: string;
   createdBy: string;
   group: { id: string; name: string } | undefined;
@@ -438,6 +493,9 @@ export type UserInfoEndpointResponse = {
   family_name: string;
   email: string;
   groups: string[];
+  // Set by the realm-level `identity_provider` protocol mapper when the user
+  // federated through a broker IdP. Absent for direct username/password logins.
+  identity_provider?: string;
 };
 
 export type AuthContext = {
@@ -449,11 +507,32 @@ export type AuthContext = {
   rbac: RBACEvaluator;
   userDisplayName: string;
   apiKeyName?: string;
+  loginMethod?: LoginMethod;
 };
+
+/**
+ * The outcome of evaluating the IdP namespace gate for a login method:
+ * - `all`        — no gate applies; every namespace is reachable.
+ * - `none`       — the login method is allowed in no namespace.
+ * - `restricted` — reachable only in `namespaceIds`.
+ */
+export type NamespaceAccess = { kind: 'all' } | { kind: 'none' } | { kind: 'restricted'; namespaceIds: Set<string> };
 
 export interface GraphApiKeyJwtPayload extends JWTPayload {
   federated_graph_id: string;
   organization_id: string;
+  features?: string[];
+}
+
+export interface PluginAccess {
+  type: 'repository';
+  name: string;
+  tag: string;
+  actions: string[];
+}
+
+export interface PluginApiKeyJwtPayload extends JWTPayload {
+  access: PluginAccess[];
 }
 
 export interface GraphApiKeyDTO {
@@ -490,9 +569,20 @@ export interface ClientDTO {
   lastUpdatedBy: string;
 }
 
+export interface ClientDTOWithOperationMetadata {
+  id: string;
+  name: string;
+  createdAt: string;
+  createdBy: string;
+  lastUpdatedAt: string;
+  lastUpdatedBy: string;
+  persistedOperationsCount: number;
+}
+
 export interface PersistedOperationWithClientDTO {
   id: string;
   operationId: string;
+  operationNames: string[];
   hash: string;
   filePath: string;
   createdAt: string;
@@ -532,6 +622,7 @@ export interface UpdatedPersistedOperation {
 export interface GraphCompositionDTO {
   id: string;
   schemaVersionId: string;
+  targetId?: string;
   createdAt: string;
   createdBy?: string;
   compositionErrors?: string;
@@ -600,10 +691,8 @@ export interface MailerParams {
   smtpPassword: string;
 }
 
-type LintRuleType = Record<LintRuleEnum, LintRuleEnum>;
-
 // when the rules are changed, it has to be changed in the constants.ts file in the studio to maintain consistency.
-export const LintRules: LintRuleType = {
+export const LintRules = {
   FIELD_NAMES_SHOULD_BE_CAMEL_CASE: 'FIELD_NAMES_SHOULD_BE_CAMEL_CASE',
   TYPE_NAMES_SHOULD_BE_PASCAL_CASE: 'TYPE_NAMES_SHOULD_BE_PASCAL_CASE',
   SHOULD_NOT_HAVE_TYPE_PREFIX: 'SHOULD_NOT_HAVE_TYPE_PREFIX',
@@ -622,7 +711,9 @@ export const LintRules: LintRuleType = {
   DISALLOW_CASE_INSENSITIVE_ENUM_VALUES: 'DISALLOW_CASE_INSENSITIVE_ENUM_VALUES',
   NO_TYPENAME_PREFIX_IN_TYPE_FIELDS: 'NO_TYPENAME_PREFIX_IN_TYPE_FIELDS',
   REQUIRE_DEPRECATION_REASON: 'REQUIRE_DEPRECATION_REASON',
-};
+} as const;
+
+export type LintRule = keyof typeof LintRules;
 
 export type Severity = 1 | 2;
 export type LintSeverityLevel = 'warn' | 'error';
@@ -635,7 +726,7 @@ export interface RulesConfig {
 }
 
 export interface LintIssueResult {
-  lintRuleType: LintRuleEnum | undefined;
+  lintRuleType: LintRule | undefined;
   severity: LintSeverity;
   message: string;
   issueLocation: {
@@ -648,7 +739,7 @@ export interface LintIssueResult {
 
 export interface SchemaLintDTO {
   severity: LintSeverityLevel;
-  ruleName: LintRuleEnum;
+  ruleName: LintRule;
 }
 
 export interface SchemaLintIssues {
@@ -703,6 +794,7 @@ export interface Field {
     endColumn?: number;
   };
   isDeprecated: boolean;
+  deprecationReason?: string;
 }
 export interface S3StorageOptions {
   url: string;
@@ -723,6 +815,7 @@ export interface NamespaceDTO {
   enableCacheWarmer: boolean;
   checksTimeframeInDays?: number;
   enableProposals: boolean;
+  enableSubgraphCheckExtensions: boolean;
 }
 
 export interface ProposalDTO {
@@ -733,6 +826,7 @@ export interface ProposalDTO {
   createdById: string;
   createdByEmail?: string;
   state: string;
+  origin: ProposalOrigin;
 }
 
 export interface ProposalSubgraphDTO {
@@ -745,3 +839,28 @@ export interface ProposalSubgraphDTO {
   isNew: boolean;
   labels: Label[];
 }
+
+export interface ComposeAndDeployResult {
+  deploymentErrors: PlainMessage<DeploymentError>[];
+  compositionErrors: PlainMessage<CompositionError>[];
+  compositionWarnings: PlainMessage<CompositionWarning>[];
+}
+
+export interface OrganizationFeatures {
+  ignoreExternalKeys: boolean;
+  splitConfigLoading: boolean;
+}
+
+export interface FederatedGraphAndCompositionResults {
+  federatedGraph: FederatedGraphDTO;
+  results: ComposeGraphsTaskResultItem[];
+}
+
+export const SOCIAL_LOGIN_PROVIDERS = ['google', 'github'] as const;
+export type SocialLoginProvider = (typeof SOCIAL_LOGIN_PROVIDERS)[number];
+
+export type LoginMethod =
+  | { type: 'sso'; ssoProviderId: string; alias: string }
+  | { type: 'social'; provider: SocialLoginProvider; alias: string }
+  | { type: 'password' }
+  | { type: 'api-key' };

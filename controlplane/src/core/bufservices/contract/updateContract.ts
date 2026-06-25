@@ -2,13 +2,7 @@ import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import { OrganizationEventName } from '@wundergraph/cosmo-connect/dist/notifications/events_pb';
-import {
-  CompositionError,
-  CompositionWarning,
-  DeploymentError,
-  UpdateContractRequest,
-  UpdateContractResponse,
-} from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import { UpdateContractRequest, UpdateContractResponse } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { AuditLogRepository } from '../../repositories/AuditLogRepository.js';
 import { ContractRepository } from '../../repositories/ContractRepository.js';
 import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
@@ -17,6 +11,7 @@ import type { RouterOptions } from '../../routes.js';
 import { enrichLogger, getLogger, handleError, isValidSchemaTags } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function updateContract(
   opts: RouterOptions,
@@ -32,13 +27,13 @@ export function updateContract(
     logger = enrichLogger(ctx, logger, authContext);
 
     const fedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
-    const contractRepo = new ContractRepository(logger, opts.db, authContext.organizationId);
     const auditLogRepo = new AuditLogRepository(opts.db);
     const orgWebhooks = new OrganizationWebhookService(
       opts.db,
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
 
     req.excludeTags = [...new Set(req.excludeTags)];
@@ -116,62 +111,56 @@ export function updateContract(
       };
     }
 
-    const updatedContractDetails = await contractRepo.update({
-      id: graph.contract.id,
-      excludeTags: req.excludeTags,
-      includeTags: req.includeTags,
-      actorId: authContext.userId,
-    });
+    const { deploymentErrors, compositionErrors, compositionWarnings } = await opts.db.transaction(async (tx) => {
+      const contractRepo = new ContractRepository(logger, tx, authContext.organizationId);
+      const fedGraphRepo = new FederatedGraphRepository(logger, tx, authContext.organizationId);
+      const compositionService = new CompositionService(
+        tx,
+        authContext.organizationId,
+        logger,
+        { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+        opts.blobStorage,
+        opts.chClient,
+        opts.webhookProxyUrl,
+        req.disableResolvabilityValidation,
+      );
 
-    await fedGraphRepo.update({
-      targetId: graph.targetId,
-      // if the routingUrl is not provided, it will be set to an empty string.
-      // As the routing url wont be updated in this case.
-      routingUrl: req.routingUrl || '',
-      updatedBy: authContext.userId,
-      readme: req.readme,
-      blobStorage: opts.blobStorage,
-      namespaceId: graph.namespaceId,
-      admissionWebhookURL: req.admissionWebhookUrl,
-      admissionWebhookSecret: req.admissionWebhookSecret,
-      admissionConfig: {
-        cdnBaseUrl: opts.cdnBaseUrl,
-        jwtSecret: opts.admissionWebhookJWTSecret,
-      },
-      labelMatchers: [],
-      chClient: opts.chClient!,
-    });
+      // Update the contract details
+      const updatedContractDetails = await contractRepo.update({
+        id: graph.contract!.id,
+        excludeTags: req.excludeTags,
+        includeTags: req.includeTags,
+        actorId: authContext.userId,
+      });
 
-    const compositionErrors: PlainMessage<CompositionError>[] = [];
-    const deploymentErrors: PlainMessage<DeploymentError>[] = [];
-    const compositionWarnings: PlainMessage<CompositionWarning>[] = [];
+      // Update the federated graph details
+      await fedGraphRepo.update({
+        compositionService,
+        targetId: graph.targetId,
+        // if the routingUrl is not provided, it will be set to an empty string.
+        // As the routing url wont be updated in this case.
+        routingUrl: req.routingUrl || '',
+        updatedBy: authContext.userId,
+        readme: req.readme,
+        namespaceId: graph.namespaceId,
+        admissionWebhookURL: req.admissionWebhookUrl,
+        admissionWebhookSecret: req.admissionWebhookSecret,
+        labelMatchers: [],
+      });
 
-    const composition = await fedGraphRepo.composeAndDeployGraphs({
-      federatedGraphs: [
-        {
-          ...graph,
+      // Compose the contract
+      return await compositionService.composeAndDeployFederatedGraph({
+        actorId: authContext.userId,
+        federatedGraph: {
+          ...graph!,
           routingUrl: req.routingUrl || graph.routingUrl,
           admissionWebhookURL: req.admissionWebhookUrl || graph.admissionWebhookURL,
           admissionWebhookSecret: req.admissionWebhookSecret || graph.admissionWebhookSecret,
           readme: req.readme || graph.readme,
-          contract: {
-            ...graph.contract,
-            ...updatedContractDetails,
-          },
+          contract: { ...graph.contract!, ...updatedContractDetails },
         },
-      ],
-      actorId: authContext.userId,
-      blobStorage: opts.blobStorage,
-      admissionConfig: {
-        cdnBaseUrl: opts.cdnBaseUrl,
-        webhookJWTSecret: opts.admissionWebhookJWTSecret,
-      },
-      chClient: opts.chClient!,
+      });
     });
-
-    compositionErrors.push(...composition.compositionErrors);
-    deploymentErrors.push(...composition.deploymentErrors);
-    compositionWarnings.push(...composition.compositionWarnings);
 
     await auditLogRepo.addAuditLog({
       organizationId: authContext.organizationId,
@@ -208,31 +197,14 @@ export function updateContract(
       authContext.userId,
     );
 
-    if (compositionErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED,
-        },
-        compositionErrors,
-        deploymentErrors: [],
-        compositionWarnings,
-      };
-    }
-
-    if (deploymentErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_DEPLOYMENT_FAILED,
-        },
-        compositionErrors: [],
-        deploymentErrors,
-        compositionWarnings,
-      };
-    }
-
     return {
       response: {
-        code: EnumStatusCode.OK,
+        code:
+          compositionErrors.length > 0
+            ? EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED
+            : deploymentErrors.length > 0
+              ? EnumStatusCode.ERR_DEPLOYMENT_FAILED
+              : EnumStatusCode.OK,
       },
       deploymentErrors,
       compositionErrors,

@@ -2,7 +2,11 @@ import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import { OrganizationEventName } from '@wundergraph/cosmo-connect/dist/notifications/events_pb';
-import { UpdateSubgraphRequest, UpdateSubgraphResponse } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import {
+  SubgraphType,
+  UpdateSubgraphRequest,
+  UpdateSubgraphResponse,
+} from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { isValidUrl } from '@wundergraph/cosmo-shared';
 import { AuditLogRepository } from '../../repositories/AuditLogRepository.js';
 import { DefaultNamespace } from '../../repositories/NamespaceRepository.js';
@@ -10,14 +14,17 @@ import { SubgraphRepository } from '../../repositories/SubgraphRepository.js';
 import type { RouterOptions } from '../../routes.js';
 import {
   enrichLogger,
+  formatSubgraphType,
   formatSubscriptionProtocol,
   formatWebsocketSubprotocol,
   getLogger,
   handleError,
+  isValidGrpcNamingScheme,
   isValidLabels,
 } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function updateSubgraph(
   opts: RouterOptions,
@@ -37,6 +44,7 @@ export function updateSubgraph(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
 
     req.namespace = req.namespace || DefaultNamespace;
@@ -142,6 +150,24 @@ export function updateSubgraph(
           compositionWarnings: [],
         };
       }
+      // For GRPC_SERVICE subgraphs, validate that routing URL follows gRPC naming scheme
+      if (
+        req.routingUrl !== undefined &&
+        subgraph.type === formatSubgraphType(SubgraphType.GRPC_SERVICE) &&
+        !isValidGrpcNamingScheme(req.routingUrl)
+      ) {
+        return {
+          response: {
+            code: EnumStatusCode.ERR,
+            details:
+              `Routing URL must follow gRPC naming scheme. ` +
+              `See https://grpc.io/docs/guides/custom-name-resolution/ for examples.`,
+          },
+          compositionErrors: [],
+          deploymentErrors: [],
+          compositionWarnings: [],
+        };
+      }
       // When un-setting the url, the url can be an empty string
       if (req.subscriptionUrl && !isValidUrl(req.subscriptionUrl)) {
         return {
@@ -161,29 +187,38 @@ export function updateSubgraph(
       throw new UnauthorizedError();
     }
 
-    const { compositionErrors, updatedFederatedGraphs, deploymentErrors, compositionWarnings } =
-      await subgraphRepo.update(
-        {
-          targetId: subgraph.targetId,
-          labels: req.labels,
-          unsetLabels: req.unsetLabels ?? false,
-          subscriptionUrl: req.subscriptionUrl,
-          routingUrl: req.routingUrl,
-          subscriptionProtocol:
-            req.subscriptionProtocol === undefined ? undefined : formatSubscriptionProtocol(req.subscriptionProtocol),
-          websocketSubprotocol:
-            req.websocketSubprotocol === undefined ? undefined : formatWebsocketSubprotocol(req.websocketSubprotocol),
-          updatedBy: authContext.userId,
-          readme: req.readme,
-          namespaceId: subgraph.namespaceId,
-        },
-        opts.blobStorage,
-        {
-          cdnBaseUrl: opts.cdnBaseUrl,
-          webhookJWTSecret: opts.admissionWebhookJWTSecret,
-        },
-        opts.chClient!,
-      );
+    const { deploymentErrors, compositionErrors, compositionWarnings, updatedFederatedGraphs } =
+      await opts.db.transaction((tx) => {
+        const subgraphRepo = new SubgraphRepository(logger, tx, authContext.organizationId);
+        const compositionService = new CompositionService(
+          tx,
+          authContext.organizationId,
+          logger,
+          { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+          opts.blobStorage,
+          opts.chClient,
+          opts.webhookProxyUrl,
+          req.disableResolvabilityValidation,
+        );
+
+        return subgraphRepo.update(
+          {
+            targetId: subgraph.targetId,
+            labels: req.labels,
+            unsetLabels: req.unsetLabels ?? false,
+            subscriptionUrl: req.subscriptionUrl,
+            routingUrl: req.routingUrl,
+            subscriptionProtocol:
+              req.subscriptionProtocol === undefined ? undefined : formatSubscriptionProtocol(req.subscriptionProtocol),
+            websocketSubprotocol:
+              req.websocketSubprotocol === undefined ? undefined : formatWebsocketSubprotocol(req.websocketSubprotocol),
+            updatedBy: authContext.userId,
+            readme: req.readme,
+            namespaceId: subgraph.namespaceId,
+          },
+          compositionService,
+        );
+      });
 
     await auditLogRepo.addAuditLog({
       organizationId: authContext.organizationId,

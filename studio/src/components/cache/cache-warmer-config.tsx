@@ -1,26 +1,13 @@
-import { useRouter } from "next/router";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "../ui/card";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "../ui/select";
-import { EnumStatusCode } from "@wundergraph/cosmo-connect/dist/common/common_pb";
-import { useState } from "react";
-import { useToast } from "../ui/use-toast";
-import { configureCacheWarmer } from "@wundergraph/cosmo-connect/dist/platform/v1/platform-PlatformService_connectquery";
-import { useMutation } from "@connectrpc/connect-query";
-import { Button } from "../ui/button";
-import { useCheckUserAccess } from "@/hooks/use-check-user-access";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
+import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
+import { useState } from 'react';
+import { useToast } from '../ui/use-toast';
+import { configureCacheWarmer } from '@wundergraph/cosmo-connect/dist/platform/v1/platform-PlatformService_connectquery';
+import { useMutation } from '@connectrpc/connect-query';
+import { Button } from '../ui/button';
+import { useCheckUserAccess } from '@/hooks/use-check-user-access';
+import { useWorkspace } from '@/hooks/use-workspace';
 
 export const CacheWarmerConfig = ({
   currentOperationsCount,
@@ -31,22 +18,20 @@ export const CacheWarmerConfig = ({
   cacheWarmerEnabled: boolean;
   refetch: () => void;
 }) => {
-  const router = useRouter();
-  const namespace = router.query.namespace as string;
-  const { mutate: configureCacheWarmerConfig, isPending } =
-    useMutation(configureCacheWarmer);
-  const [maxOperationsCount, setMaxOperationsCount] = useState(
-    currentOperationsCount.toString(),
-  );
+  const {
+    namespace: { name: namespace },
+  } = useWorkspace();
+  const { mutate: configureCacheWarmerConfig, isPending } = useMutation(configureCacheWarmer);
+  const [maxOperationsCount, setMaxOperationsCount] = useState(currentOperationsCount.toString());
   const { toast } = useToast();
   const checkUserAccess = useCheckUserAccess();
 
   const operationsCountOptions = [
-    { value: "100", label: "100" },
-    { value: "200", label: "200" },
-    { value: "300", label: "300" },
-    { value: "400", label: "400" },
-    { value: "500", label: "500" },
+    { value: '100', label: '100' },
+    { value: '200', label: '200' },
+    { value: '300', label: '300' },
+    { value: '400', label: '400' },
+    { value: '500', label: '500' },
   ];
 
   return (
@@ -57,8 +42,8 @@ export const CacheWarmerConfig = ({
             <CardTitle>Cache Warmer Configuration</CardTitle>
             <CardDescription className="text-sm text-muted-foreground">
               {cacheWarmerEnabled
-                ? "Configure the cache warmer configuration of this namespace."
-                : "Enable cache warmer to set the configuration."}
+                ? 'Configure the cache warmer configuration of this namespace.'
+                : 'Enable cache warmer to set the configuration.'}
             </CardDescription>
           </div>
           <Button
@@ -66,8 +51,7 @@ export const CacheWarmerConfig = ({
             variant="default"
             isLoading={isPending}
             disabled={
-              !cacheWarmerEnabled ||
-              !checkUserAccess({ rolesToBe: ["organization-admin", "organization-developer"] })
+              !cacheWarmerEnabled || !checkUserAccess({ rolesToBe: ['organization-admin', 'organization-developer'] })
             }
             onClick={() => {
               configureCacheWarmerConfig(
@@ -80,7 +64,7 @@ export const CacheWarmerConfig = ({
                   onSuccess: (d) => {
                     if (d.response?.code === EnumStatusCode.OK) {
                       toast({
-                        description: "Cache warmer config set successfully.",
+                        description: 'Cache warmer config set successfully.',
                         duration: 3000,
                       });
                     } else if (d.response?.details) {
@@ -91,10 +75,9 @@ export const CacheWarmerConfig = ({
                     }
                     refetch();
                   },
-                  onError: (error) => {
+                  onError: (_) => {
                     toast({
-                      description:
-                        "Could not set the cache warmer config. Please try again.",
+                      description: 'Could not set the cache warmer config. Please try again.',
                       duration: 3000,
                     });
                   },
@@ -128,7 +111,7 @@ export const CacheWarmerConfig = ({
                 }}
                 disabled={
                   !cacheWarmerEnabled ||
-                  !checkUserAccess({ rolesToBe: ["organization-admin", "organization-developer"] })
+                  !checkUserAccess({ rolesToBe: ['organization-admin', 'organization-developer'] })
                 }
               >
                 <SelectTrigger className="h-8 w-36">

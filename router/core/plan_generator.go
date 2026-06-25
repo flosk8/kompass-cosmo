@@ -2,30 +2,33 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
+	"time"
 
 	log "github.com/jensneuse/abstractlogger"
+	"go.uber.org/zap"
+
 	nodev1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/node/v1"
 	"github.com/wundergraph/cosmo/router/pkg/config"
+	"github.com/wundergraph/cosmo/router/pkg/execution_config"
+	"github.com/wundergraph/cosmo/router/pkg/metric"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/kafka"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/nats"
+	"github.com/wundergraph/cosmo/router/pkg/pubsub/redis"
+
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astnormalization"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/asttransform"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astvalidation"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/graphql_datasource"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/introspection_datasource"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/postprocess"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/operationreport"
-	"go.uber.org/zap"
-
-	"github.com/wundergraph/cosmo/router/pkg/execution_config"
 )
 
 type PlannerOperationValidationError struct {
@@ -49,6 +52,34 @@ type Planner struct {
 	operationValidator *astvalidation.OperationValidator
 }
 
+type OperationTimes struct {
+	ParseTime     time.Duration
+	NormalizeTime time.Duration
+	ValidateTime  time.Duration
+	PlanTime      time.Duration
+}
+
+func (ot *OperationTimes) TotalTime() time.Duration {
+	return ot.ParseTime + ot.NormalizeTime + ot.ValidateTime + ot.PlanTime
+}
+
+func (ot OperationTimes) Merge(other OperationTimes) OperationTimes {
+	return OperationTimes{
+		ParseTime:     ot.ParseTime + other.ParseTime,
+		NormalizeTime: ot.NormalizeTime + other.NormalizeTime,
+		ValidateTime:  ot.ValidateTime + other.ValidateTime,
+		PlanTime:      ot.PlanTime + other.PlanTime,
+	}
+}
+
+type PlanOutputFormat string
+
+const (
+	PlanOutputFormatUnset PlanOutputFormat = ""
+	PlanOutputFormatText  PlanOutputFormat = "text"
+	PlanOutputFormatJSON  PlanOutputFormat = "json"
+)
+
 func NewPlanner(planConfiguration *plan.Configuration, definition *ast.Document, clientDefinition *ast.Document) (*Planner, error) {
 	planner, err := plan.NewPlanner(*planConfiguration)
 	if err != nil {
@@ -62,57 +93,75 @@ func NewPlanner(planConfiguration *plan.Configuration, definition *ast.Document,
 	}, nil
 }
 
-func (pl *Planner) PlanOperation(operationFilePath string) (string, error) {
-	operation, err := pl.parseOperation(operationFilePath)
+// PlanOperation creates a query plan from an operation file in a pretty-printed text or JSON format
+func (pl *Planner) PlanOperation(operationFilePath string, outputFormat PlanOutputFormat) (string, OperationTimes, error) {
+	operation, opTimes, err := pl.ParseAndPrepareOperation(operationFilePath)
 	if err != nil {
-		return "", &PlannerOperationValidationError{err: err}
+		return "", opTimes, err
 	}
 
-	operationName := findOperationName(operation)
-	if operationName == nil {
-		return "", &PlannerOperationValidationError{err: errors.New("operation name not found")}
-	}
-
-	err = pl.normalizeOperation(operation, operationName)
+	rawPlan, opTimes2, err := pl.PlanPreparedOperation(operation)
+	opTimes = opTimes.Merge(opTimes2)
 	if err != nil {
-		return "", &PlannerOperationValidationError{err: err}
+		return "", opTimes, fmt.Errorf("failed to plan operation: %w", err)
 	}
 
-	err = pl.validateOperation(operation)
-	if err != nil {
-		return "", &PlannerOperationValidationError{err: err}
+	switch outputFormat {
+	case PlanOutputFormatText:
+		return rawPlan.PrettyPrint(), opTimes, nil
+	case PlanOutputFormatJSON:
+		marshal, err := json.Marshal(rawPlan)
+		if err != nil {
+			return "", opTimes, fmt.Errorf("failed to marshal raw plan: %w", err)
+		}
+		return string(marshal), opTimes, nil
 	}
 
-	rawPlan, err := pl.planOperation(operation)
-	if err != nil {
-		return "", fmt.Errorf("failed to plan operation: %w", err)
-	}
-
-	return rawPlan.PrettyPrint(), nil
+	return "", opTimes, fmt.Errorf("invalid outputFormat specified: %q", outputFormat)
 }
 
-func (pl *Planner) PlanParsedOperation(operation *ast.Document) (*resolve.FetchTreeQueryPlanNode, error) {
+// ParseAndPrepareOperation parses, normalizes and validates the operation
+func (pl *Planner) ParseAndPrepareOperation(operationFilePath string) (*ast.Document, OperationTimes, error) {
+	start := time.Now()
+	operation, err := pl.parseOperation(operationFilePath)
+	parseTime := time.Since(start)
+	if err != nil {
+		return nil, OperationTimes{ParseTime: parseTime}, &PlannerOperationValidationError{err: err}
+	}
+
+	operation, opTimes, err := pl.PrepareOperation(operation)
+	opTimes.ParseTime = parseTime
+	if err != nil {
+		return nil, opTimes, err
+	}
+
+	return operation, opTimes, nil
+}
+
+// PrepareOperation normalizes and validates the operation
+func (pl *Planner) PrepareOperation(operation *ast.Document) (*ast.Document, OperationTimes, error) {
 	operationName := findOperationName(operation)
 	if operationName == nil {
-		return nil, errors.New("operation name not found")
+		return nil, OperationTimes{}, &PlannerOperationValidationError{err: errors.New("operation name not found")}
 	}
 
+	opTimes := OperationTimes{}
+
+	start := time.Now()
 	err := pl.normalizeOperation(operation, operationName)
+	opTimes.NormalizeTime = time.Since(start)
 	if err != nil {
-		return nil, fmt.Errorf("failed to normalize operation: %w", err)
+		return nil, opTimes, &PlannerOperationValidationError{err: err}
 	}
 
+	start = time.Now()
 	err = pl.validateOperation(operation)
+	opTimes.ValidateTime = time.Since(start)
 	if err != nil {
-		return nil, &PlannerOperationValidationError{err: err}
+		return nil, opTimes, &PlannerOperationValidationError{err: err}
 	}
 
-	rawPlan, err := pl.planOperation(operation)
-	if err != nil {
-		return nil, fmt.Errorf("failed to plan operation: %w", err)
-	}
-
-	return rawPlan, nil
+	return operation, opTimes, nil
 }
 
 func (pl *Planner) normalizeOperation(operation *ast.Document, operationName []byte) (err error) {
@@ -124,8 +173,21 @@ func (pl *Planner) normalizeOperation(operation *ast.Document, operationName []b
 
 	report := operationreport.Report{}
 
-	astnormalization.NormalizeNamedOperation(operation, pl.definition, operationName, &report)
+	normalizer := astnormalization.NewWithOpts(
+		astnormalization.WithRemoveNotMatchingOperationDefinitions(),
+		astnormalization.WithExtractVariables(),
+		astnormalization.WithRemoveFragmentDefinitions(),
+		astnormalization.WithInlineFragmentSpreads(),
+		astnormalization.WithRemoveUnusedVariables(),
+		astnormalization.WithIgnoreSkipInclude(),
+	)
+	normalizer.NormalizeNamedOperation(operation, pl.definition, operationName, &report)
+	if report.HasErrors() {
+		return report
+	}
 
+	remapper := astnormalization.NewVariablesMapper()
+	remapper.NormalizeOperation(operation, pl.definition, &report)
 	if report.HasErrors() {
 		return report
 	}
@@ -133,7 +195,8 @@ func (pl *Planner) normalizeOperation(operation *ast.Document, operationName []b
 	return nil
 }
 
-func (pl *Planner) planOperation(operation *ast.Document) (planNode *resolve.FetchTreeQueryPlanNode, err error) {
+// PlanPreparedOperation creates a query plan from a normalized and validated operation
+func (pl *Planner) PlanPreparedOperation(operation *ast.Document) (planNode *resolve.FetchTreeQueryPlanNode, opTimes OperationTimes, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic during plan generation: %v", r)
@@ -145,22 +208,30 @@ func (pl *Planner) planOperation(operation *ast.Document) (planNode *resolve.Fet
 	operationName := findOperationName(operation)
 
 	if operationName == nil {
-		return nil, errors.New("operation name not found")
+		return nil, opTimes, errors.New("operation name not found")
 	}
 
 	// create and postprocess the plan
+	start := time.Now()
 	preparedPlan := pl.planner.Plan(operation, pl.definition, string(operationName), &report, plan.IncludeQueryPlanInResponse())
+	opTimes.PlanTime = time.Since(start)
 	if report.HasErrors() {
-		return nil, errors.New(report.Error())
+		return nil, opTimes, errors.New(report.Error())
 	}
+
 	post := postprocess.NewProcessor()
 	post.Process(preparedPlan)
+	// measure postprocessing time as part of planning time
+	opTimes.PlanTime = time.Since(start)
 
-	if p, ok := preparedPlan.(*plan.SynchronousResponsePlan); ok {
-		return p.Response.Fetches.QueryPlan(), nil
+	switch p := preparedPlan.(type) {
+	case *plan.SynchronousResponsePlan:
+		return p.Response.Fetches.QueryPlan(), opTimes, nil
+	case *plan.SubscriptionResponsePlan:
+		return p.Response.Response.Fetches.QueryPlan(), opTimes, nil
 	}
 
-	return &resolve.FetchTreeQueryPlanNode{}, nil
+	return &resolve.FetchTreeQueryPlanNode{}, opTimes, nil
 }
 
 func (pl *Planner) validateOperation(operation *ast.Document) (err error) {
@@ -236,9 +307,12 @@ func (pg *PlanGenerator) buildRouterConfig(configFilePath string) (*nodev1.Route
 }
 
 func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, logger *zap.Logger, maxDataSourceCollectorsConcurrency uint) error {
-	routerEngineConfig := RouterEngineConfiguration{}
+	routerEngineConfig := RouterEngineConfiguration{
+		StreamMetricStore: metric.NewNoopStreamMetricStore(),
+	}
 	natSources := map[string]*nats.ProviderAdapter{}
 	kafkaSources := map[string]*kafka.ProviderAdapter{}
+	redisSources := map[string]*redis.ProviderAdapter{}
 	for _, ds := range routerConfig.GetEngineConfig().GetDatasourceConfigurations() {
 		if ds.GetKind() != nodev1.DataSourceKind_PUBSUB || ds.GetCustomEvents() == nil {
 			continue
@@ -261,28 +335,23 @@ func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, lo
 				})
 			}
 		}
+		for _, redisConfig := range ds.GetCustomEvents().GetRedis() {
+			providerId := redisConfig.GetEngineEventConfiguration().GetProviderId()
+			if _, ok := redisSources[providerId]; !ok {
+				redisSources[providerId] = nil
+				routerEngineConfig.Events.Providers.Redis = append(routerEngineConfig.Events.Providers.Redis, config.RedisEventSource{
+					ID: providerId,
+				})
+			}
+		}
 	}
-
-	var netPollConfig graphql_datasource.NetPollConfiguration
-	netPollConfig.ApplyDefaults()
-
-	subscriptionClient := graphql_datasource.NewGraphQLSubscriptionClient(
-		http.DefaultClient,
-		http.DefaultClient,
-		context.Background(),
-		graphql_datasource.WithLogger(log.NoopLogger),
-		graphql_datasource.WithNetPollConfiguration(netPollConfig),
-	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	loader := NewLoader(ctx, false, &DefaultFactoryResolver{
-		engineCtx:          ctx,
-		httpClient:         http.DefaultClient,
-		streamingClient:    http.DefaultClient,
-		subscriptionClient: subscriptionClient,
-	}, logger)
+		engineCtx: ctx,
+	}, logger, subscriptionHooks{})
 
 	// this generates the plan configuration using the data source factories from the config package
 	planConfig, _, err := loader.Load(routerConfig.GetEngineConfig(), routerConfig.GetSubgraphs(), &routerEngineConfig, false) // TODO: configure plugins
@@ -317,8 +386,8 @@ func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, lo
 	// we need to merge the base schema, it contains the __schema and __type queries
 	// these are not usually part of a regular GraphQL schema
 	// the engine needs to have them defined, otherwise it cannot resolve such fields
-	err = asttransform.MergeDefinitionWithBaseSchema(&definition)
-	if err != nil {
+
+	if err := asttransform.MergeDefinitionWithBaseSchema(&definition); err != nil {
 		return fmt.Errorf("failed to merge graphql schema with base schema: %w", err)
 	}
 
@@ -369,5 +438,6 @@ func findOperationName(operation *ast.Document) (operationName []byte) {
 			return operation.OperationDefinitionNameBytes(operation.RootNodes[i].Ref)
 		}
 	}
+	// TODO: assign static operation name if we have single anonymous operation
 	return nil
 }

@@ -1,45 +1,41 @@
 import { describe, expect, test } from 'vitest';
 import {
   ARGUMENT_DEFINITION_UPPER,
-  BatchNormalizationResultSuccess,
-  ConfigurationData,
+  type BatchNormalizationSuccess,
+  type ConfigurationData,
   duplicateOverriddenFieldErrorMessage,
   duplicateOverriddenFieldsError,
   equivalentSourceAndTargetOverrideErrorMessage,
-  federateSubgraphs,
-  FederationResultFailure,
-  FederationResultSuccess,
-  FieldData,
+  type FieldData,
   FIRST_ORDINAL,
   invalidDirectiveError,
   invalidDirectiveLocationErrorMessage,
   invalidFieldShareabilityError,
   invalidOverrideTargetSubgraphNameWarning,
-  NormalizationResultFailure,
-  normalizeSubgraph,
-  ObjectDefinitionData,
+  type ObjectDefinitionData,
   OVERRIDE,
   parse,
   ROUTER_COMPATIBILITY_VERSION_ONE,
-  Subgraph,
+  type Subgraph,
   subgraphValidationError,
+  type TypeName,
 } from '../../../src';
-import { versionTwoRouterDefinitions } from '../utils/utils';
-import { batchNormalize } from '../../../src/v1/normalization/normalization-factory';
-import { normalizeString, schemaToSortedNormalizedString } from '../../utils/utils';
+import { SCHEMA_QUERY_DEFINITION } from '../utils/utils';
+import {
+  federateSubgraphsFailure,
+  federateSubgraphsSuccess,
+  normalizeString,
+  normalizeSubgraphFailure,
+  schemaToSortedNormalizedString,
+} from '../../utils/utils';
+import { BatchNormalizer } from '../../../src';
 
 describe('@override directive tests', () => {
   describe('normalization tests', () => {
     test('that an error is returned if the source and target subgraph name for @override are equivalent', () => {
-      const result = normalizeSubgraph(
-        subgraphQ.definitions,
-        subgraphQ.name,
-        undefined,
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as NormalizationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toStrictEqual(
+      const { errors } = normalizeSubgraphFailure(subgraphQ, ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toStrictEqual(
         invalidDirectiveError(OVERRIDE, 'Entity.name', FIRST_ORDINAL, [
           equivalentSourceAndTargetOverrideErrorMessage('subgraph-q', 'Entity.name'),
         ]),
@@ -47,16 +43,18 @@ describe('@override directive tests', () => {
     });
 
     test('that @override produces the correct engine configuration', () => {
-      const result = batchNormalize([subgraphA, subgraphE, subgraphF]) as BatchNormalizationResultSuccess;
+      const result = new BatchNormalizer({
+        subgraphs: [subgraphA, subgraphE, subgraphF],
+      }).batchNormalize() as BatchNormalizationSuccess;
       expect(result.success).toBe(true);
-      const a = result.internalSubgraphBySubgraphName.get('subgraph-a');
+      const a = result.internalSubgraphByName.get('subgraph-a');
       expect(a).toBeDefined();
-      const e = result.internalSubgraphBySubgraphName.get('subgraph-e');
+      const e = result.internalSubgraphByName.get('subgraph-e');
       expect(e).toBeDefined();
-      const g = result.internalSubgraphBySubgraphName.get('subgraph-f');
+      const g = result.internalSubgraphByName.get('subgraph-f');
       expect(g).toBeDefined();
       expect(a!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -77,7 +75,7 @@ describe('@override directive tests', () => {
         ]),
       );
       expect(e!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Entity',
             {
@@ -90,7 +88,7 @@ describe('@override directive tests', () => {
         ]),
       );
       expect(g!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Entity',
             {
@@ -107,19 +105,18 @@ describe('@override directive tests', () => {
 
   describe('federation tests', () => {
     test('that a warning is returned if @override targets an unknown subgraph name', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema, warnings } = federateSubgraphsSuccess(
         [subgraphA, subgraphB],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(result.warnings).toBeDefined();
-      expect(result.warnings![0]).toStrictEqual(
+      );
+      expect(warnings).toBeDefined();
+      expect(warnings![0]).toStrictEqual(
         invalidOverrideTargetSubgraphNameWarning('subgraph-z', 'Entity', ['age'], 'subgraph-b'),
       );
-      expect(result.warnings![0].subgraph.name).toBe('subgraph-b');
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      expect(warnings![0].subgraph.name).toBe('subgraph-b');
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Entity {
         age: Int!
@@ -130,21 +127,15 @@ describe('@override directive tests', () => {
       type Query {
         query: Entity!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an error is returned if @override is declared on multiple instances of a field', () => {
-      const result = federateSubgraphs(
-        [subgraphA, subgraphC, subgraphD],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toStrictEqual(
+      const { errors } = federateSubgraphsFailure([subgraphA, subgraphC, subgraphD], ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toStrictEqual(
         duplicateOverriddenFieldsError([
           duplicateOverriddenFieldErrorMessage('Entity.name', ['subgraph-c', 'subgraph-d']),
         ]),
@@ -152,14 +143,13 @@ describe('@override directive tests', () => {
     });
 
     test('that an overridden field does not need to be declared shareable #1.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphA, subgraphC],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -170,22 +160,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #1.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphC, subgraphA],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -196,22 +183,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #2.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphI, subgraphJ],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -222,22 +206,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #2.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphJ, subgraphI],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -248,22 +229,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphI, subgraphJ, subgraphK],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -275,22 +253,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphI, subgraphK, subgraphJ],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -302,22 +277,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.3', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphJ, subgraphI, subgraphK],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -329,22 +301,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.4', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphJ, subgraphK, subgraphI],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -356,22 +325,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.5', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphK, subgraphI, subgraphJ],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -383,22 +349,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #3.6', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphK, subgraphJ, subgraphI],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           age: Int!
@@ -410,22 +373,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #4.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphL, subgraphM],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
        type Entity {
         id: ID!
@@ -435,22 +395,19 @@ describe('@override directive tests', () => {
       type Query {
         query: Entity!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #4.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphM, subgraphL],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
        type Entity {
         id: ID!
@@ -460,22 +417,19 @@ describe('@override directive tests', () => {
       type Query {
         query: Entity!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #5.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphN, subgraphO],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
        type Entity {
         id: ID!
@@ -485,22 +439,19 @@ describe('@override directive tests', () => {
       type Query {
         query: Entity!
       }
-
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #5.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphO, subgraphN],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
        type Entity {
         id: ID!
@@ -510,22 +461,19 @@ describe('@override directive tests', () => {
       type Query {
         query: Entity!
       }
-
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #6.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphE, subgraphP],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           id: ID!
@@ -535,22 +483,19 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field does not need to be declared shareable #6.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphP, subgraphE],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
         type Entity {
           id: ID!
@@ -560,21 +505,15 @@ describe('@override directive tests', () => {
         type Query {
           query: Entity!
         }
-        
-        scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that > 1 instance of an un-shareable field returns an error regardless of override #1', () => {
-      const result = federateSubgraphs(
-        [subgraphA, subgraphC, subgraphE],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toStrictEqual(
+      const { errors } = federateSubgraphsFailure([subgraphA, subgraphC, subgraphE], ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toStrictEqual(
         invalidFieldShareabilityError(
           {
             fieldDataByName: new Map<string, FieldData>([
@@ -596,13 +535,9 @@ describe('@override directive tests', () => {
     });
 
     test('that > 1 instance of an un-shareable field returns an error regardless of override #2', () => {
-      const result = federateSubgraphs(
-        [subgraphA, subgraphI, subgraphJ],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toStrictEqual(
+      const { errors } = federateSubgraphsFailure([subgraphA, subgraphI, subgraphJ], ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toStrictEqual(
         invalidFieldShareabilityError(
           {
             fieldDataByName: new Map<string, FieldData>([
@@ -624,14 +559,10 @@ describe('@override directive tests', () => {
     });
 
     test('that if @override is declared at an invalid location, an error is returned', () => {
-      const result = federateSubgraphs(
-        [subgraphG, subgraphH],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(1);
+      const { errors } = federateSubgraphsFailure([subgraphG, subgraphH], ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
       const directiveCoords = 'Entity.name(argOne: ...)';
-      expect(result.errors[0]).toStrictEqual(
+      expect(errors[0]).toStrictEqual(
         subgraphValidationError('subgraph-g', [
           invalidDirectiveError(OVERRIDE, directiveCoords, FIRST_ORDINAL, [
             invalidDirectiveLocationErrorMessage(OVERRIDE, ARGUMENT_DEFINITION_UPPER),
@@ -641,14 +572,13 @@ describe('@override directive tests', () => {
     });
 
     test('that an overridden field still contributes to type merging #1.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphR, subgraphS],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Entity {
         id: ID!
@@ -658,22 +588,19 @@ describe('@override directive tests', () => {
       type Query {
         entities: [Entity!]!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that an overridden field still contributes to type merging #1.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphS, subgraphR],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Entity {
         id: ID!
@@ -683,43 +610,38 @@ describe('@override directive tests', () => {
       type Query {
         entities: [Entity!]!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
     });
 
     test('that renamed root type fields are successfully overridden #1.1', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema, fieldConfigurations, subgraphConfigBySubgraphName } = federateSubgraphsSuccess(
         [subgraphT, subgraphU],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Query {
         fieldOne(argOne: Int!): [String]
         fieldTwo: Int
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
-      expect(result.fieldConfigurations).toStrictEqual([
+      expect(fieldConfigurations).toStrictEqual([
         {
           argumentNames: ['argOne'],
           fieldName: 'fieldOne',
           typeName: 'Query',
         },
       ]);
-      const t = result.subgraphConfigBySubgraphName.get('subgraph-t');
+      const t = subgraphConfigBySubgraphName.get('subgraph-t');
       expect(t).toBeDefined();
       expect(t!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -730,10 +652,10 @@ describe('@override directive tests', () => {
           ],
         ]),
       );
-      const u = result.subgraphConfigBySubgraphName.get('subgraph-u');
+      const u = subgraphConfigBySubgraphName.get('subgraph-u');
       expect(u).toBeDefined();
       expect(u!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -747,35 +669,32 @@ describe('@override directive tests', () => {
     });
 
     test('that renamed root type fields are successfully overridden #1.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema, fieldConfigurations, subgraphConfigBySubgraphName } = federateSubgraphsSuccess(
         [subgraphU, subgraphT],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Query {
         fieldOne(argOne: Int!): [String]
         fieldTwo: Int
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
-      expect(result.fieldConfigurations).toStrictEqual([
+      expect(fieldConfigurations).toStrictEqual([
         {
           argumentNames: ['argOne'],
           fieldName: 'fieldOne',
           typeName: 'Query',
         },
       ]);
-      const t = result.subgraphConfigBySubgraphName.get('subgraph-t');
+      const t = subgraphConfigBySubgraphName.get('subgraph-t');
       expect(t).toBeDefined();
       expect(t!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -786,10 +705,10 @@ describe('@override directive tests', () => {
           ],
         ]),
       );
-      const u = result.subgraphConfigBySubgraphName.get('subgraph-u');
+      const u = subgraphConfigBySubgraphName.get('subgraph-u');
       expect(u).toBeDefined();
       expect(u!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -803,30 +722,25 @@ describe('@override directive tests', () => {
     });
 
     test('that renamed root type fields are successfully overridden #2.1', () => {
-      const result = federateSubgraphs(
-        [subgraphV, subgraphW],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
+      const result = federateSubgraphsSuccess([subgraphV, subgraphW], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(true);
       expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Query {
         field: String!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
       const v = result.subgraphConfigBySubgraphName.get('subgraph-v');
       expect(v).toBeDefined();
-      expect(v!.configurationDataByTypeName).toStrictEqual(new Map<string, ConfigurationData>());
+      expect(v!.configurationDataByTypeName).toStrictEqual(new Map<TypeName, ConfigurationData>());
       const w = result.subgraphConfigBySubgraphName.get('subgraph-w');
       expect(w).toBeDefined();
       expect(w!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {
@@ -840,30 +754,27 @@ describe('@override directive tests', () => {
     });
 
     test('that renamed root type fields are successfully overridden #2.2', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema, subgraphConfigBySubgraphName } = federateSubgraphsSuccess(
         [subgraphW, subgraphV],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
-          versionTwoRouterDefinitions +
+          SCHEMA_QUERY_DEFINITION +
             `
       type Query {
         field: String!
       }
-      
-      scalar openfed__Scope
     `,
         ),
       );
-      const v = result.subgraphConfigBySubgraphName.get('subgraph-v');
+      const v = subgraphConfigBySubgraphName.get('subgraph-v');
       expect(v).toBeDefined();
-      expect(v!.configurationDataByTypeName).toStrictEqual(new Map<string, ConfigurationData>());
-      const w = result.subgraphConfigBySubgraphName.get('subgraph-w');
+      expect(v!.configurationDataByTypeName).toStrictEqual(new Map<TypeName, ConfigurationData>());
+      const w = subgraphConfigBySubgraphName.get('subgraph-w');
       expect(w).toBeDefined();
       expect(w!.configurationDataByTypeName).toStrictEqual(
-        new Map<string, ConfigurationData>([
+        new Map<TypeName, ConfigurationData>([
           [
             'Query',
             {

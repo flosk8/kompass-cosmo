@@ -3,9 +3,6 @@ import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import { OrganizationEventName } from '@wundergraph/cosmo-connect/dist/notifications/events_pb';
 import {
-  CompositionError,
-  CompositionWarning,
-  DeploymentError,
   UpdateFederatedGraphRequest,
   UpdateFederatedGraphResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
@@ -17,6 +14,7 @@ import type { RouterOptions } from '../../routes.js';
 import { enrichLogger, getLogger, handleError, isValidLabelMatchers } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function updateFederatedGraph(
   opts: RouterOptions,
@@ -36,6 +34,7 @@ export function updateFederatedGraph(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
 
     req.namespace = req.namespace || DefaultNamespace;
@@ -106,39 +105,32 @@ export function updateFederatedGraph(
       };
     }
 
-    const deploymentErrors: PlainMessage<DeploymentError>[] = [];
-    let compositionErrors: PlainMessage<CompositionError>[] = [];
-    const compositionWarnings: PlainMessage<CompositionWarning>[] = [];
+    const result = await opts.db.transaction((tx) => {
+      const compositionService = new CompositionService(
+        tx,
+        authContext.organizationId,
+        logger,
+        { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+        opts.blobStorage,
+        opts.chClient,
+        opts.webhookProxyUrl,
+        req.disableResolvabilityValidation,
+      );
 
-    const result = await fedGraphRepo.update({
-      targetId: federatedGraph.targetId,
-      labelMatchers: req.labelMatchers,
-      routingUrl: req.routingUrl,
-      updatedBy: authContext.userId,
-      readme: req.readme,
-      blobStorage: opts.blobStorage,
-      namespaceId: federatedGraph.namespaceId,
-      unsetLabelMatchers: req.unsetLabelMatchers,
-      admissionWebhookURL: req.admissionWebhookURL,
-      admissionWebhookSecret: req.admissionWebhookSecret,
-      admissionConfig: {
-        cdnBaseUrl: opts.cdnBaseUrl,
-        jwtSecret: opts.admissionWebhookJWTSecret,
-      },
-      chClient: opts.chClient!,
+      const fedGraphRepo = new FederatedGraphRepository(logger, tx, authContext.organizationId);
+      return fedGraphRepo.update({
+        compositionService,
+        admissionWebhookSecret: req.admissionWebhookSecret,
+        admissionWebhookURL: req.admissionWebhookURL,
+        labelMatchers: req.labelMatchers,
+        namespaceId: federatedGraph.namespaceId,
+        readme: req.readme,
+        routingUrl: req.routingUrl,
+        targetId: federatedGraph.targetId,
+        unsetLabelMatchers: req.unsetLabelMatchers,
+        updatedBy: authContext.userId,
+      });
     });
-
-    if (result?.deploymentErrors) {
-      deploymentErrors.push(...result.deploymentErrors);
-    }
-
-    if (result?.compositionErrors) {
-      compositionErrors = result.compositionErrors;
-    }
-
-    if (result?.compositionWarnings) {
-      compositionWarnings.push(...result.compositionWarnings);
-    }
 
     await auditLogRepo.addAuditLog({
       organizationId: authContext.organizationId,
@@ -170,7 +162,7 @@ export function updateFederatedGraph(
               id: authContext.organizationId,
               slug: authContext.organizationSlug,
             },
-            errors: compositionErrors.length > 0 || deploymentErrors.length > 0,
+            errors: result.compositionErrors.length > 0 || result.deploymentErrors.length > 0,
             actor_id: authContext.userId,
           },
         },
@@ -178,35 +170,18 @@ export function updateFederatedGraph(
       );
     }
 
-    if (compositionErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED,
-        },
-        deploymentErrors: [],
-        compositionErrors,
-        compositionWarnings,
-      };
-    }
-
-    if (deploymentErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_DEPLOYMENT_FAILED,
-        },
-        deploymentErrors,
-        compositionErrors: [],
-        compositionWarnings,
-      };
-    }
-
     return {
       response: {
-        code: EnumStatusCode.OK,
+        code:
+          result && result.compositionErrors.length > 0
+            ? EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED
+            : result && result.deploymentErrors.length > 0
+              ? EnumStatusCode.ERR_DEPLOYMENT_FAILED
+              : EnumStatusCode.OK,
       },
-      compositionErrors: [],
-      deploymentErrors: [],
-      compositionWarnings,
+      compositionErrors: result?.compositionErrors || [],
+      deploymentErrors: result?.deploymentErrors || [],
+      compositionWarnings: result?.compositionWarnings || [],
     };
   });
 }

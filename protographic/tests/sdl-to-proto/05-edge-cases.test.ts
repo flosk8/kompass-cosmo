@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
-import { compileGraphQLToProto } from '../../src';
-import { expectValidProto } from '../util';
+import { compileGraphQLToProto } from '../../src/index.js';
+import { expectValidProto } from '../util.js';
 
 describe('SDL to Proto - Edge Cases and Error Handling', () => {
   test('should handle schema with only scalar fields correctly', () => {
@@ -364,6 +364,27 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
         rpc QueryUsers(QueryUsersRequest) returns (QueryUsersResponse) {}
       }
 
+      // Wrapper message for a list of Comment.
+      message ListOfComment {
+        message List {
+          repeated Comment items = 1;
+        }
+        List list = 1;
+      }
+      // Wrapper message for a list of Post.
+      message ListOfPost {
+        message List {
+          repeated Post items = 1;
+        }
+        List list = 1;
+      }
+      // Wrapper message for a list of String.
+      message ListOfString {
+        message List {
+          repeated string items = 1;
+        }
+        List list = 1;
+      }
       // Key message for User entity lookup
       message LookupUserByIdRequestKey {
         // Key field for User entity lookup.
@@ -552,7 +573,7 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
         string created_at = 4;
         google.protobuf.StringValue metadata = 5;
         UserStatus status = 6;
-        repeated Post posts = 7;
+        ListOfPost posts = 7;
         UserProfile profile = 8;
       }
 
@@ -561,11 +582,11 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
         string title = 2;
         string content = 3;
         User author = 4;
-        repeated string tags = 5;
+        ListOfString tags = 5;
         string created_at = 6;
         google.protobuf.StringValue updated_at = 7;
         PostStatus status = 8;
-        repeated Comment comments = 9;
+        ListOfComment comments = 9;
       }
 
       message Comment {
@@ -581,7 +602,7 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
         string query = 1;
         google.protobuf.Int32Value limit = 2;
         google.protobuf.Int32Value offset = 3;
-        repeated string types = 4;
+        ListOfString types = 4;
       }
 
       message SearchResult {
@@ -608,7 +629,7 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
       message PostInput {
         string title = 1;
         string content = 2;
-        repeated string tags = 3;
+        ListOfString tags = 3;
         PostStatus status = 4;
       }
 
@@ -638,5 +659,106 @@ describe('SDL to Proto - Edge Cases and Error Handling', () => {
         POST_STATUS_ARCHIVED = 3;
       }"
     `);
+  });
+
+  test('should not duplicate UNSPECIFIED when enum explicitly declares it', () => {
+    const sdl = `
+      enum State {
+        UNSPECIFIED
+        ACTIVE
+        INACTIVE
+      }
+
+      type Query {
+        state: State
+      }
+    `;
+
+    const { proto: protoText } = compileGraphQLToProto(sdl);
+    expectValidProto(protoText);
+
+    expect(protoText).toContain('STATE_UNSPECIFIED = 0;');
+    expect(protoText).toContain('STATE_ACTIVE = 1;');
+    expect(protoText).toContain('STATE_INACTIVE = 2;');
+    expect(protoText.match(/STATE_UNSPECIFIED/g)).toHaveLength(1);
+  });
+
+  test('should handle enum with UNSPECIFIED at non-first position', () => {
+    const sdl = `
+      enum Priority {
+        LOW
+        UNSPECIFIED
+        HIGH
+      }
+
+      type Query {
+        priority: Priority
+      }
+    `;
+
+    const { proto: protoText } = compileGraphQLToProto(sdl);
+    expectValidProto(protoText);
+
+    expect(protoText).toContain('PRIORITY_UNSPECIFIED = 0;');
+    expect(protoText).toContain('PRIORITY_LOW = 1;');
+    expect(protoText).toContain('PRIORITY_HIGH = 2;');
+    expect(protoText.match(/PRIORITY_UNSPECIFIED/g)).toHaveLength(1);
+  });
+
+  test('should handle enum with only UNSPECIFIED value', () => {
+    const sdl = `
+      enum OnlyUnspecified {
+        UNSPECIFIED
+      }
+
+      type Query {
+        value: OnlyUnspecified
+      }
+    `;
+
+    const { proto: protoText } = compileGraphQLToProto(sdl);
+    expectValidProto(protoText);
+
+    expect(protoText).toContain('ONLY_UNSPECIFIED_UNSPECIFIED = 0;');
+    expect(protoText.match(/ONLY(?:_UNSPECIFIED){2}/g)).toHaveLength(1);
+  });
+
+  test('should handle enum with explicit UNSPECIFIED across schema evolution with lock data', () => {
+    const sdl1 = `
+      enum Status {
+        UNSPECIFIED
+        ACTIVE
+      }
+
+      type Query {
+        status: Status
+      }
+    `;
+
+    const result1 = compileGraphQLToProto(sdl1);
+    expectValidProto(result1.proto);
+    expect(result1.proto).toContain('STATUS_UNSPECIFIED = 0;');
+    expect(result1.proto).toContain('STATUS_ACTIVE = 1;');
+
+    // Add a new value with existing lock data
+    const sdl2 = `
+      enum Status {
+        UNSPECIFIED
+        ACTIVE
+        INACTIVE
+      }
+
+      type Query {
+        status: Status
+      }
+    `;
+
+    const result2 = compileGraphQLToProto(sdl2, { lockData: result1.lockData! });
+    expectValidProto(result2.proto);
+
+    expect(result2.proto).toContain('STATUS_UNSPECIFIED = 0;');
+    expect(result2.proto).toContain('STATUS_ACTIVE = 1;');
+    expect(result2.proto).toContain('STATUS_INACTIVE = 2;');
+    expect(result2.proto.match(/STATUS_UNSPECIFIED/g)).toHaveLength(1);
   });
 });

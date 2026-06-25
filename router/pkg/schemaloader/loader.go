@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/astprinter"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astvalidation"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/operationreport"
-	"go.uber.org/zap"
 )
 
 // Operation represents a GraphQL operation with its AST document and schema information
@@ -23,7 +25,8 @@ type Operation struct {
 	OperationString string
 	Description     string
 	JSONSchema      json.RawMessage
-	OperationType   string // "query", "mutation", or "subscription"
+	OperationType   string     // "query", "mutation", or "subscription"
+	RequiredScopes  [][]string // OR-of-AND scope groups from @requiresScopes (nil = no scope check)
 }
 
 // OperationLoader loads GraphQL operations from files in a directory
@@ -79,8 +82,20 @@ func (l *OperationLoader) LoadOperationsFromDirectory(dirPath string) ([]Operati
 			return nil
 		}
 
+		// If the operation carries September-2025-spec executable descriptions
+		// (operation/variable/fragment), re-print without them so the string
+		// forwarded to upstream GraphQL servers stays valid for servers that
+		// don't yet support the new spec. Otherwise reuse the raw file content.
+		if HasExecutableDescriptions(&opDoc) {
+			operationString, err = PrintOperationWithoutDescriptions(&opDoc)
+			if err != nil {
+				l.Logger.Error("Failed to print MCP operation", zap.String("file", path), zap.Error(err))
+				return nil
+			}
+		}
+
 		// Extract the operation name and type
-		opName, opType, err := getOperationNameAndType(&opDoc)
+		opName, opType, err := GetOperationNameAndType(&opDoc)
 		if err != nil {
 			l.Logger.Error("Failed to extract MCP operation name and type", zap.String("operation", opName), zap.String("file", path), zap.Error(err))
 			return nil
@@ -116,6 +131,9 @@ func (l *OperationLoader) LoadOperationsFromDirectory(dirPath string) ([]Operati
 			}
 		}
 
+		// Extract description from operation definition
+		opDescription := extractOperationDescription(&opDoc)
+
 		// Add to our list of operations
 		operations = append(operations, Operation{
 			Name:            opName,
@@ -123,6 +141,7 @@ func (l *OperationLoader) LoadOperationsFromDirectory(dirPath string) ([]Operati
 			Document:        opDoc,
 			OperationString: operationString,
 			OperationType:   opType,
+			Description:     opDescription,
 		})
 
 		return nil
@@ -156,8 +175,8 @@ func parseOperation(path string, operation string) (ast.Document, error) {
 	return opDoc, nil
 }
 
-// getOperationNameAndType extracts the name and type of the first operation in a document
-func getOperationNameAndType(doc *ast.Document) (string, string, error) {
+// GetOperationNameAndType extracts the name and type of the first operation in a document
+func GetOperationNameAndType(doc *ast.Document) (string, string, error) {
 	for _, ref := range doc.RootNodes {
 		if ref.Kind == ast.NodeKindOperationDefinition {
 			opDef := doc.OperationDefinitions[ref.Ref]
@@ -174,10 +193,94 @@ func getOperationNameAndType(doc *ast.Document) (string, string, error) {
 			}
 
 			if opDef.Name.Length() > 0 {
-				return doc.Input.ByteSliceString(opDef.Name), opType, nil
+				return string(doc.Input.ByteSlice(opDef.Name)), opType, nil
 			}
 			return "", opType, nil
 		}
 	}
 	return "", "", fmt.Errorf("no operation found in document")
+}
+
+// extractOperationDescription extracts the description string from an operation definition
+func extractOperationDescription(doc *ast.Document) string {
+	for _, ref := range doc.RootNodes {
+		if ref.Kind == ast.NodeKindOperationDefinition {
+			opDef := doc.OperationDefinitions[ref.Ref]
+			if opDef.Description.IsDefined && opDef.Description.Content.Length() > 0 {
+				description := string(doc.Input.ByteSlice(opDef.Description.Content))
+				return strings.TrimSpace(description)
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// HasExecutableDescriptions reports whether the document contains any
+// description on an executable definition (operation, variable, fragment) —
+// the descriptions added by the September 2025 GraphQL spec that older upstream
+// servers will reject.
+func HasExecutableDescriptions(doc *ast.Document) bool {
+	for i := range doc.OperationDefinitions {
+		if doc.OperationDefinitions[i].Description.IsDefined {
+			return true
+		}
+	}
+	for i := range doc.VariableDefinitions {
+		if doc.VariableDefinitions[i].Description.IsDefined {
+			return true
+		}
+	}
+	for i := range doc.FragmentDefinitions {
+		if doc.FragmentDefinitions[i].Description.IsDefined {
+			return true
+		}
+	}
+	return false
+}
+
+// PrintOperationWithoutDescriptions re-prints an executable GraphQL document
+// with all executable-definition descriptions hidden, so the result is safe to
+// forward to upstream GraphQL servers that don't yet support the September 2025
+// spec. The document's description fields are restored before returning so
+// other consumers (e.g. MCP JSON schema generation) still see them.
+//
+// Callers should gate this on HasExecutableDescriptions and reuse the original
+// source string when no descriptions are present — re-printing reformats the
+// document.
+func PrintOperationWithoutDescriptions(doc *ast.Document) (string, error) {
+	hiddenOps := make([]int, 0, len(doc.OperationDefinitions))
+	for i := range doc.OperationDefinitions {
+		if doc.OperationDefinitions[i].Description.IsDefined {
+			doc.OperationDefinitions[i].Description.IsDefined = false
+			hiddenOps = append(hiddenOps, i)
+		}
+	}
+	hiddenVars := make([]int, 0, len(doc.VariableDefinitions))
+	for i := range doc.VariableDefinitions {
+		if doc.VariableDefinitions[i].Description.IsDefined {
+			doc.VariableDefinitions[i].Description.IsDefined = false
+			hiddenVars = append(hiddenVars, i)
+		}
+	}
+	hiddenFrags := make([]int, 0, len(doc.FragmentDefinitions))
+	for i := range doc.FragmentDefinitions {
+		if doc.FragmentDefinitions[i].Description.IsDefined {
+			doc.FragmentDefinitions[i].Description.IsDefined = false
+			hiddenFrags = append(hiddenFrags, i)
+		}
+	}
+	defer func() {
+		for _, ref := range hiddenOps {
+			doc.OperationDefinitions[ref].Description.IsDefined = true
+		}
+		for _, ref := range hiddenVars {
+			doc.VariableDefinitions[ref].Description.IsDefined = true
+		}
+		for _, ref := range hiddenFrags {
+			doc.FragmentDefinitions[ref].Description.IsDefined = true
+		}
+	}()
+
+	return astprinter.PrintString(doc)
 }

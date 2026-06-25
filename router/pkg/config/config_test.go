@@ -71,6 +71,20 @@ poll_interval: "${TEST_POLL_INTERVAL}"
 	require.Equal(t, time.Second*20, cfg.Config.PollInterval)
 }
 
+func TestLoadLogServiceNameFromEnv(t *testing.T) {
+	t.Setenv("LOG_SERVICE_NAME", "my-custom-service")
+
+	f := createTempFileFromFixture(t, `
+version: "1"
+`)
+
+	cfg, err := LoadConfig([]string{f})
+
+	require.NoError(t, err)
+
+	require.Equal(t, "my-custom-service", cfg.Config.LogServiceName)
+}
+
 func TestLoadWatchCfgFromEnvars(t *testing.T) {
 	t.Setenv("WATCH_CONFIG_ENABLED", "true")
 	t.Setenv("WATCH_CONFIG_INTERVAL", "30s")
@@ -108,6 +122,59 @@ poll_interval: 11s
 	require.NoError(t, err)
 
 	require.Equal(t, time.Second*11, cfg.Config.PollInterval)
+}
+
+func TestForceUnauthenticatedRequestTracingConfigLoading(t *testing.T) {
+	t.Run("defaults to false", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+`)
+
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.False(t, cfg.Config.EngineExecutionConfiguration.ForceUnauthenticatedRequestTracing)
+	})
+
+	t.Run("can be enabled from yaml", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+
+engine:
+  force_unauthenticated_request_tracing: true
+`)
+
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.True(t, cfg.Config.EngineExecutionConfiguration.ForceUnauthenticatedRequestTracing)
+	})
+
+	t.Run("yaml value takes precedence over env", func(t *testing.T) {
+		t.Setenv("ENGINE_FORCE_UNAUTHENTICATED_REQUEST_TRACING", "false")
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+
+engine:
+  force_unauthenticated_request_tracing: true
+`)
+
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.True(t, cfg.Config.EngineExecutionConfiguration.ForceUnauthenticatedRequestTracing)
+	})
 }
 
 // Confirms https://github.com/caarlos0/env/issues/354 is fixed
@@ -202,6 +269,63 @@ telemetry:
 	require.Len(t, cfg.Config.Telemetry.Metrics.Prometheus.ExcludeMetricLabels, 1)
 	require.Equal(t, RegExArray{regexp.MustCompile("^go_.*"), regexp.MustCompile("^process_.*")}, cfg.Config.Telemetry.Metrics.Prometheus.ExcludeMetrics)
 	require.Equal(t, RegExArray{regexp.MustCompile("^instance")}, cfg.Config.Telemetry.Metrics.Prometheus.ExcludeMetricLabels)
+}
+
+func TestLogExporterIncludeExcludeMetricsMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+
+	t.Run("only exclude_metrics is valid", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: '1'
+
+telemetry:
+  metrics:
+    otlp:
+      log_exporter:
+        enabled: true
+        exclude_metrics: ["^runtime_.*"]
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("only include_metrics is valid", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: '1'
+
+telemetry:
+  metrics:
+    otlp:
+      log_exporter:
+        enabled: true
+        include_metrics: ["^router_http_.*"]
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("both include_metrics and exclude_metrics is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: '1'
+
+telemetry:
+  metrics:
+    otlp:
+      log_exporter:
+        enabled: true
+        exclude_metrics: ["^runtime_.*"]
+        include_metrics: ["^router_http_.*"]
+`)
+		_, err := LoadConfig([]string{f})
+		require.Error(t, err)
+		require.ErrorContains(t, err, "log_exporter")
+	})
 }
 
 func TestLogLevels(t *testing.T) {
@@ -434,7 +558,7 @@ persisted_operations:
 	require.NoError(t, err, &js)
 }
 
-func TestInvalidPersistedOperations(t *testing.T) {
+func TestPersistedOperationsStorageWithoutObjectPrefix(t *testing.T) {
 	t.Parallel()
 
 	f := createTempFileFromFixture(t, `
@@ -454,12 +578,9 @@ persisted_operations:
     size: 100MB
   storage:
     provider_id: s3
-    # Missing object_prefix
 `)
 	_, err := LoadConfig([]string{f})
-	var js *jsonschema.ValidationError
-	require.ErrorAs(t, err, &js)
-	require.Equal(t, "at '/persisted_operations/storage': missing property 'object_prefix'", js.Causes[0].Error())
+	require.NoError(t, err)
 }
 
 func TestValidExecutionConfig(t *testing.T) {
@@ -527,6 +648,128 @@ execution_config:
 	})
 }
 
+func TestS3StorageProviderFromEnv(t *testing.T) {
+	// First S3 provider
+	t.Setenv("STORAGE_PROVIDER_S3_0_ID", "s3-one")
+	t.Setenv("STORAGE_PROVIDER_S3_0_ENDPOINT", "s3-one.example.com:9000")
+	t.Setenv("STORAGE_PROVIDER_S3_0_BUCKET", "bucket-one")
+	t.Setenv("STORAGE_PROVIDER_S3_0_ACCESS_KEY", "accessKey1")
+	t.Setenv("STORAGE_PROVIDER_S3_0_SECRET_KEY", "secretKey1")
+	t.Setenv("STORAGE_PROVIDER_S3_0_REGION", "us-east-1")
+	t.Setenv("STORAGE_PROVIDER_S3_0_SECURE", "true")
+
+	// Second S3 provider
+	t.Setenv("STORAGE_PROVIDER_S3_1_ID", "s3-two")
+	t.Setenv("STORAGE_PROVIDER_S3_1_ENDPOINT", "s3-two.example.com:9000")
+	t.Setenv("STORAGE_PROVIDER_S3_1_BUCKET", "bucket-two")
+	t.Setenv("STORAGE_PROVIDER_S3_1_ACCESS_KEY", "accessKey2")
+	t.Setenv("STORAGE_PROVIDER_S3_1_SECRET_KEY", "secretKey2")
+	t.Setenv("STORAGE_PROVIDER_S3_1_REGION", "eu-west-1")
+	t.Setenv("STORAGE_PROVIDER_S3_1_SECURE", "false")
+
+	f := createTempFileFromFixture(t, `
+version: "1"
+`)
+	cfg, err := LoadConfig([]string{f})
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Config.StorageProviders.S3, 2)
+
+	s3One := cfg.Config.StorageProviders.S3[0]
+	require.Equal(t, "s3-one", s3One.ID)
+	require.Equal(t, "s3-one.example.com:9000", s3One.Endpoint)
+	require.Equal(t, "bucket-one", s3One.Bucket)
+	require.Equal(t, "accessKey1", s3One.AccessKey)
+	require.Equal(t, "secretKey1", s3One.SecretKey)
+	require.Equal(t, "us-east-1", s3One.Region)
+	require.True(t, s3One.Secure)
+
+	s3Two := cfg.Config.StorageProviders.S3[1]
+	require.Equal(t, "s3-two", s3Two.ID)
+	require.Equal(t, "s3-two.example.com:9000", s3Two.Endpoint)
+	require.Equal(t, "bucket-two", s3Two.Bucket)
+	require.Equal(t, "accessKey2", s3Two.AccessKey)
+	require.Equal(t, "secretKey2", s3Two.SecretKey)
+	require.Equal(t, "eu-west-1", s3Two.Region)
+	require.False(t, s3Two.Secure)
+}
+
+func TestCDNStorageProviderFromEnv(t *testing.T) {
+	t.Setenv("STORAGE_PROVIDER_CDN_0_ID", "cdn-one")
+	t.Setenv("STORAGE_PROVIDER_CDN_0_URL", "https://cdn-one.example.com")
+
+	t.Setenv("STORAGE_PROVIDER_CDN_1_ID", "cdn-two")
+	t.Setenv("STORAGE_PROVIDER_CDN_1_URL", "https://cdn-two.example.com")
+
+	f := createTempFileFromFixture(t, `
+version: "1"
+`)
+	cfg, err := LoadConfig([]string{f})
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Config.StorageProviders.CDN, 2)
+
+	cdnOne := cfg.Config.StorageProviders.CDN[0]
+	require.Equal(t, "cdn-one", cdnOne.ID)
+	require.Equal(t, "https://cdn-one.example.com", cdnOne.URL)
+
+	cdnTwo := cfg.Config.StorageProviders.CDN[1]
+	require.Equal(t, "cdn-two", cdnTwo.ID)
+	require.Equal(t, "https://cdn-two.example.com", cdnTwo.URL)
+}
+
+func TestRedisStorageProviderFromEnv(t *testing.T) {
+	t.Setenv("STORAGE_PROVIDER_REDIS_0_ID", "redis-one")
+	t.Setenv("STORAGE_PROVIDER_REDIS_0_URLS", "redis://localhost:6379,redis://localhost:6380")
+	t.Setenv("STORAGE_PROVIDER_REDIS_0_CLUSTER_ENABLED", "true")
+
+	t.Setenv("STORAGE_PROVIDER_REDIS_1_ID", "redis-two")
+	t.Setenv("STORAGE_PROVIDER_REDIS_1_URLS", "redis://localhost:7379")
+	t.Setenv("STORAGE_PROVIDER_REDIS_1_CLUSTER_ENABLED", "false")
+
+	f := createTempFileFromFixture(t, `
+version: "1"
+`)
+	cfg, err := LoadConfig([]string{f})
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Config.StorageProviders.Redis, 2)
+
+	redisOne := cfg.Config.StorageProviders.Redis[0]
+	require.Equal(t, "redis-one", redisOne.ID)
+	require.Equal(t, []string{"redis://localhost:6379", "redis://localhost:6380"}, redisOne.URLs)
+	require.True(t, redisOne.ClusterEnabled)
+
+	redisTwo := cfg.Config.StorageProviders.Redis[1]
+	require.Equal(t, "redis-two", redisTwo.ID)
+	require.Equal(t, []string{"redis://localhost:7379"}, redisTwo.URLs)
+	require.False(t, redisTwo.ClusterEnabled)
+}
+
+func TestFileSystemStorageProviderFromEnv(t *testing.T) {
+	t.Setenv("STORAGE_PROVIDER_FS_0_ID", "fs-one")
+	t.Setenv("STORAGE_PROVIDER_FS_0_PATH", "/data/configs")
+
+	t.Setenv("STORAGE_PROVIDER_FS_1_ID", "fs-two")
+	t.Setenv("STORAGE_PROVIDER_FS_1_PATH", "/data/backups")
+
+	f := createTempFileFromFixture(t, `
+version: "1"
+`)
+	cfg, err := LoadConfig([]string{f})
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Config.StorageProviders.FileSystem, 2)
+
+	fsOne := cfg.Config.StorageProviders.FileSystem[0]
+	require.Equal(t, "fs-one", fsOne.ID)
+	require.Equal(t, "/data/configs", fsOne.Path)
+
+	fsTwo := cfg.Config.StorageProviders.FileSystem[1]
+	require.Equal(t, "fs-two", fsTwo.ID)
+	require.Equal(t, "/data/backups", fsTwo.Path)
+}
+
 func TestInvalidExecutionConfig(t *testing.T) {
 	t.Parallel()
 
@@ -552,7 +795,7 @@ execution_config:
 		_, err := LoadConfig([]string{f})
 		var js *jsonschema.ValidationError
 		require.ErrorAs(t, err, &js)
-		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config/storage': missing property 'object_path'\n- at '/execution_config': additional properties 'storage' not allowed", js.Causes[0].Error())
+		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config/storage': missing property 'object_path'\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'storage' not allowed", js.Causes[0].Error())
 	})
 
 	t.Run("too low watch interval", func(t *testing.T) {
@@ -570,7 +813,7 @@ execution_config:
 		_, err := LoadConfig([]string{f})
 		var js *jsonschema.ValidationError
 		require.ErrorAs(t, err, &js)
-		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config/file/watch_interval': duration must be greater or equal than 100ms\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed", js.Causes[0].Error())
+		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config/file/watch_interval': duration must be greater or equal than 100ms\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed", js.Causes[0].Error())
 	})
 
 	t.Run("watch interval with watch disabled", func(t *testing.T) {
@@ -587,7 +830,7 @@ execution_config:
 		_, err := LoadConfig([]string{f})
 		var js *jsonschema.ValidationError
 		require.ErrorAs(t, err, &js)
-		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config/file/watch': value must be true\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed", js.Causes[0].Error())
+		require.Equal(t, "at '/execution_config': oneOf failed, none matched\n- at '/execution_config/file/watch': value must be true\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file' not allowed", js.Causes[0].Error())
 	})
 }
 
@@ -631,7 +874,11 @@ execution_config:
 	var js *jsonschema.ValidationError
 	require.ErrorAs(t, err, &js)
 	require.True(t,
-		js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file', 'storage' not allowed" || js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'storage', 'file' not allowed",
+		js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file', 'storage' not allowed\n- at '/execution_config': additional properties 'file', 'storage' not allowed" ||
+			js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'file', 'storage' not allowed\n- at '/execution_config': additional properties 'storage', 'file' not allowed" ||
+			js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'storage', 'file' not allowed\n- at '/execution_config': additional properties 'file', 'storage' not allowed" ||
+			js.Causes[0].Error() == "at '/execution_config': oneOf failed, none matched\n- at '/execution_config': additional properties 'storage' not allowed\n- at '/execution_config': additional properties 'file' not allowed\n- at '/execution_config': additional properties 'storage', 'file' not allowed\n- at '/execution_config': additional properties 'storage', 'file' not allowed",
+		js.Causes[0].Error(),
 	)
 }
 
@@ -677,16 +924,113 @@ version: "1"
 		require.NoError(t, err)
 
 		require.False(t, c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Enabled)
-		require.False(t, c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.IncludeOperationSha)
 
 		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_ENABLED", "true")
-		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_INCLUDE_OPERATION_SHA", "true")
 
 		c, err = LoadConfig([]string{f})
 		require.NoError(t, err)
 
 		require.True(t, c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Enabled)
+	})
+
+	t.Run("exporter defaults", func(t *testing.T) {
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+telemetry:
+  metrics:
+    prometheus:
+      schema_usage:
+        enabled: true
+`)
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		exporter := c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Exporter
+		require.Equal(t, 4096, exporter.BatchSize)
+		require.Equal(t, 12800, exporter.QueueSize)
+		require.Equal(t, 2*time.Second, exporter.Interval)
+		require.Equal(t, 10*time.Second, exporter.ExportTimeout)
+	})
+
+	t.Run("exporter custom config from file", func(t *testing.T) {
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+telemetry:
+  metrics:
+    prometheus:
+      schema_usage:
+        enabled: true
+        include_operation_sha: true
+        exporter:
+          batch_size: 4096
+          queue_size: 12800
+          interval: 30s
+          export_timeout: 15s
+`)
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.True(t, c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Enabled)
 		require.True(t, c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.IncludeOperationSha)
+
+		exporter := c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Exporter
+		require.Equal(t, 4096, exporter.BatchSize)
+		require.Equal(t, 12800, exporter.QueueSize)
+		require.Equal(t, 30*time.Second, exporter.Interval)
+		require.Equal(t, 15*time.Second, exporter.ExportTimeout)
+	})
+
+	t.Run("exporter config from environment", func(t *testing.T) {
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+telemetry:
+  metrics:
+    prometheus:
+      schema_usage:
+        enabled: true
+`)
+
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_BATCH_SIZE", "2048")
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_QUEUE_SIZE", "4096")
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_INTERVAL", "20s")
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_EXPORT_TIMEOUT", "25s")
+
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		exporter := c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Exporter
+		require.Equal(t, 2048, exporter.BatchSize)
+		require.Equal(t, 4096, exporter.QueueSize)
+		require.Equal(t, 20*time.Second, exporter.Interval)
+		require.Equal(t, 25*time.Second, exporter.ExportTimeout)
+	})
+
+	t.Run("file config takes precedence over environment", func(t *testing.T) {
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+telemetry:
+  metrics:
+    prometheus:
+      schema_usage:
+        enabled: true
+        exporter:
+          batch_size: 1024
+          interval: 5s
+`)
+
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_BATCH_SIZE", "9999")
+		t.Setenv("PROMETHEUS_SCHEMA_FIELD_USAGE_EXPORTER_INTERVAL", "99s")
+
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		exporter := c.Config.Telemetry.Metrics.Prometheus.SchemaFieldUsage.Exporter
+		require.Equal(t, 1024, exporter.BatchSize)
+		require.Equal(t, 5*time.Second, exporter.Interval)
 	})
 }
 
@@ -831,6 +1175,16 @@ func TestConfigMerging(t *testing.T) {
 				Storage: PersistedOperationsStorageConfig{
 					ProviderID:   "s3",
 					ObjectPrefix: "ee",
+				},
+				Manifest: PQLManifestConfig{
+					FileName:     "manifest.json",
+					PollInterval: 10 * time.Second,
+					PollJitter:   5 * time.Second,
+					Warmup: PQLManifestWarmupConfig{
+						Enabled: true,
+						Workers: 4,
+						Timeout: 30 * time.Second,
+					},
 				},
 			},
 			AutomaticPersistedQueries: AutomaticPersistedQueriesConfig{
@@ -1080,18 +1434,18 @@ listen_addr: "localhost:3007"
 		base := createTempFileFromFixtureWithPattern(t, "config_test_1", `
 version: "1"
 
-execution_config: 
-  file: 
+execution_config:
+  file:
     path: 'somePath'
 `)
 
 		override1 := createTempFileFromFixtureWithPattern(t, "config_test_2", `
 version: "1"
 
-execution_config: 
-  storage: 
+execution_config:
+  storage:
     provider_id: 'id'
-    object_path: 'there' 
+    object_path: 'there'
 
 `)
 
@@ -1196,5 +1550,688 @@ traffic_shaping:
 `)
 		_, err := LoadConfig([]string{f})
 		require.NoError(t, err)
+	})
+}
+
+func TestValidateJwksConfiguration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("verify valid url config", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - url: "http://url/valid.json"
+
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("verify valid secret config", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - header_key_id: "givenKID"
+        secret: "example secret"
+        symmetric_algorithm: HS512
+
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("scope claim can be configured", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    scope_claim: "scp"
+    jwks:
+      - url: "http://url/valid.json"
+
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.Equal(t, "scp", cfg.Config.Authentication.JWT.ScopeClaim)
+	})
+
+	t.Run("verify scope claim defaults to scope", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - url: "http://url/valid.json"
+
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.Equal(t, "scope", cfg.Config.Authentication.JWT.ScopeClaim)
+	})
+
+	t.Run("verify both secret and url are not allowed together", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - header_key_id: "givenKID"
+        url: "http://url/valid.json"
+        algorithms: []
+        secret: "example secret"
+        symmetric_algorithm: HS512
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/authentication/jwt/jwks/")
+		require.ErrorContains(t, err, "oneOf failed, none matched")
+
+	})
+
+	t.Run("verify secret parameters mandatory", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - secret: "example secret"
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/authentication/jwt/jwks/")
+		require.ErrorContains(t, err, "missing properties 'symmetric_algorithm', 'header_key_id'")
+
+	})
+
+	t.Run("verify url parameter is mandatory", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+authentication:
+  jwt:
+    jwks:
+      - algorithms: []
+
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/authentication/jwt/jwks/")
+		require.ErrorContains(t, err, "oneOf failed, none matched")
+
+	})
+
+}
+
+func TestValidateIntrospectionAuthConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("verify authentication can be skipped for introspection queries", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+introspection:
+  enabled: true
+
+authentication:
+  ignore_introspection: true
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("verify a secret can be set for introspection query authentication skip", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+introspection:
+  enabled: true
+  secret: dedicated_secret_for_introspection
+
+authentication:
+  ignore_introspection: true
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("A secret too short is invalid", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+introspection:
+  enabled: true
+  secret: too_short_token
+
+authentication:
+  ignore_introspection: true
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/introspection/secret': minLength: got 15, want 32")
+	})
+}
+
+func TestValidateAccessLogFileMode(t *testing.T) {
+	t.Parallel()
+
+	t.Run("verify file mode is parsed correctly", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+access_logs:
+  enabled: true
+  output:
+    file:
+      enabled: true
+      path: ./access.log
+      mode: "640"
+`)
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.Equal(t, FileMode(0640), c.Config.AccessLogs.Output.File.Mode)
+	})
+
+	t.Run("verify file mode is parsed correctly with leading zero", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+access_logs:
+  enabled: true
+  output:
+    file:
+      enabled: true
+      path: ./access.log
+      mode: "0640"
+`)
+		c, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.Equal(t, FileMode(0640), c.Config.AccessLogs.Output.File.Mode)
+	})
+
+	t.Run("verify file mode throws an error when pattern is not matched", func(t *testing.T) {
+		t.Parallel()
+
+		invalidPatterns := []string{
+			// Too few digits
+			"0",
+			"00",
+			"64",
+
+			// Too many digits
+			"6440",
+			"06440",
+			"64400",
+			"640000",
+			"0640000",
+
+			// Invalid octal digits (8, 9)
+			"648",
+			"0648",
+			"659",
+			"0659",
+			"688",
+			"0688",
+			"789",
+			"0789",
+			"888",
+			"0888",
+			"999",
+			"0999",
+
+			// Non-numeric characters
+			"64A",
+			"064A",
+			"6BC",
+			"0ABC",
+			"invalid",
+			"abc",
+			"",
+
+			// Special characters
+			"64-",
+			"64+",
+			"64.",
+			"64/",
+			"64 ",
+			" 640",
+			"6 40",
+
+			// Leading zeros in wrong position
+			"6040",
+			"6400",
+			"64000",
+		}
+
+		for _, pattern := range invalidPatterns {
+			f := createTempFileFromFixture(t, `
+version: "1"
+
+access_logs:
+  enabled: true
+  output:
+    file:
+      enabled: true
+      path: ./access.log
+      mode: "`+pattern+`"
+`)
+			_, err := LoadConfig([]string{f})
+			require.Error(t, err, "Pattern '%s' should be invalid but was accepted", pattern)
+		}
+	})
+
+	t.Run("verify file mode accepts valid octal patterns", func(t *testing.T) {
+		t.Parallel()
+
+		validPatterns := []struct {
+			pattern string
+			mode    FileMode
+		}{
+			// 3 digits without leading zero
+			{"000", FileMode(0000)},
+			{"001", FileMode(0001)},
+			{"644", FileMode(0644)},
+			{"640", FileMode(0640)},
+			{"755", FileMode(0755)},
+			{"777", FileMode(0777)},
+			{"600", FileMode(0600)},
+			{"700", FileMode(0700)},
+			{"666", FileMode(0666)},
+			{"111", FileMode(0111)},
+
+			// 3 digits with leading zero
+			{"0000", FileMode(0000)},
+			{"0001", FileMode(0001)},
+			{"0644", FileMode(0644)},
+			{"0640", FileMode(0640)},
+			{"0755", FileMode(0755)},
+			{"0777", FileMode(0777)},
+			{"0600", FileMode(0600)},
+			{"0700", FileMode(0700)},
+			{"0666", FileMode(0666)},
+			{"0111", FileMode(0111)},
+		}
+
+		for _, tc := range validPatterns {
+			f := createTempFileFromFixture(t, `
+version: "1"
+
+access_logs:
+  enabled: true
+  output:
+    file:
+      enabled: true
+      path: ./access.log
+      mode: "`+tc.pattern+`"
+`)
+			c, err := LoadConfig([]string{f})
+			require.NoError(t, err, "Pattern '%s' should be valid but was rejected", tc.pattern)
+			require.Equal(t, tc.mode, c.Config.AccessLogs.Output.File.Mode, "Pattern '%s' should parse to mode %o but got %o", tc.pattern, tc.mode, c.Config.AccessLogs.Output.File.Mode)
+		}
+	})
+}
+
+func TestComplexityLimitsModeConfig(t *testing.T) {
+	t.Run("valid mode values are accepted", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []string{"measure", "enforce"} {
+			f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  complexity_limits:
+    mode: `+mode+`
+    depth:
+      enabled: true
+      limit: 5
+`)
+			_, err := LoadConfig([]string{f})
+			require.NoError(t, err, "mode %q should be valid", mode)
+		}
+	})
+
+	t.Run("invalid mode is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  complexity_limits:
+    mode: invalid
+    depth:
+      enabled: true
+      limit: 5
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/security/complexity_limits/mode'")
+		require.ErrorContains(t, err, "value must be one of")
+	})
+
+	t.Run("mode is unset when omitted from YAML", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  complexity_limits:
+    depth:
+      enabled: true
+      limit: 5
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		// When mode is omitted, it remains unset. The runtime check in
+		// ValidateQueryComplexity only skips enforcement for explicit "measure",
+		// so unset is treated as enforce
+		require.Equal(t, ComplexityLimitsModeUnset, cfg.Config.SecurityConfiguration.ComplexityLimits.Mode)
+	})
+
+	t.Run("measure mode is set correctly", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  complexity_limits:
+    mode: measure
+    depth:
+      enabled: true
+      limit: 5
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+		require.Equal(t, ComplexityLimitsModeMeasure, cfg.Config.SecurityConfiguration.ComplexityLimits.Mode)
+	})
+
+}
+
+func TestCostControlConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid config with estimated_list_size when enabled", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("estimated_list_size is required when enabled", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/security/cost_control'")
+		require.ErrorContains(t, err, "missing property 'estimated_list_size'")
+	})
+
+	t.Run("estimated_list_size not required when disabled", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: false
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("estimated_list_size must be positive", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 0
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/security/cost_control/estimated_list_size'")
+		require.ErrorContains(t, err, "minimum")
+	})
+
+	t.Run("valid mode values are accepted", func(t *testing.T) {
+		t.Parallel()
+
+		for _, mode := range []string{"measure", "enforce"} {
+			f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+    mode: `+mode+`
+`)
+			_, err := LoadConfig([]string{f})
+			require.NoError(t, err, "mode %q should be valid", mode)
+		}
+	})
+
+	t.Run("invalid mode is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+    mode: invalid
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/security/cost_control/mode'")
+		require.ErrorContains(t, err, "value must be one of")
+	})
+
+	t.Run("max_estimated_limit must be positive when mode is enforce", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+    mode: enforce
+    max_estimated_limit: 0
+`)
+		_, err := LoadConfig([]string{f})
+		require.ErrorContains(t, err, "at '/security/cost_control/max_estimated_limit'")
+		require.ErrorContains(t, err, "minimum")
+	})
+
+	t.Run("max_estimated_limit zero is allowed when mode is measure", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+    mode: measure
+    max_estimated_limit: 0
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+
+	t.Run("valid enforce config", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+security:
+  cost_control:
+    enabled: true
+    estimated_list_size: 10
+    mode: enforce
+    max_estimated_limit: 100
+`)
+		_, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+	})
+}
+
+func TestPQLManifestConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.False(t, cfg.Config.PersistedOperationsConfig.Manifest.Enabled)
+		require.Equal(t, 10*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollInterval)
+		require.Equal(t, 5*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollJitter)
+	})
+
+	t.Run("yaml config", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+
+persisted_operations:
+  manifest:
+    enabled: true
+    poll_interval: 60s
+    poll_jitter: 15s
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.True(t, cfg.Config.PersistedOperationsConfig.Manifest.Enabled)
+		require.Equal(t, 60*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollInterval)
+		require.Equal(t, 15*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollJitter)
+	})
+
+	t.Run("env variables", func(t *testing.T) {
+		t.Setenv("PERSISTED_OPERATIONS_MANIFEST_ENABLED", "true")
+		t.Setenv("PERSISTED_OPERATIONS_MANIFEST_POLL_INTERVAL", "45s")
+		t.Setenv("PERSISTED_OPERATIONS_MANIFEST_POLL_JITTER", "8s")
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+`)
+		cfg, err := LoadConfig([]string{f})
+		require.NoError(t, err)
+
+		require.True(t, cfg.Config.PersistedOperationsConfig.Manifest.Enabled)
+		require.Equal(t, 45*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollInterval)
+		require.Equal(t, 8*time.Second, cfg.Config.PersistedOperationsConfig.Manifest.PollJitter)
+	})
+
+	t.Run("poll_interval below minimum rejected", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+
+persisted_operations:
+  manifest:
+    enabled: true
+    poll_interval: 5s
+`)
+		_, err := LoadConfig([]string{f})
+
+		var js *jsonschema.ValidationError
+		require.ErrorAs(t, err, &js)
+		require.Equal(t, []string{"persisted_operations", "manifest", "poll_interval"}, js.Causes[0].InstanceLocation)
+		require.Equal(t, "at '/persisted_operations/manifest/poll_interval': duration must be greater or equal than 10s", js.Causes[0].Error())
+	})
+
+	t.Run("poll_jitter below minimum rejected", func(t *testing.T) {
+		t.Parallel()
+
+		f := createTempFileFromFixture(t, `
+version: "1"
+
+graph:
+  token: "token"
+
+persisted_operations:
+  manifest:
+    enabled: true
+    poll_jitter: 500ms
+`)
+		_, err := LoadConfig([]string{f})
+
+		var js *jsonschema.ValidationError
+		require.ErrorAs(t, err, &js)
+		require.Equal(t, []string{"persisted_operations", "manifest", "poll_jitter"}, js.Causes[0].InstanceLocation)
+		require.Equal(t, "at '/persisted_operations/manifest/poll_jitter': duration must be greater or equal than 1s", js.Causes[0].Error())
 	})
 }

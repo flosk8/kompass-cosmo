@@ -1,4 +1,4 @@
-import { ConstDirectiveNode, ConstValueNode, Kind, StringValueNode } from 'graphql';
+import { type ConstDirectiveNode, type ConstValueNode, Kind, type StringValueNode } from 'graphql';
 import {
   BOOLEAN_SCALAR,
   ENUM,
@@ -9,16 +9,24 @@ import {
   INPUT_VALUE,
   INT_SCALAR,
   INTERFACE,
+  LEVELS,
   NULL,
   OBJECT,
   REQUIRES_SCOPES,
   SCALAR,
   SCOPES,
+  SEMANTIC_NON_NULL,
   STRING_SCALAR,
   UNION,
 } from './string-constants';
 import { invalidKeyFatalError } from '../errors/errors';
 import { stringToNameNode } from '../ast/utils';
+import {
+  type AddMapEntriesParams,
+  type AddOptionalToSetParams,
+  type AddToSetParams,
+  type MergeSetValueMapParams,
+} from './params';
 
 export function getOrThrowError<K, V>(map: Map<K, V>, key: K, mapName: string): V {
   const value = map.get(key);
@@ -53,7 +61,16 @@ export function numberToOrdinal(num: number): string {
   }
 }
 
-export function addIterableValuesToSet<T>(source: Array<T> | Iterable<T>, target: Set<T>) {
+export function addIterableToSet<T>({ source, target }: AddToSetParams<T>) {
+  for (const value of source) {
+    target.add(value);
+  }
+}
+
+export function addOptionalIterableToSet<T>({ source, target }: AddOptionalToSetParams<T>) {
+  if (!source) {
+    return;
+  }
   for (const value of source) {
     target.add(value);
   }
@@ -191,6 +208,31 @@ export function generateRequiresScopesDirective(orScopes: Set<string>[]): ConstD
   };
 }
 
+export function generateSemanticNonNullDirective(levels: Set<number>): ConstDirectiveNode {
+  const sortedLevels = Array.from(levels).sort((a, b) => a - b);
+  const values = new Array<ConstValueNode>();
+  for (const level of sortedLevels) {
+    values.push({
+      kind: Kind.INT,
+      value: level.toString(),
+    });
+  }
+  return {
+    kind: Kind.DIRECTIVE,
+    name: stringToNameNode(SEMANTIC_NON_NULL),
+    arguments: [
+      {
+        kind: Kind.ARGUMENT,
+        name: stringToNameNode(LEVELS),
+        value: {
+          kind: Kind.LIST,
+          values,
+        },
+      },
+    ],
+  };
+}
+
 // shallow copy
 export function copyObjectValueMap<K, V>(source: Map<K, V>): Map<K, V> {
   const output = new Map<K, V>();
@@ -215,16 +257,30 @@ export function copyArrayValueMap<K, V>(source: Map<K, Array<V>>): Map<K, Array<
   return output;
 }
 
-export function addMapEntries<K, V>(source: Map<K, V>, target: Map<K, V>) {
+export function addMapEntries<K, V>({ source, target }: AddMapEntriesParams<K, V>) {
   for (const [key, value] of source) {
     target.set(key, value);
   }
 }
 
-export function getSingleSetEntry<T>(set: Set<T>): T | undefined {
-  const { value, done } = set.values().next();
+export function getFirstEntry<K, V>(collection: Set<V> | Map<K, V>): V | undefined {
+  const { value, done } = collection.values().next();
   if (done) {
     return;
   }
   return value;
+}
+
+export function mergeSetValueMap<K, V>({ source, target }: MergeSetValueMapParams<K, V>): void {
+  for (const [key, sourceSet] of source) {
+    const targetSet = target.get(key);
+    if (!targetSet) {
+      target.set(key, new Set<V>(sourceSet));
+      continue;
+    }
+    addIterableToSet({
+      source: sourceSet,
+      target: targetSet,
+    });
+  }
 }

@@ -2,7 +2,6 @@ import {
   billingPlans,
   billingSubscriptions,
   federatedGraphs,
-  lintRulesEnum,
   memberRoleEnum,
   organizationRoleEnum,
   organizationFeatures,
@@ -15,8 +14,12 @@ import {
   graphPruningRulesEnum,
   cacheWarmerOperations,
   proposalStateEnum,
+  proposalOriginEnum,
   proposalMatchEnum,
   schemaChangeTypeEnum,
+  subgraphTypeEnum,
+  batchPublishJobStatusEnum,
+  batchPublishJobDetails,
 } from './schema.js';
 
 export type FederatedGraph = typeof federatedGraphs.$inferSelect;
@@ -29,14 +32,17 @@ export type NewBillingSubscription = typeof billingSubscriptions.$inferInsert;
 export type NewBillingPlan = typeof billingPlans.$inferInsert;
 export type MemberRole = (typeof memberRoleEnum.enumValues)[number];
 export type OrganizationRole = (typeof organizationRoleEnum.enumValues)[number];
-export type LintRuleEnum = (typeof lintRulesEnum.enumValues)[number];
 export type GraphPruningRuleEnum = (typeof graphPruningRulesEnum.enumValues)[number];
 export type WebsocketSubprotocol = (typeof websocketSubprotocolEnum.enumValues)[number];
 export type CacheWarmupOperation = typeof cacheWarmerOperations.$inferInsert;
 export type ProposalState = (typeof proposalStateEnum.enumValues)[number];
+export type ProposalOrigin = (typeof proposalOriginEnum.enumValues)[number];
 export type ProposalMatch = (typeof proposalMatchEnum.enumValues)[number];
 export type WebhookDeliveryInfo = typeof webhookDeliveries.$inferInsert;
 export type DBSchemaChangeType = (typeof schemaChangeTypeEnum.enumValues)[number];
+export type DBSubgraphType = (typeof subgraphTypeEnum.enumValues)[number];
+export type BatchPublishJobStatus = (typeof batchPublishJobStatusEnum.enumValues)[number];
+export type NewBatchPublishJobDetails = typeof batchPublishJobDetails.$inferInsert;
 
 export type AuditableType =
   | 'organization'
@@ -58,7 +64,9 @@ export type AuditableType =
   | 'router_config'
   | 'operation_change_override'
   | 'operation_ignore_all_override'
-  | 'proposal';
+  | 'proposal'
+  | 'namespace_sso_mapping'
+  | 'organization_login_methods';
 
 export type AuditTargetType =
   | 'organization'
@@ -89,7 +97,10 @@ export type AuditLogAction =
   | 'disabled'
   | 'enabled'
   | 'added'
-  | 'removed';
+  | 'removed'
+  | 'linked'
+  | 'unlinked'
+  | 'recomposed';
 
 export type AuditLogFullAction =
   | 'namespace.created'
@@ -104,21 +115,26 @@ export type AuditLogFullAction =
   | 'graph_token.created'
   | 'graph_token.deleted'
   | 'monograph.created'
-  | 'monograph.updated'
   | 'monograph.deleted'
   | 'monograph.moved'
+  | 'monograph.recomposed'
+  | 'monograph.updated'
   | 'federated_graph.created'
   | 'federated_graph.deleted'
-  | 'federated_graph.updated'
   | 'federated_graph.moved'
+  | 'federated_graph.recomposed'
+  | 'federated_graph.updated'
   | 'subgraph.created'
   | 'subgraph.deleted'
   | 'subgraph.updated'
   | 'subgraph.moved'
+  | 'subgraph.linked'
+  | 'subgraph.unlinked'
   | 'feature_flag.created'
   | 'feature_flag.deleted'
   | 'feature_flag.disabled'
   | 'feature_flag.enabled'
+  | 'feature_flag.recomposed'
   | 'feature_subgraph.created'
   | 'feature_subgraph.deleted'
   | 'feature_subgraph.published'
@@ -162,4 +178,10 @@ export type AuditLogFullAction =
   | 'proposal.closed'
   | 'proposal.enabled'
   | 'proposal.disabled'
-  | 'namespace_proposal_config.updated';
+  | 'namespace_proposal_config.updated'
+  | 'namespace_sso_mapping.updated'
+  | 'organization_login_methods.updated'
+  | 'scim.organization_invitation_created'
+  | 'scim.update_organization_member'
+  | 'scim.activate_organization_member'
+  | 'scim.deactivate_organization_member';

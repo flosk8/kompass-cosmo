@@ -9,8 +9,8 @@
     "sourceMap": true,
     "outDir": "./dist",
     "module": "NodeNext",
-    "noEmit": true,
+    "noEmit": true
   },
-  "include": ["test/**/*"],
+  "include": ["test/**/*", "src/redlock.d.ts"],
   "exclude": ["node_modules"]
 }

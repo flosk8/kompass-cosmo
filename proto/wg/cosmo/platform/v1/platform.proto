@@ -36,6 +36,14 @@ message PublishMonographResponse {
   repeated CompositionWarning compositionWarnings = 4;
 }
 
+message ProtoInput {
+  string schema = 1;
+  string mappings = 2;
+  string lock = 3;
+  repeated string platforms = 4;
+  string version = 5;
+}
+
 message PublishFederatedSubgraphRequest {
   // The FQDN of the subgraph to be published e.g. "wg.team1.orders"
   string name = 1;
@@ -55,6 +63,11 @@ message PublishFederatedSubgraphRequest {
   optional wg.cosmo.common.GraphQLWebsocketSubprotocol websocket_subprotocol = 9;
   optional bool is_feature_subgraph = 10;
   optional string base_subgraph_name = 11;
+  optional bool disable_resolvability_validation = 12;
+  optional SubgraphType type = 13;
+  optional ProtoInput proto = 14;
+  // Optional limit for the number of errors/warnings returned
+  optional int32 limit = 15;
 }
 
 message PublishFederatedSubgraphResponse {
@@ -64,6 +77,70 @@ message PublishFederatedSubgraphResponse {
   optional bool hasChanged = 4;
   repeated CompositionWarning compositionWarnings = 5;
   optional string proposalMatchMessage = 6;
+  optional SubgraphPublishStats counts = 7;
+}
+
+message SubgraphPublishStats {
+  int32 compositionErrors = 1;
+  int32 compositionWarnings = 2;
+  int32 deploymentErrors = 3;
+}
+
+// A single subgraph entry to publish as part of a batch publish request.
+message PublishSubgraph {
+  // The name of the subgraph to publish.
+  string name = 1;
+  // The schema to publish for the subgraph.
+  string schema = 2;
+}
+
+message PublishFederatedSubgraphsRequest {
+  // The namespace all the subgraphs belong to.
+  string namespace = 1;
+  // The subgraphs to publish. Each must already exist in the namespace. Feature subgraphs are detected automatically.
+  repeated PublishSubgraph subgraphs = 2;
+  optional bool disable_resolvability_validation = 3;
+  // Optional limit for the number of errors/warnings returned.
+  optional int32 limit = 4;
+  // Optional value indicating whether the batch publish should occur asynchronously or wait for completion before returning.
+  optional bool async = 5;
+}
+
+message PublishFederatedSubgraphsResponse {
+  Response response = 1;
+  repeated CompositionError compositionErrors = 2;
+  repeated DeploymentError deploymentErrors = 3;
+  repeated CompositionWarning compositionWarnings = 4;
+  optional SubgraphPublishStats counts = 5;
+  // The names of the subgraphs whose schema actually changed as a result of this batch publish.
+  repeated string updatedSubgraphNames = 6;
+  // The job identifier the client can use to obtain details about the status of the enqueued job
+  optional string jobId = 7;
+}
+
+message GetBatchPublishJobStatusRequest {
+  string jobId = 1;
+  // Optional limit for the number of errors/warnings returned.
+  optional int32 limit = 2;
+}
+
+enum BatchPublishJobStatus {
+  PENDING = 0;
+  PROCESSING = 1;
+  FAILED = 2;
+  COMPLETED = 3;
+}
+
+message GetBatchPublishJobStatusResponse {
+  Response response = 1;
+  optional BatchPublishJobStatus status = 2;
+  optional string failureReason = 3;
+  repeated CompositionError compositionErrors = 4;
+  repeated DeploymentError deploymentErrors = 5;
+  repeated CompositionWarning compositionWarnings = 6;
+  optional SubgraphPublishStats counts = 7;
+  // The names of the subgraphs whose schema actually changed as a result of this batch publish.
+  repeated string updatedSubgraphNames = 8;
 }
 
 message GitInfo {
@@ -91,6 +168,8 @@ message CheckSubgraphSchemaRequest {
   optional bool skip_traffic_check = 6;
   optional VCSContext vcsContext = 7;
   repeated Label labels = 8;
+  optional bool disable_resolvability_validation = 9;
+  optional int32 limit = 10;
 }
 
 message FixSubgraphSchemaRequest {
@@ -99,6 +178,7 @@ message FixSubgraphSchemaRequest {
   // The string representation of the schema, the content of the file
   string schema = 2;
   string namespace = 3;
+  optional bool disable_resolvability_validation = 4;
 }
 
 message CreateMonographRequest {
@@ -131,6 +211,7 @@ message CreateFederatedGraphRequest {
   string namespace = 5;
   string admissionWebhookURL = 6;
   optional string admissionWebhookSecret = 7;
+  optional bool disable_resolvability_validation = 8;
 }
 
 message CreateFederatedSubgraphRequest {
@@ -142,7 +223,7 @@ message CreateFederatedSubgraphRequest {
   repeated Label labels = 3;
   // subscription protocol to use when subscribing to this subgraph
   optional wg.cosmo.common.GraphQLSubscriptionProtocol subscription_protocol = 5;
-    // url used for subscriptions
+  // url used for subscriptions
   optional string subscription_url = 6;
   // readme of the subgraph
   optional string readme = 7;
@@ -151,6 +232,7 @@ message CreateFederatedSubgraphRequest {
   optional bool is_event_driven_graph = 10;
   optional bool is_feature_subgraph = 11;
   optional string base_subgraph_name = 12;
+  SubgraphType type = 13;
 }
 
 message DeleteFederatedGraphRequest {
@@ -171,6 +253,7 @@ message DeleteFederatedSubgraphRequest {
   // The FQDN of the subgraph to be checked e.g. "wg.team1.orders"
   string subgraph_name = 1;
   string namespace = 2;
+  optional bool disable_resolvability_validation = 3;
 }
 
 message SchemaChange{
@@ -180,6 +263,15 @@ message SchemaChange{
   bool isBreaking = 4;
   optional bool hasOverride = 5;
   optional string subgraphName = 6;
+}
+
+message FederatedGraphSchemaChange {
+  string message = 1;
+  string changeType = 2;
+  optional string path = 3;
+  bool isBreaking = 4;
+  string federatedGraphName = 5;
+  optional bool hasOverride = 6;
 }
 
 message CompositionError {
@@ -262,6 +354,27 @@ message CheckSubgraphSchemaResponse {
   optional bool client_traffic_check_skipped = 12;
   repeated CompositionWarning compositionWarnings = 13;
   optional string proposalMatchMessage = 14;
+  // If true, it means the traffic check failed for the linked check
+  optional bool isLinkedTrafficCheckFailed = 15;
+  // If true, it means the graph pruning check failed for the linked check
+  optional bool isLinkedPruningCheckFailed = 16;
+  optional bool isCheckExtensionSkipped = 17;
+  optional string checkExtensionErrorMessage = 18;
+  optional SchemaCheckCounts counts = 19;
+  // Breaking changes detected in the composed federated graph schema (not subgraph level)
+  repeated FederatedGraphSchemaChange composedSchemaBreakingChanges = 20;
+}
+
+message SchemaCheckCounts{
+  int32 lintWarnings = 1;
+  int32 lintErrors = 2;
+  int32 breakingChanges = 3;
+  int32 nonBreakingChanges = 4;
+  int32 compositionErrors = 5;
+  int32 compositionWarnings = 6;
+  int32 graphPruneErrors = 7;
+  int32 graphPruneWarnings = 8;
+  int32 composedSchemaBreakingChanges = 9;
 }
 
 message FixSubgraphSchemaResponse {
@@ -351,7 +464,18 @@ message GetSubgraphsRequest {
   bool exclude_feature_subgraphs = 5;
 }
 
+enum SubgraphType {
+  STANDARD = 0;
+  GRPC_PLUGIN = 1;
+  GRPC_SERVICE = 2;
+}
+
 message Subgraph {
+  message PluginData{
+    string version = 1;
+    repeated string platforms = 2;
+  }
+
   string id = 1;
   string name = 2;
   string routingURL = 3;
@@ -369,6 +493,8 @@ message Subgraph {
   bool isFeatureSubgraph = 15;
   optional string baseSubgraphName = 16;
   optional string baseSubgraphId = 17;
+  SubgraphType type = 18;
+  optional PluginData pluginData = 19;
 }
 
 message GetSubgraphsResponse {
@@ -388,10 +514,6 @@ message GetFederatedGraphByNameResponse {
   FederatedGraph graph = 2;
   repeated Subgraph subgraphs = 3;
   string graphRequestToken = 4;
-  repeated FeatureFlag featureFlagsInLatestValidComposition = 5;
-  // includes all the feature subgraphs that are part of the federated graph;
-  // even the ones that are not part of the latest composition
-  repeated Subgraph featureSubgraphs = 6;
 }
 
 message GetFederatedGraphSDLByNameRequest {
@@ -413,9 +535,16 @@ message GetSubgraphByNameRequest {
 }
 
 message GetSubgraphByNameResponse {
+  message LinkedSubgraph{
+    string id = 1;
+    string name = 2;
+    string namespace = 3;
+  }
+
   Response response = 1;
   Subgraph graph = 2;
   repeated SubgraphMember members = 3;
+  optional LinkedSubgraph linkedSubgraph = 4;
 }
 
 message GetSubgraphSDLFromLatestCompositionRequest {
@@ -473,6 +602,19 @@ message SchemaCheck {
     repeated Label labels = 6;
   }
 
+  message LinkedCheck {
+    string id = 1;
+    repeated string affectedGraphNames = 2;
+    bool isCheckSuccessful = 3;
+    bool hasClientTraffic = 4;
+    bool hasGraphPruningErrors = 5;
+    bool clientTrafficCheckSkipped = 6;
+    bool graphPruningCheckSkipped = 7;
+    repeated string subgraphNames = 8;
+    string namespace = 9;
+    bool isForcedSuccess = 10;
+  }
+
   string id = 1;
   optional string targetID = 2;
   optional string subgraphName = 3;
@@ -494,6 +636,9 @@ message SchemaCheck {
   bool composition_skipped = 19;
   bool breaking_changes_skipped = 20;
   optional string errorMessage = 21;
+  repeated LinkedCheck linkedChecks = 22;
+  optional string check_extension_delivery_id = 23;
+  optional string check_extension_error_message = 24;
 }
 
 message GetChecksByFederatedGraphNameResponse {
@@ -519,6 +664,11 @@ message GetCheckSummaryResponse {
     int32 traffic_check_days = 2;
     string name = 3;
     bool isCheckSuccessful = 4;
+    bool isComposable = 5;
+    bool isBreaking = 6;
+    bool hasClientTraffic = 7;
+    bool hasLintErrors = 8;
+    bool hasGraphPruningErrors = 9;
   }
 
   message ProposalSchemaMatch {
@@ -541,6 +691,7 @@ message GetCheckSummaryResponse {
   optional string proposalName = 13;
   repeated ProposalSchemaMatch proposalMatches = 14;
   bool isProposalsEnabled = 15;
+  repeated FederatedGraphSchemaChange composedSchemaBreakingChanges = 16;
 }
 
 message GetCheckOperationsRequest {
@@ -576,6 +727,9 @@ message GetCheckOperationsResponse {
 
 message GetOperationContentRequest {
   string hash = 1;
+  string federated_graph_name = 2;
+  string namespace = 3;
+  optional string name = 4;
 }
 
 message GetOperationContentResponse {
@@ -629,6 +783,7 @@ message UpdateSubgraphRequest {
   string namespace = 8;
   optional bool unset_labels = 9;
   optional wg.cosmo.common.GraphQLWebsocketSubprotocol websocket_subprotocol = 10;
+  optional bool disable_resolvability_validation = 11;
 }
 
 message UpdateSubgraphResponse {
@@ -647,6 +802,7 @@ message UpdateFederatedGraphRequest {
   optional bool unset_label_matchers = 6;
   optional string admissionWebhookURL = 7;
   optional string admissionWebhookSecret = 8;
+  optional bool disable_resolvability_validation = 9;
 }
 
 message UpdateFederatedGraphResponse {
@@ -677,6 +833,8 @@ message CheckFederatedGraphRequest {
   string name = 1;
   repeated string label_matchers = 2;
   string namespace = 3;
+  optional bool disable_resolvability_validation = 4;
+  optional int32 limit = 5;
 }
 
 message CheckFederatedGraphResponse {
@@ -684,6 +842,7 @@ message CheckFederatedGraphResponse {
   repeated CompositionError compositionErrors = 2;
   repeated Subgraph subgraphs = 3;
   repeated CompositionWarning compositionWarnings = 4;
+  optional SchemaCheckCounts counts = 5;
 }
 
 
@@ -754,6 +913,7 @@ message AnalyticsViewColumn {
 enum CustomOptions {
   Text = 0;
   Range = 1;
+  Boolean = 2;
 }
 
 message AnalyticsViewResultFilter {
@@ -1003,6 +1163,21 @@ message InviteUserResponse {
   Response response = 1;
 }
 
+message InviteUsersRequest {
+  repeated string emails = 1;
+  repeated string groups = 2;
+}
+
+message InviteUsersInvitationError {
+  string email = 1;
+  string error = 2;
+}
+
+message InviteUsersResponse {
+  Response response = 1;
+  repeated InviteUsersInvitationError invitationErrors = 2;
+}
+
 message APIKey{
   message Group {
     string id = 1;
@@ -1016,13 +1191,18 @@ message APIKey{
   string lastUsedAt = 5;
   string expiresAt = 6;
   optional Group group = 7;
+  bool external = 8;
 }
 
-message GetAPIKeysRequest {}
+message GetAPIKeysRequest {
+  int32 limit = 1;
+  int32 offset = 2;
+}
 
 message GetAPIKeysResponse {
   Response response = 1;
   repeated APIKey apiKeys = 2;
+  int32 count = 3;
 }
 
 enum ExpiresAt {
@@ -1038,6 +1218,7 @@ message CreateAPIKeyRequest {
   ExpiresAt expires = 3;
   string groupId = 4;
   repeated string permissions = 5;
+  optional bool external = 6;
 }
 
 message CreateAPIKeyResponse {
@@ -1122,6 +1303,32 @@ message WhoAmIResponse {
   string organizationName = 2;
   optional string userEmail = 3;
   string organizationSlug = 4;
+  string organizationId = 5;
+  LoginMethod login_method = 6;
+}
+
+enum LoginMethodType {
+  LOGIN_METHOD_TYPE_UNSPECIFIED = 0;
+  LOGIN_METHOD_TYPE_SSO = 1;
+  LOGIN_METHOD_TYPE_PASSWORD = 2;
+  LOGIN_METHOD_TYPE_API_KEY = 3;
+  LOGIN_METHOD_TYPE_SOCIAL = 4;
+}
+
+enum SocialLoginProvider {
+  SOCIAL_LOGIN_PROVIDER_UNSPECIFIED = 0;
+  SOCIAL_LOGIN_PROVIDER_GOOGLE = 1;
+  SOCIAL_LOGIN_PROVIDER_GITHUB = 2;
+}
+
+message LoginMethod {
+  LoginMethodType type = 1;
+  // Only populated when type = LOGIN_METHOD_TYPE_SSO.
+  string sso_provider_id = 2;
+  string sso_provider_name = 3;
+  string sso_alias = 4;
+  // Only populated when type = LOGIN_METHOD_TYPE_SOCIAL.
+  SocialLoginProvider social_provider = 5;
 }
 
 message RouterToken {
@@ -1189,6 +1396,43 @@ message PublishedOperation {
 message PublishPersistedOperationsResponse {
   Response response = 1;
   repeated PublishedOperation operations = 2;
+}
+
+message DeletePersistedOperationRequest {
+  string fedGraphName = 1;
+  string namespace = 2;
+  string clientName = 3;
+  string operationId = 4;
+}
+
+message DeletePersistedOperationResponse {
+  message Operation {
+    string id = 1;
+    string operationId = 2;
+    string clientName = 3;
+    repeated string operationNames = 4;
+  }
+  Response response = 1;
+  Operation operation = 2;
+}
+
+message CheckPersistedOperationTrafficRequest {
+  string fedGraphName = 1;
+  string namespace = 2;
+  string operationId = 3;
+  string clientName = 4;
+}
+
+message CheckPersistedOperationTrafficResponse {
+  message Operation {
+    string id = 1;
+    string operationId = 2;
+    string clientName = 3;
+    repeated string operationNames = 4;
+    bool hasTraffic = 5;
+  }
+  Response response = 1;
+  Operation operation = 2;
 }
 
 message GetPersistedOperationsRequest {
@@ -1454,7 +1698,7 @@ message UpgradePlanResponse {
 /**
  * MetricsDashboard
  */
- message GetGraphMetricsRequest {
+message GetGraphMetricsRequest {
   string federatedGraphName = 1;
   int32 range = 2;
   DateRange dateRange = 3;
@@ -1523,7 +1767,7 @@ message MetricsErrorRateSeriesItem {
   float errorRate = 3;
 }
 
- message GetSubgraphMetricsRequest {
+message GetSubgraphMetricsRequest {
   string subgraphName = 1;
   string namespace = 2;
   int32 range = 4;
@@ -1651,6 +1895,8 @@ message GetOperationOverridesResponse {
 message GetAllOverridesRequest {
   string graph_name = 1;
   string namespace = 2;
+  int32 limit = 3;
+  int32 offset = 4;
 }
 
 message GetAllOverridesResponse {
@@ -1664,6 +1910,7 @@ message GetAllOverridesResponse {
 
   Response response = 1;
   repeated Override overrides = 2;
+  int32 total_count = 3;
 }
 
 message IsGitHubAppInstalledRequest {
@@ -1684,7 +1931,7 @@ message CreateOIDCProviderRequest {
   string name = 1;
   string discoveryEndpoint = 2;
   string clientID = 3;
-  string clientSecrect = 4;
+  string clientSecret = 4;
   repeated GroupMapper mappers = 5;
 }
 
@@ -1695,7 +1942,27 @@ message CreateOIDCProviderResponse {
   string loginURL = 4;
 }
 
-message GetOIDCProviderRequest {}
+message OIDCProvider {
+  string id = 1;
+  string name = 2;
+  string alias = 3;
+  string endpoint = 4;
+  string login_url = 5;
+  string sign_in_redirect_url = 6;
+  string sign_out_redirect_url = 7;
+  string createdAt = 8;
+}
+
+message ListOIDCProvidersRequest {}
+
+message ListOIDCProvidersResponse {
+  Response response = 1;
+  repeated OIDCProvider providers = 2;
+}
+
+message GetOIDCProviderRequest {
+  string id = 1;
+}
 
 message GetOIDCProviderResponse {
   Response response = 1;
@@ -1707,7 +1974,9 @@ message GetOIDCProviderResponse {
   repeated GroupMapper mappers = 7;
 }
 
-message DeleteOIDCProviderRequest {}
+message DeleteOIDCProviderRequest {
+  string id = 1;
+}
 
 message DeleteOIDCProviderResponse {
   Response response = 1;
@@ -1715,6 +1984,7 @@ message DeleteOIDCProviderResponse {
 
 message UpdateIDPMappersRequest {
   repeated GroupMapper mappers = 1;
+  string id = 2;
 }
 
 message UpdateIDPMappersResponse {
@@ -1745,18 +2015,18 @@ message GetAuditLogsRequest {
 }
 
 message AuditLog {
-   string id = 1;
-   string actorDisplayName = 2;
-   string action = 3;
-   string actorType = 4;
-   string auditAction = 5;
-   string auditableDisplayName = 6;
-   string targetDisplayName = 7;
-   string targetType = 8;
-   string createdAt = 9;
-   string targetNamespaceId = 10;
-   string targetNamespaceDisplayName = 11;
-   string apiKeyName = 12;
+  string id = 1;
+  string actorDisplayName = 2;
+  string action = 3;
+  string actorType = 4;
+  string auditAction = 5;
+  string auditableDisplayName = 6;
+  string targetDisplayName = 7;
+  string targetType = 8;
+  string createdAt = 9;
+  string targetNamespaceId = 10;
+  string targetNamespaceDisplayName = 11;
+  string apiKeyName = 12;
 }
 
 message GetAuditLogsResponse {
@@ -1805,6 +2075,7 @@ message GraphCompositionSubgraph {
   string target_id = 4;
   bool isFeatureSubgraph = 5;
   string changeType = 6;
+  SubgraphType subgraphType = 7;
 }
 
 message GetCompositionsRequest {
@@ -1973,16 +2244,51 @@ message ClientInfo{
   string lastUpdatedAt = 4;
   string createdBy = 5;
   string lastUpdatedBy = 6;
+  optional int32 persistedOperationsCount = 7;
+  optional bool hasTraffic = 8;
 }
 
 message GetClientsRequest {
   string fedGraphName = 1;
   string namespace = 2;
+  bool includeTraffic = 3;
 }
 
 message GetClientsResponse {
   Response response = 1;
   repeated ClientInfo clients = 2;
+}
+
+message PreviewDeleteClientRequest {
+  string fedGraphName = 1;
+  string namespace = 2;
+  string clientName = 3;
+}
+
+message PreviewDeleteClientResponse {
+  Response response = 1;
+  ClientInfo client = 2;
+  int32 persistedOperationsCount = 3;
+  bool hasTraffic = 4;
+  string organizationSlug = 5;
+}
+
+message DeleteClientRequest {
+  string fedGraphName = 1;
+  string namespace = 2;
+  string clientName = 3;
+}
+
+message DeleteClientResponse {
+  message Operation {
+    string id = 1;
+    string operationId = 2;
+    repeated string operationNames = 3;
+  }
+
+  Response response = 1;
+  ClientInfo client = 2;
+  int32 deletedOperationsCount = 3;
 }
 
 message GetFieldUsageRequest {
@@ -1994,6 +2300,8 @@ message GetFieldUsageRequest {
   DateRange dateRange = 6;
   string namespace = 7;
   optional string feature_flag_name = 8;
+  bool is_argument = 9;
+  bool is_input = 10;
 }
 
 message ClientWithOperations {
@@ -2062,6 +2370,7 @@ message MoveGraphRequest {
   string name = 1;
   string namespace = 2;
   string new_namespace = 3;
+  optional bool disable_resolvability_validation = 4;
 }
 
 message MoveGraphResponse {
@@ -2082,7 +2391,7 @@ message GetNamespaceLintConfigResponse {
 }
 
 message GetNamespaceChecksConfigurationRequest {
-   string namespace = 1;
+  string namespace = 1;
 }
 
 message GetNamespaceChecksConfigurationResponse {
@@ -2189,6 +2498,7 @@ message CreateContractRequest {
   optional string readme = 7;
   optional string admission_webhook_secret = 8;
   repeated string include_tags = 9;
+  optional bool disable_resolvability_validation = 10;
 }
 
 message CreateContractResponse {
@@ -2207,6 +2517,7 @@ message UpdateContractRequest {
   optional string admission_webhook_url = 6;
   optional string admission_webhook_secret = 7;
   optional string readme = 8;
+  optional bool disable_resolvability_validation = 9;
 }
 
 message UpdateContractResponse {
@@ -2236,6 +2547,7 @@ message CreateFeatureFlagRequest {
   repeated Label labels = 3;
   repeated string feature_subgraph_names = 4;
   bool is_enabled = 5;
+  optional bool disable_resolvability_validation = 6;
 }
 
 message CreateFeatureFlagResponse {
@@ -2251,6 +2563,7 @@ message UpdateFeatureFlagRequest {
   repeated Label labels = 3;
   repeated string feature_subgraph_names = 4;
   bool unset_labels = 5;
+  optional bool disable_resolvability_validation = 6;
 }
 
 message UpdateFeatureFlagResponse {
@@ -2258,12 +2571,14 @@ message UpdateFeatureFlagResponse {
   repeated CompositionError composition_errors = 2;
   repeated DeploymentError deployment_errors = 3;
   repeated CompositionWarning compositionWarnings = 4;
+  optional bool has_changed = 5;
 }
 
 message EnableFeatureFlagRequest {
   string name = 1;
   string namespace = 2;
   bool enabled = 3;
+  optional bool disable_resolvability_validation = 4;
 }
 
 message EnableFeatureFlagResponse {
@@ -2277,6 +2592,7 @@ message EnableFeatureFlagResponse {
 message DeleteFeatureFlagRequest {
   string name = 1;
   string namespace = 2;
+  optional bool disable_resolvability_validation = 3;
 }
 
 message DeleteFeatureFlagResponse {
@@ -2360,6 +2676,32 @@ message GetFeatureFlagsByFederatedGraphRequest {
 message GetFeatureFlagsByFederatedGraphResponse {
   Response response = 1;
   repeated FeatureFlag feature_flags = 2;
+  int32 total_count = 3;
+}
+
+message GetFeatureFlagsInLatestCompositionByFederatedGraphRequest {
+  string federated_graph_name = 1;
+  string namespace = 2;
+}
+
+message GetFeatureFlagsInLatestCompositionByFederatedGraphResponse {
+  Response response = 1;
+  // feature flags that are part of the latest valid composition of the federated graph
+  repeated FeatureFlag feature_flags = 2;
+}
+
+message GetFeatureSubgraphsByFederatedGraphRequest {
+  string federated_graph_name = 1;
+  string namespace = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+  optional string query = 5;
+}
+
+message GetFeatureSubgraphsByFederatedGraphResponse {
+  Response response = 1;
+  // all unique feature subgraphs across all feature flags of the federated graph
+  repeated Subgraph feature_subgraphs = 2;
   int32 total_count = 3;
 }
 
@@ -2491,6 +2833,33 @@ message GetNamespaceResponse {
   Namespace namespace = 2;
 }
 
+message WorkspaceNamespace {
+  string id = 1;
+  string name = 2;
+  repeated WorkspaceFederatedGraph graphs = 3;
+}
+
+message WorkspaceFederatedGraph {
+  string id = 1;
+  string targetId = 2;
+  string name = 3;
+  bool isContract = 4;
+  repeated WorkspaceSubgraph subgraphs = 5;
+}
+
+message WorkspaceSubgraph {
+  string id = 1;
+  string targetId = 2;
+  string name = 3;
+}
+
+message GetWorkspaceRequest {}
+
+message GetWorkspaceResponse {
+  Response response = 1;
+  repeated WorkspaceNamespace namespaces = 2;
+}
+
 message PushCacheWarmerOperationRequest {
   string federatedGraphName = 1;
   string operationContent = 2;
@@ -2560,6 +2929,40 @@ message GetCacheWarmerConfigResponse {
   int32 maxOperationsCount = 3;
 }
 
+message GetSubgraphCheckExtensionsConfigRequest {
+  string namespace = 1;
+}
+
+message GetSubgraphCheckExtensionsConfigResponse {
+  Response response = 1;
+  bool isEnabledForNamespace = 2;
+  bool isLintingEnabledForNamespace = 3;
+  bool isGraphPruningEnabledForNamespace = 4;
+  string endpoint = 5;
+  bool isSecretKeyAssigned = 6;
+  bool includeComposedSdl = 7;
+  bool includeLintingIssues = 8;
+  bool includePruningIssues = 9;
+  bool includeSchemaChanges = 10;
+  bool includeAffectedOperations = 11;
+}
+
+message ConfigureSubgraphCheckExtensionsRequest {
+  string namespace = 1;
+  bool enableSubgraphCheckExtensions = 2;
+  string endpoint = 3;
+  optional string secretKey = 4;
+  bool includeComposedSdl = 5;
+  bool includeLintingIssues = 6;
+  bool includePruningIssues = 7;
+  bool includeSchemaChanges = 8;
+  bool includeAffectedOperations = 9;
+}
+
+message ConfigureSubgraphCheckExtensionsResponse {
+  Response response = 1;
+}
+
 message DeleteCacheWarmerOperationRequest {
   string id = 1;
   string federatedGraphName = 2;
@@ -2582,6 +2985,7 @@ message SetGraphRouterCompatibilityVersionRequest {
   string name = 1;
   string namespace = 2;
   string version = 3;
+  optional bool disable_resolvability_validation = 4;
 }
 
 message SetGraphRouterCompatibilityVersionResponse {
@@ -2596,6 +3000,7 @@ message SetGraphRouterCompatibilityVersionResponse {
 message GetProposedSchemaOfCheckedSubgraphRequest {
   string checkId = 1;
   string checkedSubgraphId = 2;
+  string subgraphId = 3;
 }
 
 message GetProposedSchemaOfCheckedSubgraphResponse {
@@ -2614,6 +3019,7 @@ message Proposal {
   repeated ProposalSubgraph subgraphs = 8;
   bool latestCheckSuccess = 9;
   string latestCheckId = 10;
+  ProposalOrigin origin = 11;
 }
 
 message ProposalSubgraph {
@@ -2622,6 +3028,11 @@ message ProposalSubgraph {
   bool isDeleted = 3;
   bool isNew = 4;
   repeated Label labels = 5;
+}
+
+enum ProposalOrigin {
+  INTERNAL = 0;
+  EXTERNAL = 1;
 }
 
 enum ProposalNamingConvention {
@@ -2635,6 +3046,7 @@ message CreateProposalRequest {
   string name = 3;
   repeated ProposalSubgraph subgraphs = 4;
   ProposalNamingConvention namingConvention = 5;
+  ProposalOrigin origin = 6;
 }
 
 message CreateProposalResponse {
@@ -2655,6 +3067,12 @@ message CreateProposalResponse {
   string checkUrl = 15;
   string proposalUrl = 16;
   string proposalName = 17;
+  // If true, it means the traffic check failed for the linked check
+  optional bool isLinkedTrafficCheckFailed = 18;
+  // If true, it means the graph pruning check failed for the linked check
+  optional bool isLinkedPruningCheckFailed = 19;
+  optional bool hasLinkedSchemaChecks = 20;
+  repeated FederatedGraphSchemaChange composedSchemaBreakingChanges = 21;
 }
 
 message GetProposalRequest {
@@ -2679,12 +3097,13 @@ message GetProposalsByFederatedGraphRequest {
   string endDate = 4;
   int32 limit = 5;
   int32 offset = 6;
-}   
+}
 
 message GetProposalsByFederatedGraphResponse {
   Response response = 1;
   repeated Proposal proposals = 2;
   bool isProposalsEnabled = 3;
+  int32 totalCount = 4;
 }
 
 message GetProposalChecksRequest {
@@ -2729,6 +3148,12 @@ message UpdateProposalResponse {
   bool lintingSkipped = 12;
   bool graphPruningSkipped = 13;
   string checkUrl = 14;
+  // If true, it means the traffic check failed for the linked check
+  optional bool isLinkedTrafficCheckFailed = 15;
+  // If true, it means the graph pruning check failed for the linked check
+  optional bool isLinkedPruningCheckFailed = 16;
+  optional bool hasLinkedSchemaChecks = 17;
+  repeated FederatedGraphSchemaChange composedSchemaBreakingChanges = 18;
 }
 
 message EnableProposalsForNamespaceRequest {
@@ -2761,10 +3186,92 @@ message GetNamespaceProposalConfigResponse {
   LintSeverity publishSeverityLevel = 4;
 }
 
+message NamespaceLoginMethodMapping {
+  string namespace_id = 1;
+  repeated string allowed_sso_provider_ids = 2;
+  bool allow_password_login = 3;
+  bool allow_google_login = 4;
+  bool allow_github_login = 5;
+}
+
+message UpdateNamespaceLoginMethodsRequest {
+  repeated NamespaceLoginMethodMapping mappings = 1;
+}
+
+message UpdateNamespaceLoginMethodsResponse {
+  Response response = 1;
+}
+
+message ListNamespaceLoginMethodsRequest {}
+
+message ListNamespaceLoginMethodsResponse {
+  Response response = 1;
+  // One entry per namespace that is restricted to specific login methods.
+  // Namespaces with no mapping (default-open) are omitted.
+  repeated NamespaceLoginMethodMapping mappings = 2;
+}
+
+message OrganizationLoginMethods {
+  repeated string allowed_sso_provider_ids = 1;
+  bool allow_password_login = 2;
+  bool allow_google_login = 3;
+  bool allow_github_login = 4;
+  // Output only. False when the org has no restriction configured (all methods allowed).
+  bool is_restricted = 5;
+}
+
+message GetOrganizationLoginMethodsRequest {}
+
+message GetOrganizationLoginMethodsResponse {
+  Response response = 1;
+  OrganizationLoginMethods login_methods = 2;
+}
+
+message UpdateOrganizationLoginMethodsRequest {
+  repeated string allowed_sso_provider_ids = 1;
+  bool allow_password_login = 2;
+  bool allow_google_login = 3;
+  bool allow_github_login = 4;
+  // Set true to confirm that namespace mappings may be altered by this change.
+  // Left false (a preview), if the change would strip methods from existing
+  // namespace mappings the server returns requires_confirmation and makes no changes.
+  bool confirm_namespace_changes = 5;
+}
+
+message UpdateOrganizationLoginMethodsResponse {
+  Response response = 1;
+  // True when the change needs confirmation because it would alter namespace
+  // mappings listed in affected_namespaces. No changes were made in this case.
+  bool requires_confirmation = 2;
+  repeated Namespace affected_namespaces = 3;
+}
+
+enum OperationsFetchBasedOn {
+  REQUESTS = 0;
+  LATENCY = 1;
+  ERRORS = 2;
+}
+
+enum SortDirection {
+  ASC = 0;
+  DESC = 1;
+}
+
 message GetOperationsRequest {
   string federatedGraphName = 1;
   string namespace = 2;
-  optional string clientName = 3;
+  repeated string clientNames = 3; // filter by client names
+  optional int32 limit = 4;
+  optional int32 offset = 5; // pagination offset
+  optional bool includeHasDeprecatedFields = 6;
+  optional OperationsFetchBasedOn fetchBasedOn = 7; // determines which metric to fetch and sort by
+  optional bool includeContent = 8; // defaults to false
+  optional int32 range = 9; // range in hours
+  optional DateRange dateRange = 10;
+  optional string searchQuery = 11; // search by operation name or hash
+  optional bool includeOperationsWithDeprecatedFieldsOnly = 12; // defaults to false
+  optional SortDirection sortDirection = 13; // defaults to DESC
+  optional bool includeTotalCount = 14; // defaults to false
 }
 
 message GetOperationsResponse {
@@ -2777,13 +3284,18 @@ message GetOperationsResponse {
   message Operation {
     string hash = 1;
     string name = 2;
-    string content = 3;
-    float latency = 4;
-    OperationType type = 5;
+    optional string content = 3;
+    OperationType type = 4;
+    optional bool hasDeprecatedFields = 5;
+    oneof metric {
+      float latency = 6;
+      int64 requestCount = 7;
+      float errorPercentage = 8;
+    }
   }
-
   Response response = 1;
   repeated Operation operations = 2;
+  optional int32 totalCount = 3;
 }
 
 message GetClientsFromAnalyticsRequest {
@@ -2799,6 +3311,167 @@ message GetClientsFromAnalyticsResponse {
   repeated Client clients = 2;
 }
 
+message GetOperationClientsRequest {
+  string federatedGraphName = 1;
+  string namespace = 2;
+  string operationHash = 3;
+  string operationName = 4;
+  optional int32 range = 5; // range in hours
+  optional DateRange dateRange = 6;
+}
+
+message GetOperationClientsResponse {
+  message Client {
+    string name = 1;
+    string version = 2;
+    int64 requestCount = 3;
+    string lastUsed = 4; // ISO 8601 timestamp
+  }
+  Response response = 1;
+  repeated Client clients = 2;
+}
+
+message GetOperationDeprecatedFieldsRequest {
+  string federatedGraphName = 1;
+  string namespace = 2;
+  string operationHash = 3;
+  optional string operationName = 4;
+  optional int32 range = 5; // range in hours
+  optional DateRange dateRange = 6;
+}
+
+message GetOperationDeprecatedFieldsResponse {
+  message DeprecatedField {
+    string fieldName = 1;
+    string typeName = 2;
+    string path = 3;
+    string deprecationReason = 4;
+  }
+  Response response = 1;
+  repeated DeprecatedField deprecatedFields = 2;
+}
+
+message ValidateAndFetchPluginDataRequest {
+  string name = 1;
+  string namespace = 2;
+  repeated Label labels = 3;
+}
+
+message ValidateAndFetchPluginDataResponse {
+  Response response = 1;
+  string newVersion = 2;
+  string pushToken = 3;
+  string reference = 4;
+}
+
+message LinkSubgraphRequest {
+  string sourceSubgraphName = 1;
+  string sourceSubgraphNamespace = 2;
+  string targetSubgraphName = 3;
+  string targetSubgraphNamespace = 4;
+}
+
+message LinkSubgraphResponse {
+  Response response = 1;
+}
+
+message UnlinkSubgraphRequest {
+  string sourceSubgraphName = 1;
+  string sourceSubgraphNamespace = 2;
+}
+
+message UnlinkSubgraphResponse {
+  Response response = 1;
+}
+
+message VerifyAPIKeyGraphAccessRequest {
+  string federatedGraphId = 1;
+}
+
+message VerifyAPIKeyGraphAccessResponse {
+  Response response = 1;
+  bool hasOrganizationAdminOrDeveloperPermissions = 2;
+  bool hasWriteAccessToGraph = 3;
+}
+
+message InitializeCosmoUserRequest {
+  string token = 1;
+}
+
+message InitializeCosmoUserResponse {
+  Response response = 1;
+}
+
+message ListOrganizationsRequest {}
+
+message ListOrganizationsResponse {
+  message OrganizationMembership {
+    string id = 1;
+    string slug = 2;
+    string name = 3;
+    repeated string roles = 4;
+  }
+
+  Response response = 1;
+  repeated OrganizationMembership organizations = 2;
+}
+
+message RecomposeGraphRequest {
+  string name = 1;
+  string namespace = 2;
+  bool is_monograph = 3;
+  optional int32 limit = 4;
+  optional bool disable_resolvability_validation = 5;
+}
+
+message RecomposeGraphResponse {
+  Response response = 1;
+  repeated CompositionError compositionErrors = 2;
+  repeated DeploymentError deploymentErrors = 3;
+  repeated CompositionWarning compositionWarnings = 4;
+  optional SubgraphPublishStats errorCounts = 5;
+}
+
+message RecomposeFeatureFlagRequest {
+  string name = 1;
+  string namespace = 2;
+  optional int32 limit = 3;
+  optional bool disable_resolvability_validation = 5;
+}
+
+message RecomposeFeatureFlagResponse {
+  Response response = 1;
+  repeated CompositionError compositionErrors = 2;
+  repeated DeploymentError deploymentErrors = 3;
+  repeated CompositionWarning compositionWarnings = 4;
+  optional SubgraphPublishStats errorCounts = 5;
+}
+
+message GetOnboardingRequest {}
+
+message GetOnboardingResponse {
+  Response response = 1;
+  optional string finishedAt = 3;
+  int32 federatedGraphsCount = 4;
+  bool enabled = 5;
+}
+
+message CreateOnboardingRequest {}
+
+message CreateOnboardingResponse {
+  Response response = 1;
+  optional string finishedAt = 2;
+  int32 federatedGraphsCount = 3;
+}
+
+message FinishOnboardingRequest {}
+
+message FinishOnboardingResponse {
+  Response response = 1;
+  int32 federatedGraphsCount = 2;
+  string finishedAt = 3;
+}
+
 service PlatformService {
   // PlaygroundScripts
   rpc CreatePlaygroundScript(CreatePlaygroundScriptRequest) returns (CreatePlaygroundScriptResponse) {}
@@ -2812,6 +3485,9 @@ service PlatformService {
   rpc RenameNamespace(RenameNamespaceRequest) returns (RenameNamespaceResponse) {}
   rpc GetNamespaces(GetNamespacesRequest) returns (GetNamespacesResponse) {}
   rpc GetNamespace(GetNamespaceRequest) returns (GetNamespaceResponse) {}
+
+  // Workspace
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse) {}
 
   // Contracts
   rpc CreateContract(CreateContractRequest) returns (CreateContractResponse) {}
@@ -2836,6 +3512,11 @@ service PlatformService {
   rpc CreateFederatedSubgraph(CreateFederatedSubgraphRequest) returns (CreateFederatedSubgraphResponse) {}
   // PublishFederatedSubgraph pushes the schema of the subgraph to the control plane.
   rpc PublishFederatedSubgraph(PublishFederatedSubgraphRequest) returns (PublishFederatedSubgraphResponse) {}
+  // PublishFederatedSubgraphs pushes the schemas of multiple existing subgraphs to the control plane in a single
+  // request. Affected federated graphs (and their contracts / feature flags) are composed exactly once each.
+  rpc PublishFederatedSubgraphs(PublishFederatedSubgraphsRequest) returns (PublishFederatedSubgraphsResponse) {}
+  // Gets the status of a batch publish job by the provided job identifier.
+  rpc GetBatchPublishJobStatus(GetBatchPublishJobStatusRequest) returns (GetBatchPublishJobStatusResponse) {}
   // CreateFederatedGraph creates a federated graph on the control plane.
   rpc CreateFederatedGraph(CreateFederatedGraphRequest) returns (CreateFederatedGraphResponse) {}
   // DeleteFederatedGraph deletes a federated graph from the control plane.
@@ -2862,10 +3543,20 @@ service PlatformService {
   rpc DeleteRouterToken(DeleteRouterTokenRequest) returns (DeleteRouterTokenResponse) {}
   // Add persisted operations
   rpc PublishPersistedOperations(PublishPersistedOperationsRequest) returns (PublishPersistedOperationsResponse) {}
+  // Check if persisted operation has any traffic
+  rpc CheckPersistedOperationTraffic(CheckPersistedOperationTrafficRequest) returns (CheckPersistedOperationTrafficResponse) {}
+  // Delete/remove a persisted operation
+  rpc DeletePersistedOperation(DeletePersistedOperationRequest) returns (DeletePersistedOperationResponse) {}
   // GetPersistedOperations returns operations for the registered client id
   rpc GetPersistedOperations(GetPersistedOperationsRequest) returns (GetPersistedOperationsResponse) {}
   // GetAuditLogs returns the audit logs of the organization
   rpc GetAuditLogs(GetAuditLogsRequest) returns (GetAuditLogsResponse) {}
+
+  // InitializeCosmoUser takes a bearer token and ensures that the user associated with it (if valid) exists in Cosmo
+  rpc InitializeCosmoUser(InitializeCosmoUserRequest) returns (InitializeCosmoUserResponse) {}
+
+  // ListOrganizations returns all the organization the authenticated user is a member of
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse) {}
 
   // For Studio and CLI
 
@@ -2930,6 +3621,8 @@ service PlatformService {
   rpc IsMemberLimitReached(IsMemberLimitReachedRequest) returns (IsMemberLimitReachedResponse){}
   // InviteUser invites an user to join the organization
   rpc InviteUser(InviteUserRequest) returns (InviteUserResponse){}
+  // InviteUsers invites multiple users to join the organization
+  rpc InviteUsers(InviteUsersRequest) returns (InviteUsersResponse){}
   // GetAPIKeys returns a list of API keys of the organization
   rpc GetAPIKeys(GetAPIKeysRequest) returns (GetAPIKeysResponse){}
   // CreateAPIKey creates an API key for the organization
@@ -3004,12 +3697,18 @@ service PlatformService {
   rpc CreateOIDCProvider(CreateOIDCProviderRequest) returns (CreateOIDCProviderResponse) {}
   // GetOIDCProvider gets the oidc provider connected the organization
   rpc GetOIDCProvider(GetOIDCProviderRequest) returns (GetOIDCProviderResponse) {}
+  // ListOIDCProviders lists all OIDC providers configured for the organization
+  rpc ListOIDCProviders(ListOIDCProvidersRequest) returns (ListOIDCProvidersResponse) {}
   // DeleteOIDCProvider deletes the oidc provider connected the organization
   rpc DeleteOIDCProvider(DeleteOIDCProviderRequest) returns (DeleteOIDCProviderResponse) {}
   // UpdateIDPMappers updates the mappings of the oidc provider
   rpc UpdateIDPMappers(UpdateIDPMappersRequest) returns (UpdateIDPMappersResponse) {}
   // GetClients returns all the clients of the federated graph
   rpc GetClients(GetClientsRequest) returns (GetClientsResponse) {}
+  // PreviewDeleteClient returns the affected operation count for deleting a client
+  rpc PreviewDeleteClient(PreviewDeleteClientRequest) returns (PreviewDeleteClientResponse) {}
+  // DeleteClient deletes a registered client and its persisted operations
+  rpc DeleteClient(DeleteClientRequest) returns (DeleteClientResponse) {}
   // GetRouters returns all active routers of the federated graph
   rpc GetRouters(GetRoutersRequest) returns (GetRoutersResponse) {}
   // GetInvitations returns all the invitations a user has received
@@ -3018,7 +3717,7 @@ service PlatformService {
   rpc AcceptOrDeclineInvitation(AcceptOrDeclineInvitationRequest) returns (AcceptOrDeclineInvitationResponse) {}
   // GetCompositions returns all the compositions of the federated graph
   rpc GetCompositions(GetCompositionsRequest) returns (GetCompositionsResponse) {}
-   // GetCompositionDetails returns the details of that composition
+  // GetCompositionDetails returns the details of that composition
   rpc GetCompositionDetails(GetCompositionDetailsRequest) returns (GetCompositionDetailsResponse) {}
   // GetSdlBySchemaVersion returns the sdl based on the schema version
   rpc GetSdlBySchemaVersion(GetSdlBySchemaVersionRequest) returns (GetSdlBySchemaVersionResponse) {}
@@ -3105,6 +3804,10 @@ service PlatformService {
   rpc GetFeatureSubgraphs(GetFeatureSubgraphsRequest) returns (GetFeatureSubgraphsResponse) {}
   // GetFeatureFlagsByFederatedGraph returns the list of feature flags which match the label matchers of the federated graph.
   rpc GetFeatureFlagsByFederatedGraph(GetFeatureFlagsByFederatedGraphRequest) returns (GetFeatureFlagsByFederatedGraphResponse) {}
+  // GetFeatureFlagsInLatestCompositionByFederatedGraph returns only the feature flags that are part of the latest valid composition.
+  rpc GetFeatureFlagsInLatestCompositionByFederatedGraph(GetFeatureFlagsInLatestCompositionByFederatedGraphRequest) returns (GetFeatureFlagsInLatestCompositionByFederatedGraphResponse) {}
+  // GetFeatureSubgraphsByFederatedGraph returns the paginated list of unique feature subgraphs across all feature flags of the federated graph.
+  rpc GetFeatureSubgraphsByFederatedGraph(GetFeatureSubgraphsByFederatedGraphRequest) returns (GetFeatureSubgraphsByFederatedGraphResponse) {}
 
   // GetFederatedGraphById returns the federated graph by id.
   rpc GetFederatedGraphById(GetFederatedGraphByIdRequest) returns (GetFederatedGraphByIdResponse) {}
@@ -3122,6 +3825,9 @@ service PlatformService {
   rpc GetCacheWarmerConfig(GetCacheWarmerConfigRequest) returns (GetCacheWarmerConfigResponse) {}
   // DeleteCacheWarmerOperation deletes a cache warmer operation.
   rpc DeleteCacheWarmerOperation(DeleteCacheWarmerOperationRequest) returns (DeleteCacheWarmerOperationResponse) {}
+
+  rpc GetSubgraphCheckExtensionsConfig(GetSubgraphCheckExtensionsConfigRequest) returns (GetSubgraphCheckExtensionsConfigResponse) {}
+  rpc ConfigureSubgraphCheckExtensions(ConfigureSubgraphCheckExtensionsRequest) returns (ConfigureSubgraphCheckExtensionsResponse) {}
 
   //
   // Billing
@@ -3154,6 +3860,14 @@ service PlatformService {
   rpc ConfigureNamespaceProposalConfig(ConfigureNamespaceProposalConfigRequest) returns (ConfigureNamespaceProposalConfigResponse) {}
   // GetNamespaceProposalConfig returns the proposal config of the namespace passed.
   rpc GetNamespaceProposalConfig(GetNamespaceProposalConfigRequest) returns (GetNamespaceProposalConfigResponse) {}
+  // UpdateNamespaceLoginMethods replaces the org's per-namespace login-method configuration in one call.
+  rpc UpdateNamespaceLoginMethods(UpdateNamespaceLoginMethodsRequest) returns (UpdateNamespaceLoginMethodsResponse) {}
+  // ListNamespaceLoginMethods returns the login-method configuration for every restricted namespace in the org.
+  rpc ListNamespaceLoginMethods(ListNamespaceLoginMethodsRequest) returns (ListNamespaceLoginMethodsResponse) {}
+  // GetOrganizationLoginMethods returns the org's allowed login methods (empty restriction = all allowed).
+  rpc GetOrganizationLoginMethods(GetOrganizationLoginMethodsRequest) returns (GetOrganizationLoginMethodsResponse) {}
+  // UpdateOrganizationLoginMethods replaces the org's allowed login methods and reconciles namespace mappings.
+  rpc UpdateOrganizationLoginMethods(UpdateOrganizationLoginMethodsRequest) returns (UpdateOrganizationLoginMethodsResponse) {}
   // GetProposalsByFederatedGraph returns proposals for a federated graph.
   rpc GetProposalsByFederatedGraph(GetProposalsByFederatedGraphRequest) returns (GetProposalsByFederatedGraphResponse) {}
   // GetProposalChecks returns checks for a proposal.
@@ -3162,4 +3876,27 @@ service PlatformService {
   rpc GetOperations(GetOperationsRequest) returns (GetOperationsResponse) {}
   // GetClientsFromAnalytics returns all the clients of the federated graph from the analytics
   rpc GetClientsFromAnalytics(GetClientsFromAnalyticsRequest) returns (GetClientsFromAnalyticsResponse) {}
+  // GetOperationClients returns the clients that have used a specific operation
+  rpc GetOperationClients(GetOperationClientsRequest) returns (GetOperationClientsResponse) {}
+  // GetOperationDeprecatedFields returns the deprecated fields used in a specific operation
+  rpc GetOperationDeprecatedFields(GetOperationDeprecatedFieldsRequest) returns (GetOperationDeprecatedFieldsResponse) {}
+
+  // ValidateAndFetchPluginData validates the limit of plugins and returns the latest version and token
+  rpc ValidateAndFetchPluginData(ValidateAndFetchPluginDataRequest) returns (ValidateAndFetchPluginDataResponse) {}
+
+  // LinkSubgraph links one subgraph to another
+  rpc LinkSubgraph(LinkSubgraphRequest) returns (LinkSubgraphResponse) {}
+  // UnlinkSubgraph unlinks one subgraph from another
+  rpc UnlinkSubgraph(UnlinkSubgraphRequest) returns (UnlinkSubgraphResponse) {}
+  // VerifyAPIKeyGraphAccess checks if the token or the jwt has organization admin or developer  and checks if the token has permissions to write to the graph
+  rpc VerifyAPIKeyGraphAccess(VerifyAPIKeyGraphAccessRequest) returns (VerifyAPIKeyGraphAccessResponse) {}
+  // RecomposeGraph triggers a recomposition of the federated graph (or monograph) using its current subgraphs
+  rpc RecomposeGraph(RecomposeGraphRequest) returns (RecomposeGraphResponse) {}
+  // RecomposeFeatureFlag triggers a recomposition of the feature flag using its current subgraphs
+  rpc RecomposeFeatureFlag(RecomposeFeatureFlagRequest) returns (RecomposeFeatureFlagResponse) {}
+
+  // Onboarding
+  rpc GetOnboarding(GetOnboardingRequest) returns (GetOnboardingResponse) {}
+  rpc CreateOnboarding(CreateOnboardingRequest) returns (CreateOnboardingResponse) {}
+  rpc FinishOnboarding(FinishOnboardingRequest) returns (FinishOnboardingResponse) {}
 }

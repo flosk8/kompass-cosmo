@@ -1,9 +1,13 @@
 import {
   ArgumentNode,
+  ConstValueNode,
   DirectiveNode,
   getNamedType,
   GraphQLEnumType,
+  GraphQLEnumValue,
   GraphQLField,
+  GraphQLID,
+  GraphQLInputField,
   GraphQLInputObjectType,
   GraphQLInterfaceType,
   GraphQLNamedType,
@@ -14,54 +18,48 @@ import {
   isEnumType,
   isInputObjectType,
   isInterfaceType,
-  isListType,
-  isNonNullType,
+  isNamedType,
   isObjectType,
   isScalarType,
   isUnionType,
+  Kind,
   StringValueNode,
 } from 'graphql';
+import { camelCase } from 'lodash-es';
 import {
   createEntityLookupMethodName,
-  createEntityLookupRequestName,
-  createEntityLookupResponseName,
   createEnumUnspecifiedValue,
   createOperationMethodName,
   createRequestMessageName,
+  createResolverMethodName,
   createResponseMessageName,
   graphqlEnumValueToProtoEnumValue,
   graphqlFieldToProtoField,
+  resolverResponseResultName,
+  typeFieldArgsName,
+  typeFieldContextName,
 } from './naming-conventions.js';
-import { camelCase } from 'lodash-es';
 import { ProtoLock, ProtoLockManager } from './proto-lock.js';
-
-/**
- * Maps GraphQL scalar types to Protocol Buffer types
- *
- * GraphQL has a smaller set of primitive types compared to Protocol Buffers.
- * This mapping ensures consistent representation between the two type systems.
- */
-const SCALAR_TYPE_MAP: Record<string, string> = {
-  ID: 'string', // GraphQL IDs map to Proto strings
-  String: 'string', // Direct mapping
-  Int: 'int32', // GraphQL Int is 32-bit signed
-  Float: 'double', // Using double for GraphQL Float gives better precision
-  Boolean: 'bool', // Direct mapping
-};
-
-/**
- * Maps GraphQL scalar types to Protocol Buffer wrapper types for nullable fields
- *
- * These wrapper types allow distinguishing between unset fields and zero values
- * in Protocol Buffers, which is important for GraphQL nullable semantics.
- */
-const SCALAR_WRAPPER_TYPE_MAP: Record<string, string> = {
-  ID: 'google.protobuf.StringValue',
-  String: 'google.protobuf.StringValue',
-  Int: 'google.protobuf.Int32Value',
-  Float: 'google.protobuf.DoubleValue',
-  Boolean: 'google.protobuf.BoolValue',
-};
+import {
+  CONNECT_FIELD_RESOLVER,
+  CONTEXT,
+  EXTERNAL_DIRECTIVE_NAME,
+  FIELD_ARGS,
+  KEY_DIRECTIVE_NAME,
+  REQUIRES_DIRECTIVE_NAME,
+  RESULT,
+} from './string-constants.js';
+import { buildProtoOptions, type ProtoOptions } from './proto-options.js';
+import { ProtoFieldType, ProtoMessage, ProtoMessageField } from './types.js';
+import {
+  buildProtoMessage,
+  createNestedListWrapper,
+  formatComment,
+  getProtoTypeFromGraphQL,
+  listNameByNestingLevel,
+  renderRPCMethod,
+} from './proto-utils.js';
+import { RequiredFieldsVisitor } from './required-fields-visitor.js';
 
 /**
  * Generic structure for returning RPC and message definitions
@@ -75,13 +73,30 @@ interface CollectionResult {
 /**
  * Options for GraphQLToProtoTextVisitor
  */
-export interface GraphQLToProtoTextVisitorOptions {
+export interface GraphQLToProtoTextVisitorOptions extends ProtoOptions {
   serviceName?: string;
   packageName?: string;
-  goPackage?: string;
   lockData?: ProtoLock;
   /** Whether to include descriptions/comments from GraphQL schema */
   includeComments?: boolean;
+  /** Custom options printed as proto options */
+  protoOptions?: ProtoOption[];
+}
+
+/**
+ * Format based on https://protobuf.dev/reference/protobuf/proto3-spec/#option
+ */
+export interface ProtoOption {
+  name: string;
+  constant: string;
+}
+
+/**
+ * Data structure for key directive
+ */
+interface KeyDirective {
+  keyString: string;
+  resolvable: boolean;
 }
 
 /**
@@ -158,9 +173,10 @@ export class GraphQLToProtoTextVisitor {
     const {
       serviceName = 'DefaultService',
       packageName = 'service.v1',
-      goPackage,
       lockData,
       includeComments = true,
+      protoOptions,
+      ...languageOptions
     } = options;
 
     this.schema = schema;
@@ -174,13 +190,142 @@ export class GraphQLToProtoTextVisitor {
       this.initializeFieldNumbersMap(lockData);
     }
 
-    // Initialize options
-    if (goPackage && goPackage !== '') {
-      // Generate default go_package if not provided
-      const defaultGoPackage = `cosmo/pkg/proto/${packageName};${packageName.replace('.', '')}`;
-      const goPackageOption = goPackage || defaultGoPackage;
-      this.options.push(`option go_package = "${goPackageOption}";`);
+    // Process language-specific proto options using buildProtoOptions
+    const protoOptionsFromLanguageProps = buildProtoOptions(
+      {
+        ...languageOptions,
+      },
+      packageName,
+    );
+
+    // Add language-specific options
+    if (protoOptionsFromLanguageProps.length > 0) {
+      this.options.push(...protoOptionsFromLanguageProps);
     }
+
+    // Process custom protoOptions array (for backward compatibility)
+    if (protoOptions && protoOptions.length > 0) {
+      const processedOptions = protoOptions.map((opt) => `option ${opt.name} = ${opt.constant};`);
+      this.options.push(...processedOptions);
+    }
+  }
+
+  /**
+   * Visit the GraphQL schema to generate Proto buffer definition
+   *
+   * @returns The complete Protocol Buffer definition as a string
+   */
+  public visit(): string {
+    // Collect RPC methods and message definitions from all sources
+    const resolverResult = this.collectResolverRpcMethods();
+    const requiredFieldResult = this.collectRequiredFieldRpcMethods();
+    const entityResult = this.collectEntityRpcMethods();
+    const queryResult = this.collectQueryRpcMethods();
+    const mutationResult = this.collectMutationRpcMethods();
+
+    // Combine all RPC methods and message definitions
+    const allRpcMethods = [
+      ...entityResult.rpcMethods,
+      ...queryResult.rpcMethods,
+      ...mutationResult.rpcMethods,
+      ...resolverResult.rpcMethods,
+      ...requiredFieldResult.rpcMethods,
+    ];
+    const allMethodNames = [
+      ...entityResult.methodNames,
+      ...queryResult.methodNames,
+      ...mutationResult.methodNames,
+      ...resolverResult.methodNames,
+      ...requiredFieldResult.methodNames,
+    ];
+
+    const allMessageDefinitions = [
+      ...entityResult.messageDefinitions,
+      ...queryResult.messageDefinitions,
+      ...mutationResult.messageDefinitions,
+      ...resolverResult.messageDefinitions,
+      ...requiredFieldResult.messageDefinitions,
+    ];
+
+    // Add all types from the schema to the queue that weren't already queued
+    this.queueAllSchemaTypes();
+
+    // Process all complex types from the message queue to determine if wrapper types are needed
+    this.processMessageQueue();
+
+    // Add wrapper import if needed
+    if (this.usesWrapperTypes) {
+      this.addImport('google/protobuf/wrappers.proto');
+    }
+
+    // Build the complete proto file
+    let protoContent: string[] = [];
+
+    // Add the header (syntax, package, imports, options)
+    protoContent.push(...this.buildProtoHeader());
+
+    // Add a service description comment
+    if (this.includeComments) {
+      const serviceComment = `Service definition for ${this.serviceName}`;
+      protoContent.push(...this.formatComment(serviceComment, 0)); // Top-level comment, no indent
+    }
+
+    // Add service block containing RPC methods
+    protoContent.push(`service ${this.serviceName} {`);
+    this.indent++;
+
+    // Sort method names deterministically by alphabetical order
+    const orderedMethodNames = [...allMethodNames].sort();
+
+    // Add RPC methods in the ordered sequence
+    for (const methodName of orderedMethodNames) {
+      const methodIndex = allMethodNames.indexOf(methodName);
+      if (methodIndex !== -1) {
+        // Handle multi-line RPC definitions that include comments
+        const rpcMethodText = allRpcMethods[methodIndex];
+        if (rpcMethodText.includes('\n')) {
+          // For multi-line RPC method definitions (with comments), add each line separately
+          const lines = rpcMethodText.split('\n');
+          protoContent.push(...lines);
+        } else {
+          protoContent.push(`${rpcMethodText}`);
+        }
+      }
+    }
+
+    // Close service definition
+    this.indent--;
+    protoContent.push('}');
+    protoContent.push('');
+
+    // Add all wrapper messages first since they might be referenced by other messages
+    if (this.nestedListWrappers.size > 0) {
+      // Sort the wrappers by name for deterministic output
+      const sortedWrapperNames = [...this.nestedListWrappers.keys()].sort();
+      for (const wrapperName of sortedWrapperNames) {
+        protoContent.push(this.nestedListWrappers.get(wrapperName)!);
+      }
+    }
+
+    // Add all message definitions
+    for (const messageDef of allMessageDefinitions) {
+      protoContent.push(messageDef);
+    }
+
+    protoContent = this.trimEmptyLines(protoContent);
+    this.protoText = this.trimEmptyLines(this.protoText);
+
+    if (this.protoText.length > 0) {
+      protoContent.push('');
+    }
+
+    // Add all processed types from protoText (populated by processMessageQueue)
+    protoContent.push(...this.protoText);
+
+    // Store the generated lock data for retrieval
+    this.generatedLockData = this.lockManager.getLockData();
+
+    return protoContent.join('\n');
   }
 
   /**
@@ -374,15 +519,6 @@ export class GraphQLToProtoTextVisitor {
   }
 
   /**
-   * Add an option statement to the proto file
-   */
-  private addOption(optionStatement: string): void {
-    if (!this.options.includes(optionStatement)) {
-      this.options.push(optionStatement);
-    }
-  }
-
-  /**
    * Build the proto file header with syntax, package, imports, and options
    */
   private buildProtoHeader(): string[] {
@@ -419,99 +555,25 @@ export class GraphQLToProtoTextVisitor {
   }
 
   /**
-   * Visit the GraphQL schema to generate Proto buffer definition
-   *
-   * @returns The complete Protocol Buffer definition as a string
+   * Trim empty lines from the beginning and end of the array
    */
-  public visit(): string {
-    // Collect RPC methods and message definitions from all sources
-    const entityResult = this.collectEntityRpcMethods();
-    const queryResult = this.collectQueryRpcMethods();
-    const mutationResult = this.collectMutationRpcMethods();
+  private trimEmptyLines(data: string[]): string[] {
+    // Find the first non-empty line index
+    const firstNonEmpty = data.findIndex((line) => line.trim() !== '');
 
-    // Combine all RPC methods and message definitions
-    const allRpcMethods = [...entityResult.rpcMethods, ...queryResult.rpcMethods, ...mutationResult.rpcMethods];
-    const allMethodNames = [...entityResult.methodNames, ...queryResult.methodNames, ...mutationResult.methodNames];
-
-    const allMessageDefinitions = [
-      ...entityResult.messageDefinitions,
-      ...queryResult.messageDefinitions,
-      ...mutationResult.messageDefinitions,
-    ];
-
-    // Add all types from the schema to the queue that weren't already queued
-    this.queueAllSchemaTypes();
-
-    // Process all complex types from the message queue to determine if wrapper types are needed
-    this.processMessageQueue();
-
-    // Add wrapper import if needed
-    if (this.usesWrapperTypes) {
-      this.addImport('google/protobuf/wrappers.proto');
+    // If no non-empty lines found, return empty array
+    if (firstNonEmpty === -1) {
+      return [];
     }
 
-    // Build the complete proto file
-    const protoContent: string[] = [];
-
-    // Add the header (syntax, package, imports, options)
-    protoContent.push(...this.buildProtoHeader());
-
-    // Add a service description comment
-    if (this.includeComments) {
-      const serviceComment = `Service definition for ${this.serviceName}`;
-      protoContent.push(...this.formatComment(serviceComment, 0)); // Top-level comment, no indent
+    // Find the last non-empty line index by searching backwards
+    let lastNonEmpty = data.length - 1;
+    while (lastNonEmpty >= 0 && data[lastNonEmpty].trim() === '') {
+      lastNonEmpty--;
     }
 
-    // Add service block containing RPC methods
-    protoContent.push(`service ${this.serviceName} {`);
-    this.indent++;
-
-    // Sort method names deterministically by alphabetical order
-    const orderedMethodNames = [...allMethodNames].sort();
-
-    // Add RPC methods in the ordered sequence
-    for (const methodName of orderedMethodNames) {
-      const methodIndex = allMethodNames.indexOf(methodName);
-      if (methodIndex !== -1) {
-        // Handle multi-line RPC definitions that include comments
-        const rpcMethodText = allRpcMethods[methodIndex];
-        if (rpcMethodText.includes('\n')) {
-          // For multi-line RPC method definitions (with comments), add each line separately
-          const lines = rpcMethodText.split('\n');
-          protoContent.push(...lines);
-        } else {
-          // For simple one-line RPC method definitions (ensure 2-space indentation)
-          protoContent.push(`  ${rpcMethodText}`);
-        }
-      }
-    }
-
-    // Close service definition
-    this.indent--;
-    protoContent.push('}');
-    protoContent.push('');
-
-    // Add all wrapper messages first since they might be referenced by other messages
-    if (this.nestedListWrappers.size > 0) {
-      // Sort the wrappers by name for deterministic output
-      const sortedWrapperNames = Array.from(this.nestedListWrappers.keys()).sort();
-      for (const wrapperName of sortedWrapperNames) {
-        protoContent.push(this.nestedListWrappers.get(wrapperName)!);
-      }
-    }
-
-    // Add all message definitions
-    for (const messageDef of allMessageDefinitions) {
-      protoContent.push(messageDef);
-    }
-
-    // Add all processed types from protoText (populated by processMessageQueue)
-    protoContent.push(...this.protoText);
-
-    // Store the generated lock data for retrieval
-    this.generatedLockData = this.lockManager.getLockData();
-
-    return protoContent.join('\n');
+    // Return slice from first to last non-empty line (inclusive)
+    return data.slice(firstNonEmpty, lastNonEmpty + 1);
   }
 
   /**
@@ -539,36 +601,63 @@ export class GraphQLToProtoTextVisitor {
         continue;
       }
 
-      // Check if this is an entity type (has @key directive)
-      if (isObjectType(type)) {
-        const astNode = type.astNode;
-        const keyDirective = astNode?.directives?.find((d) => d.name.value === 'key');
+      // Skip non-entity types
+      if (!isObjectType(type) && !isInterfaceType(type)) {
+        continue;
+      }
+      const keyDirectives = this.getKeyDirectives(type);
+      // Skip types that don't have @key directives
+      if (keyDirectives.length === 0) {
+        continue;
+      }
 
-        if (keyDirective) {
-          // Queue this type for message generation
-          this.queueTypeForProcessing(type);
+      // Queue this type for message generation (only once)
+      this.queueTypeForProcessing(type);
 
-          const keyFields = this.getKeyFieldsFromDirective(keyDirective);
-          if (keyFields.length > 0) {
-            const keyField = keyFields[0];
-            const methodName = createEntityLookupMethodName(typeName, keyField);
-            const requestName = createEntityLookupRequestName(typeName, keyField);
-            const responseName = createEntityLookupResponseName(typeName, keyField);
+      // Normalize keys by sorting fields alphabetically and deduplicating
 
-            // Add method name and RPC method with description from the entity type
-            result.methodNames.push(methodName);
-            const description = `Lookup ${typeName} entity by ${keyField}${
-              type.description ? ': ' + type.description : ''
-            }`;
-            result.rpcMethods.push(this.createRpcMethod(methodName, requestName, responseName, description));
-
-            // Create request and response messages
-            result.messageDefinitions.push(
-              ...this.createKeyRequestMessage(typeName, requestName, keyFields[0], responseName),
-            );
-            result.messageDefinitions.push(...this.createKeyResponseMessage(typeName, responseName, requestName));
-          }
+      const normalizedKeysSet = new Set<string>();
+      for (const keyDirective of keyDirectives) {
+        const keyInfo = this.getKeyInfoFromDirective(keyDirective);
+        if (!keyInfo) {
+          continue;
         }
+
+        const { keyString, resolvable } = keyInfo;
+        if (!resolvable) {
+          continue;
+        }
+
+        const normalizedKey = keyString
+          .split(/[\s,]+/)
+          .filter((field) => field.length > 0)
+          .sort()
+          .join(' ');
+
+        normalizedKeysSet.add(normalizedKey);
+      }
+
+      // Process each normalized key
+      for (const normalizedKeyString of normalizedKeysSet) {
+        const methodName = createEntityLookupMethodName(typeName, normalizedKeyString);
+
+        const requestName = createRequestMessageName(methodName);
+        const responseName = createResponseMessageName(methodName);
+
+        // Add method name and RPC method with description from the entity type
+        result.methodNames.push(methodName);
+        const keyFields = normalizedKeyString.split(' ');
+        const keyDescription = keyFields.length === 1 ? keyFields[0] : keyFields.join(' and ');
+        const description = `Lookup ${typeName} entity by ${keyDescription}${
+          type.description ? ': ' + type.description : ''
+        }`;
+        result.rpcMethods.push(this.createRpcMethod(methodName, requestName, responseName, description));
+
+        // Create request and response messages for this key combination
+        result.messageDefinitions.push(
+          ...this.createKeyRequestMessage(typeName, requestName, normalizedKeyString, responseName),
+        );
+        result.messageDefinitions.push(...this.createKeyResponseMessage(typeName, responseName, requestName));
       }
     }
 
@@ -602,7 +691,9 @@ export class GraphQLToProtoTextVisitor {
     // Get the root operation type (Query or Mutation)
     const rootType = operationType === 'Query' ? this.schema.getQueryType() : this.schema.getMutationType();
 
-    if (!rootType) return result;
+    if (!rootType) {
+      return result;
+    }
 
     const fields = rootType.getFields();
 
@@ -612,9 +703,13 @@ export class GraphQLToProtoTextVisitor {
 
     for (const fieldName of orderedFieldNames) {
       // Skip special fields like _entities
-      if (fieldName === '_entities') continue;
+      if (fieldName === '_entities' || fieldName === '_service') {
+        continue;
+      }
 
-      if (!fields[fieldName]) continue;
+      if (!fields[fieldName]) {
+        continue;
+      }
 
       const field = fields[fieldName];
       const mappedName = createOperationMethodName(operationType, fieldName);
@@ -670,15 +765,14 @@ export class GraphQLToProtoTextVisitor {
     responseName: string,
     description?: string | null,
   ): string {
-    if (!this.includeComments || !description) {
-      return `rpc ${methodName}(${requestName}) returns (${responseName}) {}`;
-    }
+    const rpcLines = renderRPCMethod(this.includeComments, {
+      name: methodName,
+      request: requestName,
+      response: responseName,
+      description,
+    });
 
-    // RPC method comments should be indented 1 level (2 spaces)
-    const commentLines = this.formatComment(description, 1);
-    const methodLine = `  rpc ${methodName}(${requestName}) returns (${responseName}) {}`;
-
-    return [...commentLines, methodLine].join('\n');
+    return rpcLines.join('\n');
   }
 
   /**
@@ -687,7 +781,7 @@ export class GraphQLToProtoTextVisitor {
   private createKeyRequestMessage(
     typeName: string,
     requestName: string,
-    keyField: string,
+    keyString: string,
     responseName: string,
   ): string[] {
     const messageLines: string[] = [];
@@ -707,28 +801,36 @@ export class GraphQLToProtoTextVisitor {
       messageLines.push(`  reserved ${this.formatReservedNumbers(keyMessageLock.reservedNumbers)};`);
     }
 
+    const keyFields = keyString.split(' ');
+
     // Check for field removals in the key message
     if (lockData.messages[keyMessageName]) {
       const originalKeyFieldNames = Object.keys(lockData.messages[keyMessageName].fields);
-      const currentKeyFieldNames = [graphqlFieldToProtoField(keyField)];
+      const currentKeyFieldNames = keyFields.map((field) => graphqlFieldToProtoField(field));
       this.trackRemovedFields(keyMessageName, originalKeyFieldNames, currentKeyFieldNames);
     }
 
-    const protoKeyField = graphqlFieldToProtoField(keyField);
+    // Add all key fields to the key message
+    const protoKeyFields: string[] = [];
+    for (const [index, keyField] of keyFields.entries()) {
+      const protoKeyField = graphqlFieldToProtoField(keyField);
+      protoKeyFields.push(protoKeyField);
 
-    // Get the appropriate field number for the key field
-    const keyFieldNumber = this.getFieldNumber(keyMessageName, protoKeyField, 1);
+      // Get the appropriate field number for this key field
+      const keyFieldNumber = this.getFieldNumber(keyMessageName, protoKeyField, index + 1);
 
-    if (this.includeComments) {
-      const keyFieldComment = `Key field for ${typeName} entity lookup.`;
-      messageLines.push(...this.formatComment(keyFieldComment, 1)); // Field comment, indent 1 level
+      if (this.includeComments) {
+        const keyFieldComment = `Key field for ${typeName} entity lookup.`;
+        messageLines.push(...this.formatComment(keyFieldComment, 1)); // Field comment, indent 1 level
+      }
+      messageLines.push(`  string ${protoKeyField} = ${keyFieldNumber};`);
     }
-    messageLines.push(`  string ${protoKeyField} = ${keyFieldNumber};`);
+
     messageLines.push('}');
     messageLines.push('');
 
     // Ensure the key message is registered in the lock manager data
-    this.lockManager.reconcileMessageFieldOrder(keyMessageName, [protoKeyField]);
+    this.lockManager.reconcileMessageFieldOrder(keyMessageName, protoKeyFields);
 
     // Now create the main request message with a repeated key field
     // Check for field removals in the request message
@@ -834,10 +936,7 @@ Example:
     const lockData = this.lockManager.getLockData();
     const argNames = field.args.map((arg) => graphqlFieldToProtoField(arg.name));
 
-    if (lockData.messages[requestName]) {
-      const originalFieldNames = Object.keys(lockData.messages[requestName].fields);
-      this.trackRemovedFields(requestName, originalFieldNames, argNames);
-    }
+    this.lockManager.reconcileMessageFieldOrder(requestName, argNames);
 
     // Add a description comment for the request message
     if (this.includeComments) {
@@ -867,13 +966,18 @@ Example:
       // Process arguments in the order specified by the lock manager
       for (const argName of orderedArgNames) {
         const arg = field.args.find((a) => a.name === argName);
-        if (!arg) continue;
+        if (!arg) {
+          continue;
+        }
 
         const argType = this.getProtoTypeFromGraphQL(arg.type);
         const argProtoName = graphqlFieldToProtoField(arg.name);
 
-        // Get the field number from the messages structure using the original field name
-        const fieldNumber = lockData.messages[operationName]?.fields[argName];
+        const fieldNumber = this.getFieldNumber(
+          requestName,
+          argProtoName,
+          this.getNextAvailableFieldNumber(requestName),
+        );
 
         // Add argument description as comment
         if (arg.description) {
@@ -882,11 +986,10 @@ Example:
         }
 
         // Check if the argument is a list type and add the repeated keyword if needed
-        const isRepeated = isListType(arg.type) || (isNonNullType(arg.type) && isListType(arg.type.ofType));
-        if (isRepeated) {
-          messageLines.push(`  repeated ${argType} ${argProtoName} = ${fieldNumber};`);
+        if (argType.isRepeated) {
+          messageLines.push(`  repeated ${argType.typeName} ${argProtoName} = ${fieldNumber};`);
         } else {
-          messageLines.push(`  ${argType} ${argProtoName} = ${fieldNumber};`);
+          messageLines.push(`  ${argType.typeName} ${argProtoName} = ${fieldNumber};`);
         }
 
         // Add complex input types to the queue for processing
@@ -940,8 +1043,6 @@ Example:
     }
 
     const returnType = this.getProtoTypeFromGraphQL(field.type);
-    const isRepeated = isListType(field.type) || (isNonNullType(field.type) && isListType(field.type.ofType));
-
     // Get the appropriate field number, respecting the lock
     const fieldNumber = this.getFieldNumber(responseName, protoFieldName, 1);
 
@@ -951,10 +1052,10 @@ Example:
       messageLines.push(...this.formatComment(field.description, 1));
     }
 
-    if (isRepeated) {
-      messageLines.push(`  repeated ${returnType} ${protoFieldName} = ${fieldNumber};`);
+    if (returnType.isRepeated) {
+      messageLines.push(`  repeated ${returnType.typeName} ${protoFieldName} = ${fieldNumber};`);
     } else {
-      messageLines.push(`  ${returnType} ${protoFieldName} = ${fieldNumber};`);
+      messageLines.push(`  ${returnType.typeName} ${protoFieldName} = ${fieldNumber};`);
     }
 
     messageLines.push('}');
@@ -966,21 +1067,392 @@ Example:
   }
 
   /**
-   * Extract key fields from a directive
+   * Extract all key directives from a GraphQL object type
+   *
+   * @param type - The GraphQL object type to check for key directives
+   * @returns Array of all key directives found
+   */
+  private getKeyDirectives(type: GraphQLObjectType | GraphQLInterfaceType): DirectiveNode[] {
+    return type.astNode?.directives?.filter((d) => d.name.value === KEY_DIRECTIVE_NAME) || [];
+  }
+
+  /**
+   * Checks if a type has a @key directive
+   * @param type - The type to check
+   * @returns True if the type has a @key directive, false otherwise
+   */
+  private hasKeyDirective(type: GraphQLObjectType): boolean {
+    return type.astNode?.directives?.some((d) => d.name.value === KEY_DIRECTIVE_NAME) ?? false;
+  }
+
+  /**
+   * Extract key info from a directive
    *
    * The @key directive specifies which fields form the entity's primary key.
    * We extract these for creating appropriate lookup methods.
    *
    * @param directive - The @key directive from the GraphQL AST
-   * @returns Array of field names that form the key
+   * @returns An object with the key fields and whether it is resolvable
    */
-  private getKeyFieldsFromDirective(directive: DirectiveNode): string[] {
-    const fieldsArg = directive.arguments?.find((arg: ArgumentNode) => arg.name.value === 'fields');
-    if (fieldsArg && fieldsArg.value.kind === 'StringValue') {
-      const stringValue = fieldsArg.value as StringValueNode;
-      return stringValue.value.split(' ');
+  private getKeyInfoFromDirective(directive: DirectiveNode): KeyDirective | null {
+    const fieldsArgs = directive.arguments?.find((arg: ArgumentNode) => arg.name.value === 'fields');
+    const resolvableArg = directive.arguments?.find((arg: ArgumentNode) => arg.name.value === 'resolvable');
+
+    if (!fieldsArgs && !resolvableArg) {
+      return null;
     }
-    return [];
+
+    const result: KeyDirective = {
+      keyString: '',
+      resolvable: true,
+    };
+
+    if (fieldsArgs && fieldsArgs.value.kind === 'StringValue') {
+      const stringValue = fieldsArgs.value as StringValueNode;
+      result.keyString = stringValue.value;
+    }
+
+    if (resolvableArg && resolvableArg.value.kind === 'BooleanValue') {
+      result.resolvable = resolvableArg.value.value;
+    }
+
+    return result;
+  }
+
+  private collectResolverRpcMethods(): CollectionResult {
+    const typeMap = this.schema.getTypeMap();
+    const result: CollectionResult = { rpcMethods: [], methodNames: [], messageDefinitions: [] };
+
+    for (const type of Object.values(typeMap)) {
+      if (!isObjectType(type) || this.isOperationType(type)) {
+        continue;
+      }
+
+      const fields = type.getFields();
+
+      for (const field of Object.values(fields)) {
+        if (field.args.length === 0 && !this.findDirective(field, CONNECT_FIELD_RESOLVER)) {
+          continue;
+        }
+
+        // Skip fields with @requires directive, they are managed by the required fields visitor
+        if (field.args.length > 0 && this.findDirective(field, REQUIRES_DIRECTIVE_NAME)) {
+          continue;
+        }
+
+        const methodName = createResolverMethodName(type.name, field.name);
+        const requestName = createRequestMessageName(methodName);
+        const responseName = createResponseMessageName(methodName);
+
+        // Add method name and RPC method with the field description
+        result.methodNames.push(methodName);
+        result.rpcMethods.push(this.createRpcMethod(methodName, requestName, responseName, field.description));
+
+        result.messageDefinitions.push(...this.createResolverRequestMessage(methodName, requestName, type, field));
+        result.messageDefinitions.push(...this.createResolverResponseMessage(methodName, responseName, field));
+      }
+    }
+
+    return result;
+  }
+
+  private collectRequiredFieldRpcMethods(): CollectionResult {
+    const typeMap = this.schema.getTypeMap();
+    const result: CollectionResult = { rpcMethods: [], methodNames: [], messageDefinitions: [] };
+
+    const entityTypes = Object.values(typeMap).filter((type) => this.isEntityType(type));
+
+    for (const entity of entityTypes) {
+      const requiredFields = Object.values(entity.getFields()).filter((field) =>
+        field.astNode?.directives?.some((d) => d.name.value === REQUIRES_DIRECTIVE_NAME),
+      );
+
+      for (const requiredField of requiredFields) {
+        const fieldSet = this.getRequiredFieldSet(requiredField);
+        const visitor = new RequiredFieldsVisitor(this.schema, entity, requiredField, fieldSet);
+        visitor.visit();
+
+        const rpcMethods = visitor.getRPCMethods();
+        const messageDefinitions = visitor.getMessageDefinitions();
+        this.usesWrapperTypes = this.usesWrapperTypes || visitor.usesWrapperTypes;
+
+        result.rpcMethods.push(...rpcMethods.map((m) => renderRPCMethod(this.includeComments, m).join('\n')));
+        result.methodNames.push(...rpcMethods.map((m) => m.name));
+        const messageLines = messageDefinitions.flatMap((m) => buildProtoMessage(this.includeComments, m));
+        result.messageDefinitions.push(...messageLines);
+      }
+    }
+
+    return result;
+  }
+
+  private getRequiredFieldSet(field: GraphQLField<any, any>): string {
+    const node = field.astNode?.directives
+      ?.find((d) => d.name.value === REQUIRES_DIRECTIVE_NAME)
+      ?.arguments?.find((arg: ArgumentNode) => arg.name.value === 'fields')?.value as StringValueNode;
+    if (!node) {
+      throw new Error(`Required field set not found for field ${field.name}`);
+    }
+
+    return node.value;
+  }
+
+  private getFieldContext(
+    parent: GraphQLObjectType,
+    field: GraphQLField<any, any>,
+  ): { context: string; error: string | undefined } {
+    const resolvedDirective = this.findDirective(field, CONNECT_FIELD_RESOLVER);
+    if (resolvedDirective) {
+      const valueNode = resolvedDirective.arguments?.find((arg) => arg.name.value === CONTEXT)?.value;
+      const context = !valueNode || valueNode.kind !== Kind.STRING ? '' : valueNode.value.trim();
+
+      if (context.length > 0) {
+        return { context, error: undefined };
+      }
+    }
+
+    const idFields = this.getIDFields(parent, field.name);
+    switch (idFields.length) {
+      case 0: {
+        return { context: '', error: 'No fields with type ID found' };
+      }
+      case 1: {
+        return { context: idFields[0].name, error: undefined };
+      }
+      default: {
+        return {
+          context: '',
+          error: `Multiple fields with type ID found - provide a context with the fields you want to use in the @${CONNECT_FIELD_RESOLVER} directive`,
+        };
+      }
+    }
+  }
+
+  private getIDFields(type: GraphQLObjectType, currentFieldName: string): GraphQLField<any, any>[] {
+    const fields = type.getFields();
+    const result = Object.entries(fields)
+      .map(([_, field]) => {
+        const underlyingType = this.getUnderlyingType(field.type);
+        if (underlyingType.name === GraphQLID.name && field.name !== currentFieldName) {
+          return field;
+        }
+
+        return undefined;
+      })
+      .filter((f) => f !== undefined);
+
+    return result;
+  }
+
+  private getUnderlyingType(type: GraphQLType): GraphQLNamedType {
+    while (!isNamedType(type)) {
+      type = type.ofType;
+    }
+
+    return type;
+  }
+
+  private findDirective(field: GraphQLField<any, any>, directive: string): DirectiveNode | undefined {
+    return field.astNode?.directives?.find((d) => d.name.value === directive);
+  }
+
+  /**
+   * Creates a request message for a resolver field. This message is used to
+   * pass the arguments to the resolver method.
+   * 
+   * @example
+   * ```protobuf
+      message ResolveUserPostArgs {
+        bool upper = 1;
+      }
+
+      message ResolveUserPostContext {
+        string id = 1;
+      }
+
+      message ResolveUserPostRequest {
+        repeated ResolveUserPostContext context = 1;
+        ResolveUserPostArgs field_args = 2;
+      }
+
+   * 
+   * ```
+   * @param requestName - The name of the request message
+   * @param field 
+   * @returns 
+   */
+  private createResolverRequestMessage(
+    methodName: string,
+    requestName: string,
+    parent: GraphQLObjectType,
+    field: GraphQLField<any, any>,
+  ): string[] {
+    const messageLines: string[] = [];
+    const { context, error } = this.getFieldContext(parent, field);
+
+    if (error) {
+      throw new Error(`Invalid field context for resolver. ${error}`);
+    }
+
+    const hasArgs = field.args.length > 0;
+    const argsMessageName = typeFieldArgsName(methodName);
+    const contextMessageName = typeFieldContextName(methodName);
+
+    // Build the arguments message (only when field has arguments)
+    let fieldNumber = 0;
+    if (hasArgs) {
+      messageLines.push(
+        ...this.buildMessage({
+          messageName: argsMessageName,
+          fields: field.args.map((arg) => {
+            const protoType = this.getProtoTypeFromGraphQL(arg.type);
+            return {
+              fieldName: graphqlFieldToProtoField(arg.name),
+              typeName: protoType.typeName,
+              isRepeated: protoType.isRepeated,
+              fieldNumber: ++fieldNumber,
+            };
+          }),
+        }),
+      );
+    }
+
+    // filter the fields in the parent type that are in the context
+    const searchFields = context.split(/[\s,]+/).filter((field) => field.length > 0);
+    const fieldFilter = Object.values(parent.getFields()).filter((field) => searchFields.includes(field.name));
+    if (searchFields.length !== fieldFilter.length) {
+      throw new Error(`Invalid field context for resolver. Could not find all fields in the parent type: ${context}`);
+    }
+
+    // build the context message
+    fieldNumber = 0;
+    messageLines.push(
+      ...this.buildMessage({
+        messageName: contextMessageName,
+        fields: fieldFilter.map((field) => ({
+          fieldName: graphqlFieldToProtoField(field.name),
+          fieldNumber: ++fieldNumber,
+          ...this.getProtoTypeFromGraphQL(field.type),
+        })),
+      }),
+    );
+
+    fieldNumber = 0;
+    const keyMessageFields: ProtoMessageField[] = [];
+
+    // add the context message to the key message
+    keyMessageFields.push({
+      fieldName: CONTEXT,
+      typeName: contextMessageName,
+      fieldNumber: ++fieldNumber,
+      isRepeated: true,
+      description: `${CONTEXT} provides the resolver context for the field ${field.name} of type ${parent.name}.`,
+    });
+
+    // add the args message to the key message (only when field has arguments)
+    if (hasArgs) {
+      keyMessageFields.push({
+        fieldName: FIELD_ARGS,
+        typeName: argsMessageName,
+        fieldNumber: ++fieldNumber,
+        description: `${FIELD_ARGS} provides the arguments for the resolver field ${field.name} of type ${parent.name}.`,
+      });
+    }
+
+    // build the actual request message
+    messageLines.push(
+      ...this.buildMessage({
+        messageName: requestName,
+        fields: keyMessageFields,
+      }),
+    );
+
+    if (hasArgs) {
+      this.processedTypes.add(argsMessageName);
+    }
+    this.processedTypes.add(requestName);
+
+    return messageLines;
+  }
+
+  /**
+   * Creates a response message for a resolver field. This message is used to
+   * pass the response from the resolver method.
+   * 
+   * @example
+   * ```protobuf
+      message ResolveUserPostsResult {
+        string user_id = 1;
+        ListOfPost posts = 2;
+      }
+
+      message ResolveUserPostsResponse {
+        repeated ResolveUserPostsResult result = 1;
+      }      
+
+   * ```
+   * @param responseName
+   * @param fieldName
+   * @param field
+   * @returns string[] - The protobuf text generated for the response message
+   */
+  private createResolverResponseMessage(
+    methodName: string,
+    responseName: string,
+    field: GraphQLField<any, any>,
+  ): string[] {
+    const messageLines: string[] = [];
+
+    // CreateResultMessage
+    const resultMessageName = resolverResponseResultName(methodName);
+    const protoType = this.getProtoTypeFromGraphQL(field.type);
+
+    messageLines.push(
+      ...this.buildMessage({
+        messageName: resultMessageName,
+        fields: [
+          {
+            fieldName: graphqlFieldToProtoField(field.name),
+            typeName: protoType.typeName,
+            isRepeated: protoType.isRepeated,
+            fieldNumber: 1,
+          },
+        ],
+      }),
+    );
+
+    messageLines.push(
+      ...this.buildMessage({
+        messageName: responseName,
+        fields: [
+          {
+            fieldName: RESULT,
+            typeName: resultMessageName,
+            fieldNumber: 1,
+            isRepeated: true,
+          },
+        ],
+      }),
+    );
+
+    return messageLines;
+  }
+
+  private isOperationType(type: GraphQLObjectType): boolean {
+    if (type.name.startsWith('__') || type.name === '_Entity') {
+      return true;
+    }
+
+    return type.name === 'Query' || type.name === 'Mutation' || type.name === 'Subscription';
+  }
+
+  /**
+   * Checks if a type is an entity type
+   * @param type - The type to check
+   * @returns True if the type is an entity type, false otherwise
+   */
+  private isEntityType(type: GraphQLNamedType): type is GraphQLObjectType {
+    return isObjectType(type) && !this.isOperationType(type) && this.hasKeyDirective(type);
   }
 
   /**
@@ -1070,11 +1542,23 @@ Example:
       return;
     }
 
+    const allFields = Object.values(type.getFields());
+    // Filter out fields that have arguments or @connect__fieldResolver as those are handled in separate resolver rpcs
+    const validFields = allFields
+      .filter((field) => field.args.length === 0 && !this.findDirective(field, CONNECT_FIELD_RESOLVER))
+      .filter(
+        (field) =>
+          !field.astNode?.directives?.some(
+            (directive) =>
+              directive.name.value === EXTERNAL_DIRECTIVE_NAME || directive.name.value === REQUIRES_DIRECTIVE_NAME,
+          ),
+      );
+
     // Check for field removals if lock data exists for this type
     const lockData = this.lockManager.getLockData();
     if (lockData.messages[type.name]) {
       const originalFieldNames = Object.keys(lockData.messages[type.name].fields);
-      const currentFieldNames = Object.keys(type.getFields());
+      const currentFieldNames = validFields.map((field) => field.name);
       this.trackRemovedFields(type.name, originalFieldNames, currentFieldNames);
     }
 
@@ -1097,16 +1581,23 @@ Example:
     const fields = type.getFields();
 
     // Get field names and order them using the lock manager
-    const fieldNames = Object.keys(fields);
+    const fieldNames = Object.keys(fields).filter((fieldName) => validFields.some((field) => field.name === fieldName));
     const orderedFieldNames = this.lockManager.reconcileMessageFieldOrder(type.name, fieldNames);
 
     for (const fieldName of orderedFieldNames) {
-      if (!fields[fieldName]) continue;
+      if (!fields[fieldName]) {
+        continue;
+      }
 
+      // ignore fields with arguments as those are handled in separate resolver rpcs
       const field = fields[fieldName];
+      if (field.args.length > 0) {
+        continue;
+      }
+
       const fieldType = this.getProtoTypeFromGraphQL(field.type);
-      const isRepeated = isListType(field.type) || (isNonNullType(field.type) && isListType(field.type.ofType));
       const protoFieldName = graphqlFieldToProtoField(fieldName);
+      const deprecationInfo = this.fieldIsDeprecated(field, [...type.getInterfaces()]);
 
       // Get the appropriate field number, respecting the lock
       const fieldNumber = this.getFieldNumber(type.name, protoFieldName, this.getNextAvailableFieldNumber(type.name));
@@ -1116,10 +1607,21 @@ Example:
         this.protoText.push(...this.formatComment(field.description, 1)); // Field comment, indent 1 level
       }
 
-      if (isRepeated) {
-        this.protoText.push(`  repeated ${fieldType} ${protoFieldName} = ${fieldNumber};`);
+      if (deprecationInfo.deprecated && deprecationInfo.reason && deprecationInfo.reason.length > 0) {
+        this.protoText.push(...this.formatComment(`Deprecation notice: ${deprecationInfo.reason}`, 1));
+      }
+
+      const fieldOptions = [];
+      if (deprecationInfo.deprecated) {
+        fieldOptions.push(` [deprecated = true]`);
+      }
+
+      if (fieldType.isRepeated) {
+        this.protoText.push(
+          `  repeated ${fieldType.typeName} ${protoFieldName} = ${fieldNumber}${fieldOptions.join(' ')};`,
+        );
       } else {
-        this.protoText.push(`  ${fieldType} ${protoFieldName} = ${fieldNumber};`);
+        this.protoText.push(`  ${fieldType.typeName} ${protoFieldName} = ${fieldNumber}${fieldOptions.join(' ')};`);
       }
 
       // Queue complex field types for processing
@@ -1131,6 +1633,63 @@ Example:
 
     this.indent--;
     this.protoText.push('}');
+  }
+
+  /**
+   * Resolve deprecation for a field (optionally considering interface fields)
+   * Field-level reason takes precedence; otherwise the first interface with a non-empty reason wins.
+   * @param field - The GraphQL field to handle directives for
+   * @param interfaces - The GraphQL interfaces that the field implements
+   * @returns An object with the deprecated flag and the reason for deprecation
+   */
+  private fieldIsDeprecated(
+    field: GraphQLField<any, any> | GraphQLInputField,
+    interfaces: GraphQLInterfaceType[],
+  ): { deprecated: boolean; reason?: string } {
+    const allFieldsRefs = [
+      field,
+      ...interfaces.map((iface) => iface.getFields()[field.name]).filter((f) => f !== undefined),
+    ];
+
+    const deprecatedDirectives = allFieldsRefs
+      .map((f) => f.astNode?.directives?.find((d) => d.name.value === 'deprecated'))
+      .filter((d) => d !== undefined);
+
+    if (deprecatedDirectives.length === 0) {
+      return { deprecated: false };
+    }
+
+    const reasons = deprecatedDirectives
+      .map((d) => d.arguments?.find((a) => a.name.value === 'reason')?.value)
+      .filter((r) => r !== undefined && this.isNonEmptyStringValueNode(r));
+
+    if (reasons.length === 0) {
+      return { deprecated: true };
+    }
+
+    return { deprecated: true, reason: reasons[0]?.value };
+  }
+
+  private enumValueIsDeprecated(value: GraphQLEnumValue): { deprecated: boolean; reason?: string } {
+    const deprecatedDirective = value.astNode?.directives?.find((d) => d.name.value === 'deprecated');
+    if (!deprecatedDirective) {
+      return { deprecated: false };
+    }
+    const reasonNode = deprecatedDirective.arguments?.find((a) => a.name.value === 'reason')?.value;
+    if (this.isNonEmptyStringValueNode(reasonNode)) {
+      return { deprecated: true, reason: reasonNode.value.trim() };
+    }
+
+    return { deprecated: true };
+  }
+
+  /**
+   * Check if a node is a non-empty string value node
+   * @param node - The node to check
+   * @returns True if the node is a non-empty string value node, false otherwise
+   */
+  private isNonEmptyStringValueNode(node: ConstValueNode | undefined): node is StringValueNode {
+    return node?.kind === Kind.STRING && node.value.trim().length > 0;
   }
 
   /**
@@ -1173,12 +1732,14 @@ Example:
     const orderedFieldNames = this.lockManager.reconcileMessageFieldOrder(type.name, fieldNames);
 
     for (const fieldName of orderedFieldNames) {
-      if (!fields[fieldName]) continue;
+      if (!fields[fieldName]) {
+        continue;
+      }
 
       const field = fields[fieldName];
       const fieldType = this.getProtoTypeFromGraphQL(field.type);
-      const isRepeated = isListType(field.type) || (isNonNullType(field.type) && isListType(field.type.ofType));
       const protoFieldName = graphqlFieldToProtoField(fieldName);
+      const deprecationInfo = this.fieldIsDeprecated(field, []);
 
       // Get the appropriate field number, respecting the lock
       const fieldNumber = this.getFieldNumber(type.name, protoFieldName, this.getNextAvailableFieldNumber(type.name));
@@ -1188,10 +1749,21 @@ Example:
         this.protoText.push(...this.formatComment(field.description, 1)); // Field comment, indent 1 level
       }
 
-      if (isRepeated) {
-        this.protoText.push(`  repeated ${fieldType} ${protoFieldName} = ${fieldNumber};`);
+      if (deprecationInfo.deprecated && deprecationInfo.reason && deprecationInfo.reason.length > 0) {
+        this.protoText.push(...this.formatComment(`Deprecation notice: ${deprecationInfo.reason}`, 1));
+      }
+
+      const fieldOptions = [];
+      if (deprecationInfo.deprecated) {
+        fieldOptions.push(` [deprecated = true]`);
+      }
+
+      if (fieldType.isRepeated) {
+        this.protoText.push(
+          `  repeated ${fieldType.typeName} ${protoFieldName} = ${fieldNumber}${fieldOptions.join(' ')};`,
+        );
       } else {
-        this.protoText.push(`  ${fieldType} ${protoFieldName} = ${fieldNumber};`);
+        this.protoText.push(`  ${fieldType.typeName} ${protoFieldName} = ${fieldNumber}${fieldOptions.join(' ')};`);
       }
 
       // Queue complex field types for processing
@@ -1219,7 +1791,7 @@ Example:
     this.processedTypes.add(type.name);
 
     const implementingTypes = Object.values(this.schema.getTypeMap())
-      .filter(isObjectType)
+      .filter((t) => isObjectType(t))
       .filter((t) => t.getInterfaces().some((i) => i.name === type.name));
 
     if (implementingTypes.length === 0) {
@@ -1246,10 +1818,11 @@ Example:
     const typeNames = implementingTypes.map((t) => t.name);
     const orderedTypeNames = this.lockManager.reconcileMessageFieldOrder(`${type.name}Implementations`, typeNames);
 
-    for (let i = 0; i < orderedTypeNames.length; i++) {
-      const typeName = orderedTypeNames[i];
+    for (const [i, typeName] of orderedTypeNames.entries()) {
       const implType = implementingTypes.find((t) => t.name === typeName);
-      if (!implType) continue;
+      if (!implType) {
+        continue;
+      }
 
       // Add implementing type description as comment if available
       if (implType.description) {
@@ -1305,10 +1878,11 @@ Example:
     const typeNames = types.map((t) => t.name);
     const orderedTypeNames = this.lockManager.reconcileMessageFieldOrder(`${type.name}Members`, typeNames);
 
-    for (let i = 0; i < orderedTypeNames.length; i++) {
-      const typeName = orderedTypeNames[i];
+    for (const [i, typeName] of orderedTypeNames.entries()) {
       const memberType = types.find((t) => t.name === typeName);
-      if (!memberType) continue;
+      if (!memberType) {
+        continue;
+      }
 
       // Add member type description as comment if available
       if (memberType.description) {
@@ -1367,35 +1941,50 @@ Example:
     const unspecifiedValue = createEnumUnspecifiedValue(type.name);
     this.protoText.push(`  ${unspecifiedValue} = 0;`);
 
-    // Use lock manager to order enum values
+    // Use lock manager to order enum values, filtering out any value whose proto name
+    // collides with the auto-generated UNSPECIFIED value (already emitted at position 0)
     const values = type.getValues();
-    const valueNames = values.map((v) => v.name);
+    const valueNames = values
+      .filter((v) => graphqlEnumValueToProtoEnumValue(type.name, v.name) !== unspecifiedValue)
+      .map((v) => v.name);
     const orderedValueNames = this.lockManager.reconcileEnumValueOrder(type.name, valueNames);
 
     for (const valueName of orderedValueNames) {
       const value = values.find((v) => v.name === valueName);
-      if (!value) continue;
+      if (!value) {
+        continue;
+      }
 
       const protoEnumValue = graphqlEnumValueToProtoEnumValue(type.name, value.name);
+
+      const deprecationInfo = this.enumValueIsDeprecated(value);
 
       // Add enum value description as comment
       if (value.description) {
         this.protoText.push(...this.formatComment(value.description, 1)); // Field comment, indent 1 level
       }
 
+      if (deprecationInfo.deprecated && deprecationInfo.reason && deprecationInfo.reason.length > 0) {
+        this.protoText.push(...this.formatComment(`Deprecation notice: ${deprecationInfo.reason}`, 1));
+      }
+
       // Get value number from lock data
-      const lockData = this.lockManager.getLockData();
       let valueNumber = 0;
 
       if (lockData.enums[type.name] && lockData.enums[type.name].fields[value.name]) {
         valueNumber = lockData.enums[type.name].fields[value.name];
       } else {
-        // This should never happen since we just reconciled, but just in case
-        console.warn(`Missing enum value number for ${type.name}.${value.name}`);
-        continue;
+        // Indicates a bug in lock reconciliation; fail fast rather than silently
+        // producing a proto enum value with number 0, which would collide with UNSPECIFIED.
+        throw new Error(`Missing enum value number for ${type.name}.${value.name}`);
       }
 
-      this.protoText.push(`  ${protoEnumValue} = ${valueNumber};`);
+      const fieldOptions = [];
+      if (deprecationInfo.deprecated) {
+        fieldOptions.push(` [deprecated = true]`);
+      }
+
+      this.protoText.push(`  ${protoEnumValue} = ${valueNumber}${fieldOptions.join(' ')};`);
     }
 
     this.indent--;
@@ -1413,128 +2002,27 @@ Example:
    * @param ignoreWrapperTypes - If true, do not use wrapper types for nullable scalar fields
    * @returns The corresponding Protocol Buffer type name
    */
-  private getProtoTypeFromGraphQL(graphqlType: GraphQLType, ignoreWrapperTypes: boolean = false): string {
-    // For nullable scalar types, use wrapper types
-    if (isScalarType(graphqlType)) {
-      if (ignoreWrapperTypes) {
-        return SCALAR_TYPE_MAP[graphqlType.name] || 'string';
-      }
-      this.usesWrapperTypes = true; // Track that we're using wrapper types
-      return SCALAR_WRAPPER_TYPE_MAP[graphqlType.name] || 'google.protobuf.StringValue';
+  private getProtoTypeFromGraphQL(graphqlType: GraphQLType, ignoreWrapperTypes = false): ProtoFieldType {
+    const protoFieldType = getProtoTypeFromGraphQL(this.includeComments, graphqlType, ignoreWrapperTypes);
+    if (!ignoreWrapperTypes && protoFieldType.isWrapper) {
+      this.usesWrapperTypes = true;
     }
 
-    if (isEnumType(graphqlType)) {
-      return graphqlType.name;
-    }
-
-    if (isNonNullType(graphqlType)) {
-      // For non-null scalar types, use the base type
-      if (isScalarType(graphqlType.ofType)) {
-        return SCALAR_TYPE_MAP[graphqlType.ofType.name] || 'string';
-      }
-
-      return this.getProtoTypeFromGraphQL(graphqlType.ofType);
-    }
-
-    if (isListType(graphqlType)) {
-      // Handle nested list types (e.g., [[Type]])
-      const innerType = graphqlType.ofType;
-
-      // If the inner type is also a list, we need to use a wrapper message
-      if (isListType(innerType) || (isNonNullType(innerType) && isListType(innerType.ofType))) {
-        // Find the most inner type by unwrapping all lists and non-nulls
-        let currentType: GraphQLType = innerType;
-        while (isListType(currentType) || isNonNullType(currentType)) {
-          currentType = isListType(currentType) ? currentType.ofType : (currentType as any).ofType;
+    const listWrapper = protoFieldType.listWrapper;
+    if (listWrapper) {
+      for (let i = 1; i <= listWrapper.nestingLevel; i++) {
+        const wrapperName = listNameByNestingLevel(i, listWrapper.baseType);
+        if (this.processedTypes.has(wrapperName) || this.nestedListWrappers.has(wrapperName)) {
+          continue;
         }
 
-        // Get the name of the inner type and create wrapper name
-        const namedInnerType = currentType as GraphQLNamedType;
-        const wrapperName = `${namedInnerType.name}List`;
-
-        // Generate the wrapper message if not already created
-        if (!this.processedTypes.has(wrapperName) && !this.nestedListWrappers.has(wrapperName)) {
-          this.createNestedListWrapper(wrapperName, namedInnerType);
-        }
-
-        return wrapperName;
+        const wrapperMessage = createNestedListWrapper(this.includeComments, i, listWrapper.baseType);
+        this.nestedListWrappers.set(wrapperName, wrapperMessage);
+        this.processedTypes.add(wrapperName);
       }
-
-      return this.getProtoTypeFromGraphQL(innerType, true);
     }
 
-    // Named types (object, interface, union, input)
-    const namedType = graphqlType as GraphQLNamedType;
-    if (namedType && typeof namedType.name === 'string') {
-      return namedType.name;
-    }
-
-    return 'string'; // Default fallback
-  }
-
-  /**
-   * Create a nested list wrapper message for the given base type
-   */
-  private createNestedListWrapper(wrapperName: string, baseType: GraphQLNamedType): void {
-    // Skip if already processed
-    if (this.processedTypes.has(wrapperName) || this.nestedListWrappers.has(wrapperName)) {
-      return;
-    }
-
-    // Mark as processed to avoid recursion
-    this.processedTypes.add(wrapperName);
-
-    // Check for field removals if lock data exists for this wrapper
-    const lockData = this.lockManager.getLockData();
-    if (lockData.messages[wrapperName]) {
-      const originalFieldNames = Object.keys(lockData.messages[wrapperName].fields);
-      const currentFieldNames = ['result'];
-      this.trackRemovedFields(wrapperName, originalFieldNames, currentFieldNames);
-    }
-
-    // Create a temporary array for the wrapper definition
-    const messageLines: string[] = [];
-
-    // Add a description comment for the wrapper message
-    if (this.includeComments) {
-      const wrapperComment = `Wrapper message for a list of ${baseType.name}.`;
-      messageLines.push(...this.formatComment(wrapperComment, 0)); // Top-level comment, no indent
-    }
-
-    messageLines.push(`message ${wrapperName} {`);
-
-    // Add reserved field numbers if any exist
-    const messageLock = lockData.messages[wrapperName];
-    if (messageLock?.reservedNumbers && messageLock.reservedNumbers.length > 0) {
-      messageLines.push(`  reserved ${this.formatReservedNumbers(messageLock.reservedNumbers)};`);
-    }
-
-    // Get the appropriate field number from the lock
-    const fieldNumber = this.getFieldNumber(wrapperName, 'result', 1);
-
-    // For the inner type, we need to get the proto type for the base type
-    const protoType = this.getProtoTypeFromGraphQL(baseType, true);
-    messageLines.push(`  repeated ${protoType} result = ${fieldNumber};`);
-
-    messageLines.push('}');
-    messageLines.push('');
-
-    // Ensure the wrapper message is registered in the lock manager data
-    this.lockManager.reconcileMessageFieldOrder(wrapperName, ['result']);
-
-    // Store the wrapper message for later inclusion in the output
-    this.nestedListWrappers.set(wrapperName, messageLines.join('\n'));
-  }
-
-  /**
-   * Get indentation based on the current level
-   *
-   * Helper method to maintain consistent indentation in the output.
-   *
-   * @returns String with spaces for the current indentation level
-   */
-  private getIndent(): string {
-    return '  '.repeat(this.indent);
+    return protoFieldType;
   }
 
   /**
@@ -1556,7 +2044,9 @@ Example:
    * @returns A formatted string for the reserved statement
    */
   private formatReservedNumbers(numbers: number[]): string {
-    if (numbers.length === 0) return '';
+    if (numbers.length === 0) {
+      return '';
+    }
 
     // Sort numbers for better readability
     const sortedNumbers = [...numbers].sort((a, b) => a - b);
@@ -1589,11 +2079,7 @@ Example:
     // Format the ranges
     return ranges
       .map(([start, end]) => {
-        if (start === end) {
-          return start.toString();
-        } else {
-          return `${start} to ${end}`;
-        }
+        return start === end ? start.toString() : `${start} to ${end}`;
       })
       .join(', ');
   }
@@ -1604,19 +2090,16 @@ Example:
    * @param indentLevel - The level of indentation for the comment (in number of 2-space blocks)
    * @returns Array of comment lines with proper indentation
    */
-  private formatComment(description: string | undefined | null, indentLevel: number = 0): string[] {
-    if (!this.includeComments || !description) {
-      return [];
-    }
+  private formatComment(description: string | undefined | null, indentLevel = 0): string[] {
+    return formatComment(this.includeComments, description, indentLevel);
+  }
 
-    // Use 2-space indentation consistently
-    const indent = '  '.repeat(indentLevel);
-    const lines = description.trim().split('\n');
-
-    if (lines.length === 1) {
-      return [`${indent}// ${lines[0]}`];
-    } else {
-      return [`${indent}/*`, ...lines.map((line) => `${indent} * ${line}`), `${indent} */`];
-    }
+  /**
+   * Builds a message definition from a ProtoMessage object
+   * @param message - The ProtoMessage object
+   * @returns The message definition
+   */
+  private buildMessage(message: ProtoMessage): string[] {
+    return buildProtoMessage(this.includeComments, message);
   }
 }

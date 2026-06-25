@@ -8,6 +8,7 @@ import {
 import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
 import { GraphCompositionRepository } from '../../repositories/GraphCompositionRepository.js';
 import type { RouterOptions } from '../../routes.js';
+import { UnauthorizedError } from '../../errors/errors.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
 
 export function getChangelogBySchemaVersion(
@@ -24,10 +25,6 @@ export function getChangelogBySchemaVersion(
     const fedRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
     const graphCompositionRepo = new GraphCompositionRepository(logger, opts.db);
 
-    const changelogs = await fedRepo.fetchChangelogByVersion({
-      schemaVersionId: req.schemaVersionId,
-    });
-
     const composition = await graphCompositionRepo.getGraphCompositionBySchemaVersion({
       schemaVersionId: req.schemaVersionId,
       organizationId: authContext.organizationId,
@@ -41,6 +38,17 @@ export function getChangelogBySchemaVersion(
         },
       };
     }
+
+    if (composition.targetId) {
+      const graph = await fedRepo.byTargetId(composition.targetId);
+      if (graph && !authContext.rbac.hasFederatedGraphReadAccess(graph)) {
+        throw new UnauthorizedError();
+      }
+    }
+
+    const changelogs = await fedRepo.fetchChangelogByVersion({
+      schemaVersionId: req.schemaVersionId,
+    });
 
     return {
       response: {

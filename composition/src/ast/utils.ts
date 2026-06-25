@@ -1,31 +1,31 @@
 import {
-  ArgumentNode,
-  DocumentNode,
-  EnumTypeDefinitionNode,
-  EnumTypeExtensionNode,
-  FieldNode,
-  InputObjectTypeDefinitionNode,
-  InputObjectTypeExtensionNode,
-  InterfaceTypeDefinitionNode,
-  InterfaceTypeExtensionNode,
+  type ArgumentNode,
+  type DocumentNode,
+  type EnumTypeDefinitionNode,
+  type EnumTypeExtensionNode,
+  type FieldNode,
+  type InputObjectTypeDefinitionNode,
+  type InputObjectTypeExtensionNode,
+  type InterfaceTypeDefinitionNode,
+  type InterfaceTypeExtensionNode,
   Kind,
-  NamedTypeNode,
-  NameNode,
-  ObjectTypeDefinitionNode,
-  ObjectTypeExtensionNode,
+  type NamedTypeNode,
+  type NameNode,
+  type ObjectTypeDefinitionNode,
+  type ObjectTypeExtensionNode,
   OperationTypeNode,
   parse as graphqlParse,
-  ScalarTypeDefinitionNode,
-  ScalarTypeExtensionNode,
-  SchemaDefinitionNode,
-  SchemaExtensionNode,
-  SelectionNode,
-  SelectionSetNode,
-  StringValueNode,
-  UnionTypeDefinitionNode,
-  UnionTypeExtensionNode,
+  type ScalarTypeDefinitionNode,
+  type ScalarTypeExtensionNode,
+  type SchemaDefinitionNode,
+  type SchemaExtensionNode,
+  type SelectionNode,
+  type SelectionSetNode,
+  type StringValueNode,
+  type UnionTypeDefinitionNode,
+  type UnionTypeExtensionNode,
 } from 'graphql';
-import { CompositeOutputNode } from '../schema-building/ast';
+import { type CompositeOutputNode } from '../schema-building/ast';
 import {
   ARGUMENT_DEFINITION_UPPER,
   ENUM_UPPER,
@@ -289,3 +289,15 @@ export type ObjectTypeNode = ObjectTypeDefinitionNode | ObjectTypeExtensionNode;
 export type ScalarTypeNode = ScalarTypeDefinitionNode | ScalarTypeExtensionNode;
 export type SchemaNode = SchemaDefinitionNode | SchemaExtensionNode;
 export type UnionTypeNode = UnionTypeDefinitionNode | UnionTypeExtensionNode;
+
+export type ParentTypeNode =
+  | EnumTypeNode
+  | InputObjectTypeNode
+  | InterfaceTypeNode
+  | ObjectTypeNode
+  | ScalarTypeNode
+  | UnionTypeNode;
+
+export type InterfaceNodeKind = Kind.INTERFACE_TYPE_DEFINITION | Kind.INTERFACE_TYPE_EXTENSION;
+export type ObjectNodeKind = Kind.OBJECT_TYPE_DEFINITION | Kind.OBJECT_TYPE_EXTENSION;
+export type CompositeOutputNodeKind = InterfaceNodeKind | ObjectNodeKind;

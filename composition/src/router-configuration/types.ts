@@ -1,3 +1,12 @@
+import { type OperationTypeNode } from 'graphql';
+import {
+  type ArgumentName,
+  type DirectiveArgumentCoords,
+  type FieldCoords,
+  type FieldName,
+  type TypeName,
+} from '../types/types';
+
 export type NatsEventType = 'subscribe' | 'publish' | 'request';
 
 export type KafkaEventType = 'subscribe' | 'publish';
@@ -72,21 +81,92 @@ export type FieldSetConditionDataParams = {
 };
 
 export type RequiredFieldConfiguration = {
-  fieldName: string;
+  fieldName: FieldName;
   selectionSet: string;
   conditions?: Array<FieldSetConditionData>;
   disableEntityResolver?: boolean;
 };
 
 export type ConfigurationData = {
-  fieldNames: Set<string>;
+  fieldNames: Set<FieldName>;
   isRootNode: boolean;
-  typeName: string;
-  entityInterfaceConcreteTypeNames?: Set<string>;
+  typeName: TypeName;
+  entityInterfaceConcreteTypeNames?: Set<TypeName>;
   events?: EventConfiguration[];
-  externalFieldNames?: Set<string>;
+  externalFieldNames?: Set<FieldName>;
   isInterfaceObject?: boolean;
   provides?: RequiredFieldConfiguration[];
   keys?: RequiredFieldConfiguration[];
+  requireFetchReasonsFieldNames?: Array<FieldName>;
   requires?: RequiredFieldConfiguration[];
+  entityCaching?: EntityCachingConfiguration;
+};
+
+// Extracted from @openfed__entityCache(maxAge: Int!, negativeCacheTTL: Int, includeHeaders: Boolean,
+// partialCacheLoad: Boolean, shadowMode: Boolean) on OBJECT types. Defines per-entity cache TTL and behavior.
+export type EntityCacheConfiguration = {
+  typeName: TypeName;
+  maxAgeSeconds: number;
+  // TTL (in seconds) for caching "not found" entity responses (entity returned null
+  // from _entities without errors). 0 disables negative caching; composition rejects
+  // negative values at validation time.
+  notFoundCacheTtlSeconds: number;
+  // When true, request headers are included in the cache key (useful for user-specific entities).
+  includeHeaders: boolean;
+  // When true, allows partial cache hits — the router fetches only missing entities from the subgraph.
+  partialCacheLoad: boolean;
+  // When true, the cache runs in shadow mode — cache reads/writes happen but responses always come
+  // from the subgraph. Useful for warming caches or validating correctness without affecting traffic.
+  shadowMode: boolean;
+};
+
+// Extracted from @openfed__cacheInvalidate on Mutation/Subscription fields.
+// Tells the router to evict the returned entity from the cache after the operation completes.
+export type CacheInvalidateConfiguration = {
+  entityTypeName: TypeName;
+  fieldName: FieldName;
+  operationType: OperationTypeNode;
+};
+
+// Extracted from @openfed__cachePopulate on Mutation/Subscription fields.
+// Tells the router to populate the entity cache with the operation's return value.
+// maxAgeSeconds overrides the entity's default TTL when provided.
+export type CachePopulateConfiguration = {
+  entityTypeName: TypeName;
+  fieldName: FieldName;
+  maxAgeSeconds: number;
+  operationType: OperationTypeNode;
+};
+
+export type EntityCachingConfiguration = {
+  // Attached to the Mutation/Subscription type's ConfigurationData from @openfed__cacheInvalidate.
+  cacheInvalidateConfigurations: Array<CacheInvalidateConfiguration>;
+  // Attached to the Mutation/Subscription type's ConfigurationData from @openfed__cachePopulate.
+  cachePopulateConfigurations: Array<CachePopulateConfiguration>;
+  // Attached to an entity type's ConfigurationData (e.g. "Product") from @openfed__entityCache.
+  entityCacheConfigurations: Array<EntityCacheConfiguration>;
+};
+
+export type Costs = {
+  directiveArgumentWeights: Map<DirectiveArgumentCoords, number>;
+  fieldWeights: Map<FieldCoords, FieldWeightConfiguration>;
+  listSizes: Map<FieldCoords, FieldListSizeConfiguration>;
+  typeWeights: Map<TypeName, number>;
+};
+
+export type FieldWeightConfiguration = {
+  argumentWeights: Map<ArgumentName, number>;
+  directiveArgumentWeights: Map<DirectiveArgumentCoords, number>;
+  fieldName: FieldName;
+  typeName: TypeName;
+  weight?: number;
+};
+
+export type FieldListSizeConfiguration = {
+  fieldName: FieldName;
+  requireOneSlicingArgument: boolean;
+  sizedFields: Array<FieldName>;
+  slicingArguments: Array<ArgumentName>;
+  typeName: TypeName;
+  assumedSize?: number;
 };

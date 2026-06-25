@@ -1,64 +1,86 @@
-import { Warning } from '../warnings/types';
-import { DocumentNode, GraphQLSchema, OperationTypeNode } from 'graphql';
-import { ConfigurationData } from '../router-configuration/types';
+import { type Warning } from '../warnings/types';
 import {
-  AuthorizationData,
-  ConditionalFieldData,
-  EntityData,
-  EntityInterfaceSubgraphData,
-  ParentDefinitionData,
-  PersistedDirectiveDefinitionData,
-} from '../schema-building/types';
-import { Graph } from '../resolvability-graph/graph';
-import { InternalSubgraph } from '../subgraph/types';
+  type DirectiveDefinitionNode,
+  type DocumentNode,
+  type GraphQLSchema,
+  type OperationTypeNode,
+  type SchemaDefinitionNode,
+  type SchemaExtensionNode,
+} from 'graphql';
+import { type ConfigurationData, type Costs } from '../router-configuration/types';
+import {
+  type AuthorizationData,
+  type ConditionalFieldData,
+  type EntityData,
+  type EntityInterfaceSubgraphData,
+  type ParentDefinitionData,
+} from '../schema-building/types/types';
+import { type Graph } from '../resolvability-graph/graph';
+import { type InternalSubgraph } from '../subgraph/types';
+import {
+  type AbstractTypeName,
+  type DirectiveName,
+  type FieldName,
+  type InterfaceTypeName,
+  type SubgraphName,
+  type TypeName,
+} from '../types/types';
+import { type ExecutionMultiFailure } from '../types/results';
+import { type LinkImportData } from '../v1/normalization/types/types';
+import { type DirectiveDefinitionData } from '../directive-definition-data/types/types';
 
-export type NormalizationResultFailure = {
-  errors: Array<Error>;
-  success: false;
+export interface NormalizationFailure extends ExecutionMultiFailure {
   warnings: Array<Warning>;
-};
+}
 
-export type NormalizationResultSuccess = {
-  authorizationDataByParentTypeName: Map<string, AuthorizationData>;
-  concreteTypeNamesByAbstractTypeName: Map<string, Set<string>>;
+export type NormalizationSuccess = {
+  authorizationDataByParentTypeName: Map<TypeName, AuthorizationData>;
+  concreteTypeNamesByAbstractTypeName: Map<AbstractTypeName, Set<TypeName>>;
   conditionalFieldDataByCoordinates: Map<string, ConditionalFieldData>;
-  configurationDataByTypeName: Map<string, ConfigurationData>;
+  configurationDataByTypeName: Map<TypeName, ConfigurationData>;
+  costs: Costs;
+  directiveDefinitionByName: Map<DirectiveName, DirectiveDefinitionNode>;
   entityInterfaces: Map<string, EntityInterfaceSubgraphData>;
-  entityDataByTypeName: Map<string, EntityData>;
-  fieldCoordsByNamedTypeName: Map<string, Set<string>>;
-  originalTypeNameByRenamedTypeName: Map<string, string>;
+  entityDataByTypeName: Map<TypeName, EntityData>;
+  federatedDirectiveDataByName: Map<DirectiveName, DirectiveDefinitionData>;
+  fieldCoordsByNamedTypeName: Map<TypeName, Set<string>>;
+  importDataByDirectiveName: Map<DirectiveName, LinkImportData>;
+  interfaceImplementationTypeNamesByInterfaceTypeName: Map<InterfaceTypeName, Set<InterfaceTypeName>>;
   isEventDrivenGraph: boolean;
   isVersionTwo: boolean;
   keyFieldNamesByParentTypeName: Map<string, Set<string>>;
   keyFieldSetsByEntityTypeNameByKeyFieldCoords: Map<string, Map<string, Set<string>>>;
   operationTypes: Map<string, OperationTypeNode>;
-  overridesByTargetSubgraphName: Map<string, Map<string, Set<string>>>;
-  parentDefinitionDataByTypeName: Map<string, ParentDefinitionData>;
-  persistedDirectiveDefinitionDataByDirectiveName: Map<string, PersistedDirectiveDefinitionData>;
+  originalTypeNameByRenamedTypeName: Map<TypeName, TypeName>;
+  overriddenFieldNamesByParentTypeNameByTargetSubgraphName: Map<SubgraphName, Map<TypeName, Set<FieldName>>>;
+  parentDefinitionDataByTypeName: Map<TypeName, ParentDefinitionData>;
   schema: GraphQLSchema;
   subgraphAST: DocumentNode;
   subgraphString: string;
   success: true;
   warnings: Array<Warning>;
+  schemaNode?: SchemaDefinitionNode | SchemaExtensionNode;
 };
 
-export type NormalizationResult = NormalizationResultFailure | NormalizationResultSuccess;
+export type NormalizationResult = NormalizationFailure | NormalizationSuccess;
 
-export type BatchNormalizationResultFailure = {
+export interface BatchNormalizationFailure extends ExecutionMultiFailure {
   errors: Array<Error>;
-  success: false;
   warnings: Array<Warning>;
-};
+}
 
-export type BatchNormalizationResultSuccess = {
+export type BatchNormalizationSuccess = {
   success: true;
-  authorizationDataByParentTypeName: Map<string, AuthorizationData>;
-  concreteTypeNamesByAbstractTypeName: Map<string, Set<string>>;
-  entityDataByTypeName: Map<string, EntityData>;
-  fieldCoordsByNamedTypeName: Map<string, Set<string>>;
-  internalSubgraphBySubgraphName: Map<string, InternalSubgraph>;
+  authorizationDataByParentTypeName: Map<TypeName, AuthorizationData>;
+  concreteTypeNamesByAbstractTypeName: Map<AbstractTypeName, Set<TypeName>>;
+  entityDataByTypeName: Map<TypeName, EntityData>;
+  executableDirectiveDatasByName: Map<DirectiveName, Array<DirectiveDefinitionData>>;
+  federatedDirectiveDataByName: Map<DirectiveName, DirectiveDefinitionData>;
+  fieldCoordsByNamedTypeName: Map<TypeName, Set<string>>;
+  interfaceImplementationTypeNamesByInterfaceTypeName: Map<InterfaceTypeName, Set<InterfaceTypeName>>;
   internalGraph: Graph;
+  internalSubgraphByName: Map<SubgraphName, InternalSubgraph>;
   warnings: Array<Warning>;
 };
 
-export type BatchNormalizationResult = BatchNormalizationResultFailure | BatchNormalizationResultSuccess;
+export type BatchNormalizationResult = BatchNormalizationFailure | BatchNormalizationSuccess;

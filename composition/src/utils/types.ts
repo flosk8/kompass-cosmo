@@ -1,4 +1,5 @@
-import { Kind } from 'graphql';
+import { type Kind } from 'graphql';
+import { type ArgumentName, type SubgraphName } from '../types/types';
 
 export type RootTypeName = 'Mutation' | 'Query' | 'Subscription';
 
@@ -14,7 +15,7 @@ export type InvalidFieldImplementation = {
   invalidImplementedArguments: InvalidArgumentImplementation[];
   isInaccessible: boolean;
   originalResponseType: string;
-  unimplementedArguments: Set<string>;
+  unimplementedArguments: Set<ArgumentName>;
 };
 
 export type ImplementationErrors = {
@@ -23,22 +24,24 @@ export type ImplementationErrors = {
 };
 
 export type GraphFieldData = {
+  externalSubgraphNames: Set<SubgraphName>;
   name: string;
   namedTypeName: string;
   isLeaf: boolean;
-  subgraphNames: Set<string>;
+  subgraphNames: Set<SubgraphName>;
 };
 
 // The accumulation of all EntityInterfaceSubgraphData for the type name
 export type InvalidRequiredInputValueData = {
   inputValueName: string;
-  missingSubgraphs: string[];
-  requiredSubgraphs: string[];
+  missingSubgraphs: Array<SubgraphName>;
+  requiredSubgraphs: Array<SubgraphName>;
 };
 
 export type InvalidEntityInterface = {
+  definedConcreteTypeNames: Set<string>;
+  requiredConcreteTypeNames: Set<string>;
   subgraphName: string;
-  concreteTypeNames: Set<string>;
 };
 
 export type InputNodeKind = Kind.ENUM_TYPE_DEFINITION | Kind.INPUT_OBJECT_TYPE_DEFINITION | Kind.SCALAR_TYPE_DEFINITION;

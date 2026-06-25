@@ -2,11 +2,13 @@ import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { SQL, and, count, desc, eq, gt, lt, not } from 'drizzle-orm';
 import { FastifyBaseLogger } from 'fastify';
 import * as schema from '../../db/schema.js';
-import { graphCompositions, graphCompositionSubgraphs, schemaVersion, targets, users } from '../../db/schema.js';
+import { graphCompositions, graphCompositionSubgraphs, schemaVersion, subgraphs, users } from '../../db/schema.js';
 import { DateRange, GraphCompositionDTO } from '../../types/index.js';
-import { ComposedSubgraph } from '../composition/composer.js';
+import { CompositionSubgraphRecord } from '../composition/composer.js';
+import { traced } from '../tracing.js';
 import { FederatedGraphRepository } from './FederatedGraphRepository.js';
 
+@traced
 export class GraphCompositionRepository {
   constructor(
     private logger: FastifyBaseLogger,
@@ -31,7 +33,7 @@ export class GraphCompositionRepository {
     compositionErrorString: string;
     compositionWarningString: string;
     routerConfigSignature?: string;
-    composedSubgraphs: ComposedSubgraph[];
+    composedSubgraphs: CompositionSubgraphRecord[];
     composedById: string;
     admissionErrorString?: string;
     deploymentErrorString?: string;
@@ -46,8 +48,7 @@ export class GraphCompositionRepository {
         throw new Error(`Could not find actor ${composedById}`);
       }
 
-      const subgraphSchemaVersionIds = composedSubgraphs.map((subgraph) => subgraph.schemaVersionId!);
-
+      const subgraphSchemaVersionIds = composedSubgraphs.map((subgraph) => subgraph.schemaVersionId);
       const previousComposition = (
         await tx
           .select({
@@ -140,7 +141,7 @@ export class GraphCompositionRepository {
           subgraphId: subgraph.id,
           subgraphTargetId: subgraph.targetId,
           subgraphName: subgraph.name,
-          schemaVersionId: subgraph.schemaVersionId!,
+          schemaVersionId: subgraph.schemaVersionId,
           isFeatureSubgraph: subgraph.isFeatureSubgraph,
           changeType: (() => {
             if (addedSubgraphs.some((s) => s.id === subgraph.id)) {
@@ -207,7 +208,7 @@ export class GraphCompositionRepository {
       .from(graphCompositions)
       .innerJoin(schemaVersion, eq(schemaVersion.id, graphCompositions.schemaVersionId))
       .leftJoin(users, eq(graphCompositions.createdById, users.id))
-      .where(eq(graphCompositions.id, input.compositionId))
+      .where(and(eq(graphCompositions.id, input.compositionId), eq(schemaVersion.organizationId, input.organizationId)))
       .orderBy(desc(schemaVersion.createdAt))
       .execute();
 
@@ -225,6 +226,7 @@ export class GraphCompositionRepository {
     return {
       id: composition.id,
       schemaVersionId: composition.schemaVersionId,
+      targetId: composition.targetId,
       createdAt: composition.createdAt.toISOString(),
       isComposable: composition.isComposable || false,
       compositionErrors: composition.compositionErrors || undefined,
@@ -262,7 +264,12 @@ export class GraphCompositionRepository {
       .from(graphCompositions)
       .innerJoin(schemaVersion, eq(schemaVersion.id, graphCompositions.schemaVersionId))
       .leftJoin(users, eq(graphCompositions.createdById, users.id))
-      .where(eq(graphCompositions.schemaVersionId, input.schemaVersionId))
+      .where(
+        and(
+          eq(graphCompositions.schemaVersionId, input.schemaVersionId),
+          eq(schemaVersion.organizationId, input.organizationId),
+        ),
+      )
       .orderBy(desc(schemaVersion.createdAt))
       .execute();
 
@@ -280,6 +287,7 @@ export class GraphCompositionRepository {
     return {
       id: composition.id,
       schemaVersionId: composition.schemaVersionId,
+      targetId: composition.targetId,
       createdAt: composition.createdAt.toISOString(),
       isComposable: composition.isComposable || false,
       compositionErrors: composition.compositionErrors || undefined,
@@ -301,8 +309,10 @@ export class GraphCompositionRepository {
         targetId: graphCompositionSubgraphs.subgraphTargetId,
         isFeatureSubgraph: graphCompositionSubgraphs.isFeatureSubgraph,
         changeType: graphCompositionSubgraphs.changeType,
+        subgraphType: subgraphs.type,
       })
       .from(graphCompositionSubgraphs)
+      .innerJoin(subgraphs, eq(graphCompositionSubgraphs.subgraphId, subgraphs.id))
       .where(eq(graphCompositionSubgraphs.graphCompositionId, input.compositionId))
       .execute();
 

@@ -1,0 +1,73 @@
+---
+title: "@openfed subscriptionFilter"
+description: "@openfed__subscriptionFilter is an Open Federation directive used to filter subscription events based on filter predicates."
+icon: filter
+---
+
+## Definition
+
+```graphql
+directive @openfed__subscriptionFilter(condition: openfed__SubscriptionFilterCondition!) on FIELD_DEFINITION
+
+scalar openfed__SubscriptionFilterValue
+
+input openfed__SubscriptionFieldCondition {
+    fieldPath: String!
+    values: [openfed__SubscriptionFilterValue]!
+}
+
+input openfed__SubscriptionFilterCondition {
+    AND: [openfed__SubscriptionFilterCondition!]
+    IN: openfed__SubscriptionFieldCondition
+    NOT: openfed__SubscriptionFilterCondition
+    OR: [openfed__SubscriptionFilterCondition!]
+}
+```
+
+## Overview
+
+The `@openfed__subscriptionFilter` directive declares that a field definition can be filtered by filter conditions. The directive can only be applied to [EDG](/federation/event-driven-federated-subscriptions) subscriptions.
+
+## Arguments
+
+|Argument Name|Argument Type|
+|---|---|
+|condition|openfed\_\_SubscriptionFilterCondition!|
+
+The `condition` argument requires an object representing the filter condition. This object can be nested to express OR, AND, and NOT conditions. Currently, only the IN comparison operator is supported. This operator can be used to validate if a value is inside a list.
+
+## Supported return types
+
+`@openfed__subscriptionFilter` works on subscription fields whose return type is:
+
+- An **object** type.
+- A **union** type. The `fieldPath` must resolve on every accessible union member. If any member is missing the path or resolves to a non-leaf type, composition fails with an error naming the offending member.
+- An **interface** type. The same rule applies to every accessible concrete implementer.
+
+Members and implementers marked `@inaccessible` are skipped before validation. The filter runs against the event payload by field name, so the static return type does not affect runtime evaluation. The condition is validated once per concrete type at composition time and emitted as a single configuration in the router.
+
+### Union example
+
+```graphql
+type EntityUpdated @key(fields: "id code", resolvable: false) {
+    id: ID! @external
+    code: String! @external
+}
+
+type EntityDeleted @key(fields: "id code", resolvable: false) {
+    id: ID! @external
+    code: String! @external
+}
+
+union EntityEvent = EntityUpdated | EntityDeleted
+
+type Subscription {
+    onEntityEvent(code: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entity:event"], providerId: "kafka")
+        @openfed__subscriptionFilter(condition: {
+            IN: { fieldPath: "code", values: ["{{ args.code }}"] }
+        })
+}
+```
+
+The router checks `code` on every incoming event payload regardless of `__typename`. Events whose `__typename` is not a member of the union surface an `INVALID_GRAPHQL` error to the subscriber instead of being delivered.

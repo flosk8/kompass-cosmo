@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/wundergraph/cosmo/router/pkg/otel/otelconfig"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 
@@ -151,7 +152,9 @@ func NewPrometheusMeterProvider(ctx context.Context, c *Config, serviceInstanceI
 	if err != nil {
 		return nil, nil, err
 	}
-	opts = append(opts, sdkmetric.WithReader(promExporter))
+	opts = append(opts,
+		sdkmetric.WithExemplarFilter(c.Prometheus.ExemplarFilter.toOtelExemplarFilter()),
+		sdkmetric.WithReader(promExporter))
 
 	return sdkmetric.NewMeterProvider(opts...), registry, nil
 }
@@ -159,7 +162,8 @@ func NewPrometheusMeterProvider(ctx context.Context, c *Config, serviceInstanceI
 func getTemporalitySelector(temporality otelconfig.ExporterTemporality, log *zap.Logger) func(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 	// https://github.com/open-telemetry/opentelemetry-go/blob/main/internal/shared/otlp/otlpmetric/oconf/envconfig.go.tmpl#L166-L177
 	// See the above link for selectors for different temporalities
-	if temporality == otelconfig.DeltaTemporality {
+	switch temporality {
+	case otelconfig.DeltaTemporality:
 		deltaTemporalitySelector := func(kind sdkmetric.InstrumentKind) metricdata.Temporality {
 			switch kind {
 			case sdkmetric.InstrumentKindCounter,
@@ -171,11 +175,11 @@ func getTemporalitySelector(temporality otelconfig.ExporterTemporality, log *zap
 			}
 		}
 		return deltaTemporalitySelector
-	} else if temporality == otelconfig.CumulativeTemporality {
+	case otelconfig.CumulativeTemporality:
 		return cumulativeTemporalitySelector
-	} else if temporality == otelconfig.CustomCloudTemporality {
+	case otelconfig.CustomCloudTemporality:
 		return defaultCloudTemporalitySelector
-	} else {
+	default:
 		// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/sdk.md#metricreader
 		// if the temporality is not configured, we fallback the to the default as per OTEL-SDK
 		log.Debug("The temporality selector falls back to the default.")
@@ -201,7 +205,7 @@ func createOTELExporter(log *zap.Logger, exp *OpenTelemetryExporter) (sdkmetric.
 
 	var exporter sdkmetric.Exporter
 	switch exp.Exporter {
-	case otelconfig.ExporterOLTPHTTP:
+	case otelconfig.ExporterOTLPHTTP:
 		opts := []otlpmetrichttp.Option{
 			// Includes host and port
 			otlpmetrichttp.WithEndpoint(u.Host),
@@ -224,7 +228,7 @@ func createOTELExporter(log *zap.Logger, exp *OpenTelemetryExporter) (sdkmetric.
 			context.Background(),
 			opts...,
 		)
-	case otelconfig.ExporterOLTPGRPC:
+	case otelconfig.ExporterOTLPGRPC:
 		opts := []otlpmetricgrpc.Option{
 			// Includes host and port
 			otlpmetricgrpc.WithEndpoint(u.Host),
@@ -261,31 +265,47 @@ func NewOtlpMeterProvider(ctx context.Context, log *zap.Logger, c *Config, servi
 		return nil, err
 	}
 
-	if c.OpenTelemetry.TestReader != nil {
-		mp := sdkmetric.NewMeterProvider(append(opts, sdkmetric.WithReader(c.OpenTelemetry.TestReader))...)
-		// Set the global MeterProvider to the SDK metric provider.
-		otel.SetMeterProvider(mp)
+	opts = append(opts, sdkmetric.WithExemplarFilter(c.OpenTelemetry.ExemplarFilter.toOtelExemplarFilter()))
 
-		return mp, nil
+	if c.OpenTelemetry.TestReader != nil {
+		opts = append(opts, sdkmetric.WithReader(c.OpenTelemetry.TestReader))
+	} else {
+		for _, exp := range c.OpenTelemetry.Exporters {
+			if exp.Disabled {
+				continue
+			}
+
+			exporter, err := createOTELExporter(log, exp)
+			if err != nil {
+				log.Error("creating OTEL metrics exporter", zap.Error(err))
+				return nil, err
+			}
+
+			opts = append(opts, sdkmetric.WithReader(
+				sdkmetric.NewPeriodicReader(exporter,
+					sdkmetric.WithTimeout(defaultExportTimeout),
+					sdkmetric.WithInterval(defaultExportInterval),
+				),
+			))
+		}
 	}
 
-	for _, exp := range c.OpenTelemetry.Exporters {
-		if exp.Disabled {
-			continue
+	if c.OpenTelemetry.LogExporter.Enabled {
+		if len(c.OpenTelemetry.LogExporter.ExcludeMetrics) > 0 && len(c.OpenTelemetry.LogExporter.IncludeMetrics) > 0 {
+			return nil, fmt.Errorf("metrics log exporter: exclude_metrics and include_metrics cannot be used together, use only one")
 		}
-
-		exporter, err := createOTELExporter(log, exp)
-		if err != nil {
-			log.Error("creating OTEL metrics exporter", zap.Error(err))
-			return nil, err
+		logExp := newLogExporter(log, c.OpenTelemetry.LogExporter.ExcludeMetrics, c.OpenTelemetry.LogExporter.IncludeMetrics)
+		exportInterval := defaultExportInterval
+		if c.OpenTelemetry.LogExporter.ExportInterval > 0 {
+			exportInterval = c.OpenTelemetry.LogExporter.ExportInterval
 		}
-
 		opts = append(opts, sdkmetric.WithReader(
-			sdkmetric.NewPeriodicReader(exporter,
+			sdkmetric.NewPeriodicReader(logExp,
 				sdkmetric.WithTimeout(defaultExportTimeout),
-				sdkmetric.WithInterval(defaultExportInterval),
+				sdkmetric.WithInterval(exportInterval),
 			),
 		))
+		log.Warn("Metrics log exporter is enabled. Expect increased log volume.")
 	}
 
 	mp := sdkmetric.NewMeterProvider(opts...)
@@ -375,6 +395,13 @@ func defaultPrometheusMetricOptions(ctx context.Context, serviceInstanceID strin
 		// In a custom View function, we need to explicitly copy the name, description, and unit.
 		s := sdkmetric.Stream{Name: i.Name, Description: i.Description, Unit: i.Unit}
 
+		// We currently don't want to expose the otelhttp scope metrics.
+		// TODO: Once we want to expose the otelhttp scope metrics, we need to remove this.
+		if i.Scope.Name == otelhttp.ScopeName {
+			s.Aggregation = sdkmetric.AggregationDrop{}
+			return s, true
+		}
+
 		// Filter out metrics that match the excludeMetrics regexes
 		for _, re := range c.Prometheus.ExcludeMetrics {
 			promName := SanitizeName(i.Name)
@@ -404,6 +431,14 @@ func defaultPrometheusMetricOptions(ctx context.Context, serviceInstanceID strin
 		sdkmetric.WithResource(r),
 	)
 
+	// When the cardinality limit is explicitly set to 0 or negative, the OTEL SDK will not apply a limit.
+	limit := c.CardinalityLimit
+	if limit <= 0 {
+		limit = DefaultCardinalityLimit
+	}
+
+	opts = append(opts, sdkmetric.WithCardinalityLimit(limit))
+
 	return opts, nil
 }
 
@@ -432,6 +467,14 @@ func defaultOtlpMetricOptions(ctx context.Context, serviceInstanceID string, c *
 	var view sdkmetric.View = func(i sdkmetric.Instrument) (sdkmetric.Stream, bool) {
 		// In a custom View function, we need to explicitly copy the name, description, and unit.
 		s := sdkmetric.Stream{Name: i.Name, Description: i.Description, Unit: i.Unit}
+
+		// We currently don't want to expose the otelhttp scope metrics.
+		// TODO: Once we want to expose the otelhttp scope metrics, we need to remove this.
+		if i.Scope.Name == otelhttp.ScopeName {
+			s.Aggregation = sdkmetric.AggregationDrop{}
+			return s, true
+		}
+
 		// Filter out metrics that match the excludeMetrics regexes
 		for _, re := range c.OpenTelemetry.ExcludeMetrics {
 			if re.MatchString(i.Name) {
@@ -453,12 +496,18 @@ func defaultOtlpMetricOptions(ctx context.Context, serviceInstanceID string, c *
 		return s, true
 	}
 
-	// Info: There can be only a single view per instrument. A view with less restriction might override a view.
+	// When the cardinality limit is explicitly set to 0 or negative, the OTEL SDK will not apply a limit.
+	limit := c.CardinalityLimit
+	if limit <= 0 {
+		limit = DefaultCardinalityLimit
+	}
 
+	// Info: There can be only a single view per instrument. A view with less restriction might override a view.
 	return []sdkmetric.Option{
 		// Record information about this application in a Resource.
 		sdkmetric.WithResource(r),
 		sdkmetric.WithView(view),
+		sdkmetric.WithCardinalityLimit(limit),
 	}, nil
 }
 

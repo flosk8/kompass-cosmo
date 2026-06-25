@@ -2,19 +2,15 @@ schema {
   query: Query
 }
 
-directive @authenticated on ENUM | FIELD_DEFINITION | INTERFACE | OBJECT | SCALAR
-
-directive @inaccessible on ARGUMENT_DEFINITION | ENUM | ENUM_VALUE | FIELD_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION
-
-directive @requiresScopes(
-  scopes: [[openfed__Scope!]!]!
-) on ENUM | FIELD_DEFINITION | INTERFACE | OBJECT | SCALAR
-
 directive @tag(
   name: String!
 ) repeatable on ARGUMENT_DEFINITION | ENUM | ENUM_VALUE | FIELD_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION
 
-scalar openfed__Scope
+directive @inaccessible on ARGUMENT_DEFINITION | ENUM | ENUM_VALUE | FIELD_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION
+
+directive @myDirective(a: String!) on FIELD_DEFINITION
+
+directive @hello on FIELD_DEFINITION
 
 type Query {
   allPandas: [Panda]
@@ -77,7 +73,7 @@ interface ProductItf implements SkuItf {
 type Product implements ProductItf & SkuItf {
   id: ID! @tag(name: "hi-from-products")
   sku: String
-  name: String
+  name: String @hello
   package: String
   variation: ProductVariation
   dimensions: ProductDimension

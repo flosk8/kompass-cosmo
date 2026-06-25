@@ -1,5 +1,5 @@
 node_modules
-.husky
+.husky/_
 .idea
 .vscode
 .zed
@@ -16,8 +16,16 @@ lerna-debug.log
 /demo/cmd/subscriptiontest/subscriptiontest
 .github/scripts/keycloak-22.0.4/**
 .github/scripts/keycloak-22.0.4.zip
-/router-tests/cmd/config-validator/router-configs/**
 
 # Go workspace files
 go.work
 go.work.sum
+
+# Mise local config
+**/mise.local.toml
+
+# Serena
+.serena/
+
+# Claude Code
+.claude/worktrees/

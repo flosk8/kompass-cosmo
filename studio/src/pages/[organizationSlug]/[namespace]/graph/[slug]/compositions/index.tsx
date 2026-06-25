@@ -1,56 +1,40 @@
-import { useApplyParams } from "@/components/analytics/use-apply-params";
-import { useDateRangeQueryState } from "@/components/analytics/useAnalyticsQueryState";
-import { getCheckIcon } from "@/components/check-badge-icon";
-import {
-  DatePickerWithRange,
-  DateRangePickerChangeHandler,
-} from "@/components/date-picker-with-range";
-import { EmptyState } from "@/components/empty-state";
-import { InfoTooltip } from "@/components/info-tooltip";
-import {
-  GraphPageLayout,
-  getGraphLayout,
-} from "@/components/layout/graph-layout";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Loader } from "@/components/ui/loader";
-import { Pagination } from "@/components/ui/pagination";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-  TableWrapper,
-} from "@/components/ui/table";
-import { Toolbar } from "@/components/ui/toolbar";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { useFeatureLimit } from "@/hooks/use-feature-limit";
-import { formatDateTime } from "@/lib/format-date";
-import { createDateRange } from "@/lib/insights-helpers";
-import { NextPageWithLayout } from "@/lib/page";
-import { cn } from "@/lib/utils";
-import { useQuery } from "@connectrpc/connect-query";
-import { ExclamationTriangleIcon } from "@heroicons/react/24/outline";
-import { EnumStatusCode } from "@wundergraph/cosmo-connect/dist/common/common_pb";
-import { getCompositions } from "@wundergraph/cosmo-connect/dist/platform/v1/platform-PlatformService_connectquery";
-import { formatDistanceToNow, formatISO } from "date-fns";
-import Link from "next/link";
-import { useRouter } from "next/router";
-import { MdNearbyError, MdVerifiedUser } from "react-icons/md";
+import { useApplyParams } from '@/components/analytics/use-apply-params';
+import { useDateRangeQueryState } from '@/components/analytics/useAnalyticsQueryState';
+import { getCheckIcon } from '@/components/check-badge-icon';
+import { DatePickerWithRange, DateRangePickerChangeHandler } from '@/components/date-picker-with-range';
+import { EmptyState } from '@/components/empty-state';
+import { InfoTooltip } from '@/components/info-tooltip';
+import { GraphPageLayout, getGraphLayout } from '@/components/layout/graph-layout';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Loader } from '@/components/ui/loader';
+import { Pagination } from '@/components/ui/pagination';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow, TableWrapper } from '@/components/ui/table';
+import { Toolbar } from '@/components/ui/toolbar';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { useFeatureLimit } from '@/hooks/use-feature-limit';
+import { formatDateTime } from '@/lib/format-date';
+import { createDateRange } from '@/lib/insights-helpers';
+import { NextPageWithLayout } from '@/lib/page';
+import { cn } from '@/lib/utils';
+import { useQuery } from '@connectrpc/connect-query';
+import { ExclamationTriangleIcon } from '@heroicons/react/24/outline';
+import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
+import { getCompositions } from '@wundergraph/cosmo-connect/dist/platform/v1/platform-PlatformService_connectquery';
+import { formatDistanceToNow, formatISO } from 'date-fns';
+import Link from 'next/link';
+import { useRouter } from 'next/router';
+import { MdNearbyError, MdVerifiedUser } from 'react-icons/md';
+import { useWorkspace } from '@/hooks/use-workspace';
 
 const CompositionsPage: NextPageWithLayout = () => {
   const router = useRouter();
-  const pageNumber = router.query.page
-    ? parseInt(router.query.page as string)
-    : 1;
+  const pageNumber = router.query.page ? parseInt(router.query.page as string) : 1;
 
-  const limit = Number.parseInt((router.query.pageSize as string) || "10");
+  const limit = Number.parseInt((router.query.pageSize as string) || '10');
+  const {
+    namespace: { name: namespace },
+  } = useWorkspace();
 
   const {
     dateRange: { start, end },
@@ -64,7 +48,7 @@ const CompositionsPage: NextPageWithLayout = () => {
     getCompositions,
     {
       fedGraphName: router.query.slug as string,
-      namespace: router.query.namespace as string,
+      namespace,
       limit: limit > 50 ? 50 : limit,
       offset: (pageNumber - 1) * limit,
       startDate: formatISO(startDate),
@@ -78,19 +62,12 @@ const CompositionsPage: NextPageWithLayout = () => {
 
   if (isLoading) return <Loader fullscreen />;
 
-  if (
-    !data ||
-    !data?.compositions ||
-    error ||
-    data?.response?.code !== EnumStatusCode.OK
-  )
+  if (!data || !data?.compositions || error || data?.response?.code !== EnumStatusCode.OK)
     return (
       <EmptyState
         icon={<ExclamationTriangleIcon />}
         title="Could not retrieve federated graphs"
-        description={
-          data?.response?.details || error?.message || "Please try again"
-        }
+        description={data?.response?.details || error?.message || 'Please try again'}
         actions={<Button onClick={() => refetch()}>Retry</Button>}
       />
     );
@@ -110,8 +87,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                 <div>Admission</div>
                 <div>
                   <InfoTooltip>
-                    Indicates if the composition has been validated and signed
-                    by your Admission Controller.
+                    Indicates if the composition has been validated and signed by your Admission Controller.
                   </InfoTooltip>
                 </div>
               </TableHead>
@@ -134,7 +110,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                   hasMultipleChangedSubgraphs,
                   triggeredBySubgraphName,
                 }) => {
-                  const path = `${router.asPath.split("?")[0]}/${id}`;
+                  const path = `${router.asPath.split('?')[0]}/${id}`;
                   return (
                     <TableRow
                       key={id}
@@ -143,10 +119,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                     >
                       <TableCell>
                         <div className="flex flex-col items-start">
-                          <Link
-                            href={path}
-                            className="font-medium text-foreground"
-                          >
+                          <Link href={path} className="font-medium text-foreground">
                             {id}
                           </Link>
                           <Tooltip>
@@ -157,9 +130,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                                 })}
                               </span>
                             </TooltipTrigger>
-                            <TooltipContent side="bottom">
-                              {formatDateTime(new Date(createdAt))}
-                            </TooltipContent>
+                            <TooltipContent side="bottom">{formatDateTime(new Date(createdAt))}</TooltipContent>
                           </Tooltip>
                         </div>
                       </TableCell>
@@ -168,9 +139,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                           italic: hasMultipleChangedSubgraphs,
                         })}
                       >
-                        {hasMultipleChangedSubgraphs
-                          ? "Multiple Subgraphs"
-                          : triggeredBySubgraphName}
+                        {hasMultipleChangedSubgraphs ? 'Multiple Subgraphs' : triggeredBySubgraphName}
                       </TableCell>
                       <TableCell>{createdBy}</TableCell>
                       <TableCell>
@@ -178,40 +147,32 @@ const CompositionsPage: NextPageWithLayout = () => {
                           <TooltipTrigger>
                             <div className="flex items-center space-x-1">
                               {admissionError ? (
-                                <Badge
-                                  variant="outline"
-                                  className="gap-2 py-1.5"
-                                >
+                                <Badge variant="outline" className="gap-2 py-1.5">
                                   <MdNearbyError className="h-4 w-4 text-destructive" />
                                   <span>Error</span>
                                 </Badge>
                               ) : routerConfigSignature ? (
-                                <Badge
-                                  variant="outline"
-                                  className="gap-2 py-1.5"
-                                >
+                                <Badge variant="outline" className="gap-2 py-1.5">
                                   <MdVerifiedUser className="h-4 w-4 text-amber-500" />
                                   <span>Validated & Signed</span>
                                 </Badge>
                               ) : (
-                                "-"
+                                '-'
                               )}
                             </div>
                           </TooltipTrigger>
                           <TooltipContent side="bottom">
                             {admissionError ? (
                               <>
-                                {" "}
-                                This composition could not be validated due to
-                                an error in the Admission Controller Webhooks.
-                                Please open the composition details page to see
-                                the error.
+                                {' '}
+                                This composition could not be validated due to an error in the Admission Controller
+                                Webhooks. Please open the composition details page to see the error.
                               </>
                             ) : routerConfigSignature ? (
                               <>
-                                {" "}
-                                This composition has been validated and signed
-                                successfully by your Admission Controller.
+                                {' '}
+                                This composition has been validated and signed successfully by your Admission
+                                Controller.
                               </>
                             ) : null}
                           </TooltipContent>
@@ -223,10 +184,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                             {getCheckIcon(isComposable)} <span>Composes</span>
                           </Badge>
                           {isLatestValid && (
-                            <Badge
-                              variant="outline"
-                              className="gap-2 bg-success py-1.5"
-                            >
+                            <Badge variant="outline" className="gap-2 bg-success py-1.5">
                               <div className="h-2 w-2 rounded-full bg-white" />
                               <span>Ready to fetch</span>
                             </Badge>
@@ -234,12 +192,7 @@ const CompositionsPage: NextPageWithLayout = () => {
                         </div>
                       </TableCell>
                       <TableCell className="text-center">
-                        <Button
-                          asChild
-                          variant="ghost"
-                          size="sm"
-                          className="table-action"
-                        >
+                        <Button asChild variant="ghost" size="sm" className="table-action">
                           <Link href={path}>View</Link>
                         </Button>
                       </TableCell>
@@ -270,10 +223,7 @@ const CompositionToolbar = () => {
     range,
   } = useDateRangeQueryState();
 
-  const onDateRangeChange: DateRangePickerChangeHandler = ({
-    dateRange,
-    range,
-  }) => {
+  const onDateRangeChange: DateRangePickerChangeHandler = ({ dateRange, range }) => {
     if (range) {
       applyParams({
         range: range.toString(),
@@ -292,10 +242,7 @@ const CompositionToolbar = () => {
     }
   };
 
-  const breakingChangeRetention = useFeatureLimit(
-    "breaking-change-retention",
-    7,
-  );
+  const breakingChangeRetention = useFeatureLimit('breaking-change-retention', 7);
 
   return (
     <Toolbar>
@@ -311,15 +258,11 @@ const CompositionToolbar = () => {
 
 CompositionsPage.getLayout = (page) =>
   getGraphLayout(
-    <GraphPageLayout
-      title="Compositions"
-      subtitle="A record of compositions"
-      toolbar={<CompositionToolbar />}
-    >
+    <GraphPageLayout title="Compositions" subtitle="A record of compositions" toolbar={<CompositionToolbar />}>
       {page}
     </GraphPageLayout>,
     {
-      title: "Compositions",
+      title: 'Compositions',
     },
   );
 

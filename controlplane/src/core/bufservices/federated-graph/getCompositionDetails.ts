@@ -10,7 +10,8 @@ import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepos
 import { GraphCompositionRepository } from '../../repositories/GraphCompositionRepository.js';
 import { NamespaceRepository } from '../../repositories/NamespaceRepository.js';
 import type { RouterOptions } from '../../routes.js';
-import { enrichLogger, getLogger, handleError } from '../../util.js';
+import { UnauthorizedError } from '../../errors/errors.js';
+import { convertToSubgraphType, enrichLogger, getLogger, handleError } from '../../util.js';
 
 export function getCompositionDetails(
   opts: RouterOptions,
@@ -57,6 +58,13 @@ export function getCompositionDetails(
       };
     }
 
+    if (composition.targetId) {
+      const graph = await fedRepo.byTargetId(composition.targetId);
+      if (graph && !authContext.rbac.hasFederatedGraphReadAccess(graph)) {
+        throw new UnauthorizedError();
+      }
+    }
+
     const compositionSubgraphs = await compositionRepo.getCompositionSubgraphs({
       compositionId: req.compositionId,
     });
@@ -81,6 +89,7 @@ export function getCompositionDetails(
     const featureFlagCompositions = await featureFlagRepo.getFeatureFlagCompositionsByBaseSchemaVersion({
       baseSchemaVersionId: composition.schemaVersionId,
       namespaceId: namespace.id,
+      organizationId: authContext.organizationId,
     });
 
     return {
@@ -88,7 +97,10 @@ export function getCompositionDetails(
         code: EnumStatusCode.OK,
       },
       composition,
-      compositionSubgraphs,
+      compositionSubgraphs: compositionSubgraphs.map((subgraph) => ({
+        ...subgraph,
+        subgraphType: convertToSubgraphType(subgraph.subgraphType),
+      })),
       changeCounts: {
         additions: addCount,
         deletions: minusCount,

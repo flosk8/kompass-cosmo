@@ -3,37 +3,143 @@ import { printSchemaWithDirectives } from '@graphql-tools/utils';
 import {
   COMPOSITION_VERSION,
   ConfigurationData,
+  Costs,
   FieldConfiguration,
   ROOT_TYPE_NAMES,
   ROUTER_COMPATIBILITY_VERSIONS,
   SupportedRouterCompatibilityVersion,
+  TypeName,
 } from '@wundergraph/composition';
-import { GraphQLSchema, lexicographicSortSchema } from 'graphql';
 import {
   GraphQLSubscriptionProtocol,
   GraphQLWebsocketSubprotocol,
 } from '@wundergraph/cosmo-connect/dist/common/common_pb';
-
+import { GraphQLSchema, lexicographicSortSchema } from 'graphql';
+import { PartialMessage } from '@bufbuild/protobuf';
 import {
   ConfigurationVariable,
   ConfigurationVariableKind,
+  CostConfiguration,
   DataSourceConfiguration,
   DataSourceCustom_GraphQL,
   DataSourceCustomEvents,
+  CacheInvalidateConfiguration,
+  CachePopulateConfiguration,
   DataSourceKind,
   EngineConfiguration,
+  EntityCacheConfiguration,
+  EntityCachingConfiguration,
+  FieldListSizeConfiguration,
+  FieldWeightConfiguration,
   GraphQLSubscriptionConfiguration,
   GRPCConfiguration,
   GRPCMapping,
   HTTPMethod,
+  ImageReference,
   InternedString,
   PluginConfiguration,
   RouterConfig,
   TypeField,
 } from '@wundergraph/cosmo-connect/dist/node/v1/node_pb';
-import { PartialMessage } from '@bufbuild/protobuf';
-import { configurationDatasToDataSourceConfiguration, generateFieldConfigurations } from './graphql-configuration.js';
 import { invalidRouterCompatibilityVersion, normalizationFailureError } from './errors.js';
+import { configurationDatasToDataSourceConfiguration, generateFieldConfigurations } from './graphql-configuration.js';
+
+function costsToCostConfiguration(costs?: Costs): CostConfiguration | undefined {
+  if (!costs) {
+    return undefined;
+  }
+  if (
+    costs.fieldWeights.size === 0 &&
+    costs.listSizes.size === 0 &&
+    costs.typeWeights.size === 0 &&
+    costs.directiveArgumentWeights.size === 0
+  ) {
+    return undefined;
+  }
+  return new CostConfiguration({
+    fieldWeights: [...costs.fieldWeights.values()].map(
+      (fw) =>
+        new FieldWeightConfiguration({
+          ...fw,
+          argumentWeights: Object.fromEntries(fw.argumentWeights),
+          directiveArgumentWeights: Object.fromEntries(fw.directiveArgumentWeights),
+        }),
+    ),
+    listSizes: [...costs.listSizes.values()].map((ls) => new FieldListSizeConfiguration(ls)),
+    typeWeights: Object.fromEntries(costs.typeWeights),
+    directiveArgumentWeights: Object.fromEntries(costs.directiveArgumentWeights),
+  });
+}
+
+/**
+ * Convert the entity-caching configuration spread across a subgraph's `ConfigurationData` into the
+ * `EntityCaching` message. Add new entity-caching field types to the collection loop and the
+ * emptiness check below.
+ *
+ * @returns The `EntityCaching` message, or `undefined` when empty so the field is omitted (like
+ * `costsToCostConfiguration`).
+ */
+function extractEntityCachingConfiguration(
+  dataByTypeName?: Map<TypeName, ConfigurationData>,
+): EntityCachingConfiguration | undefined {
+  if (!dataByTypeName) {
+    return;
+  }
+  const entityCacheConfigurations: EntityCacheConfiguration[] = [];
+  const cacheInvalidateConfigurations: CacheInvalidateConfiguration[] = [];
+  const cachePopulateConfigurations: CachePopulateConfiguration[] = [];
+  for (const data of dataByTypeName.values()) {
+    if (!data.entityCaching) {
+      continue;
+    }
+
+    for (const config of data.entityCaching.entityCacheConfigurations) {
+      entityCacheConfigurations.push(
+        new EntityCacheConfiguration({
+          typeName: config.typeName,
+          maxAgeSeconds: BigInt(config.maxAgeSeconds),
+          notFoundCacheTtlSeconds: BigInt(config.notFoundCacheTtlSeconds),
+          includeHeaders: config.includeHeaders,
+          partialCacheLoad: config.partialCacheLoad,
+          shadowMode: config.shadowMode,
+        }),
+      );
+    }
+
+    for (const config of data.entityCaching?.cacheInvalidateConfigurations) {
+      cacheInvalidateConfigurations.push(
+        new CacheInvalidateConfiguration({
+          entityTypeName: config.entityTypeName,
+          fieldName: config.fieldName,
+          operationType: config.operationType,
+        }),
+      );
+    }
+
+    for (const config of data.entityCaching?.cachePopulateConfigurations) {
+      cachePopulateConfigurations.push(
+        new CachePopulateConfiguration({
+          entityTypeName: config.entityTypeName,
+          fieldName: config.fieldName,
+          operationType: config.operationType,
+          maxAgeSeconds: BigInt(config.maxAgeSeconds),
+        }),
+      );
+    }
+  }
+
+  if (
+    entityCacheConfigurations.length > 0 ||
+    cacheInvalidateConfigurations.length > 0 ||
+    cachePopulateConfigurations.length > 0
+  ) {
+    return new EntityCachingConfiguration({
+      cacheInvalidateConfigurations,
+      cachePopulateConfigurations,
+      entityCacheConfigurations,
+    });
+  }
+}
 
 export interface Input {
   federatedClientSDL: string;
@@ -63,23 +169,23 @@ export enum SubgraphKind {
 export type RouterSubgraph = ComposedSubgraph | ComposedSubgraphPlugin | ComposedSubgraphGRPC;
 
 export interface ComposedSubgraph {
-  kind: SubgraphKind.Standard;
+  readonly kind: SubgraphKind.Standard;
   id: string;
   name: string;
   sdl: string;
   url: string;
-  schemaVersionId?: string;
   subscriptionUrl: string;
   subscriptionProtocol?: SubscriptionProtocol | undefined;
   websocketSubprotocol?: WebsocketSubprotocol | undefined;
   // The intermediate representation of the engine configuration for the subgraph
-  configurationDataByTypeName?: Map<string, ConfigurationData>;
+  configurationDataByTypeName?: Map<TypeName, ConfigurationData>;
   // The normalized GraphQL schema for the subgraph
   schema?: GraphQLSchema;
+  costs?: Costs;
 }
 
 export interface ComposedSubgraphPlugin {
-  kind: SubgraphKind.Plugin;
+  readonly kind: SubgraphKind.Plugin;
   id: string;
   version: string;
   name: string;
@@ -88,13 +194,15 @@ export interface ComposedSubgraphPlugin {
   protoSchema: string;
   mapping: GRPCMapping;
   // The intermediate representation of the engine configuration for the subgraph
-  configurationDataByTypeName?: Map<string, ConfigurationData>;
+  configurationDataByTypeName?: Map<TypeName, ConfigurationData>;
   // The normalized GraphQL schema for the subgraph
   schema?: GraphQLSchema;
+  imageReference?: ImageReference;
+  costs?: Costs;
 }
 
 export interface ComposedSubgraphGRPC {
-  kind: SubgraphKind.GRPC;
+  readonly kind: SubgraphKind.GRPC;
   id: string;
   name: string;
   sdl: string;
@@ -102,9 +210,10 @@ export interface ComposedSubgraphGRPC {
   protoSchema: string;
   mapping: GRPCMapping;
   // The intermediate representation of the engine configuration for the subgraph
-  configurationDataByTypeName?: Map<string, ConfigurationData>;
+  configurationDataByTypeName?: Map<TypeName, ConfigurationData>;
   // The normalized GraphQL schema for the subgraph
   schema?: GraphQLSchema;
+  costs?: Costs;
 }
 
 export const internString = (config: EngineConfiguration, str: string): InternedString => {
@@ -200,6 +309,7 @@ export const buildRouterConfig = function (input: Input): RouterConfig {
           plugin: new PluginConfiguration({
             name: subgraph.name,
             version: subgraph.version,
+            imageReference: subgraph.imageReference,
           }),
         });
 
@@ -274,10 +384,12 @@ export const buildRouterConfig = function (input: Input): RouterConfig {
       // https://github.com/wundergraph/cosmo/blob/main/router/core/router.go#L342
       id: subgraph.id,
       childNodes,
+      costConfiguration: costsToCostConfiguration(subgraph.costs),
       customEvents,
       customGraphql,
       directives: [],
       entityInterfaces,
+      entityCachingConfiguration: extractEntityCachingConfiguration(subgraph.configurationDataByTypeName),
       interfaceObjects,
       keys,
       kind,

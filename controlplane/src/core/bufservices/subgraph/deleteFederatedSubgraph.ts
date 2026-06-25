@@ -6,6 +6,7 @@ import {
   DeleteFederatedSubgraphRequest,
   DeleteFederatedSubgraphResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import { FeatureFlagDTO } from '../../../types/index.js';
 import { AuditLogRepository } from '../../repositories/AuditLogRepository.js';
 import { FeatureFlagRepository } from '../../repositories/FeatureFlagRepository.js';
 import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
@@ -16,6 +17,7 @@ import { enrichLogger, getFederatedGraphRouterCompatibilityVersion, getLogger, h
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { ProposalRepository } from '../../repositories/ProposalRepository.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function deleteFederatedSubgraph(
   opts: RouterOptions,
@@ -29,7 +31,7 @@ export function deleteFederatedSubgraph(
     logger = enrichLogger(ctx, logger, authContext);
 
     const subgraphRepo = new SubgraphRepository(logger, opts.db, authContext.organizationId);
-    const proposalRepo = new ProposalRepository(opts.db);
+    const proposalRepo = new ProposalRepository(opts.db, authContext.organizationId);
     const namespaceRepo = new NamespaceRepository(opts.db, authContext.organizationId);
     const fedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
     const orgWebhooks = new OrganizationWebhookService(
@@ -37,6 +39,7 @@ export function deleteFederatedSubgraph(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
 
     req.namespace = req.namespace || DefaultNamespace;
@@ -83,12 +86,10 @@ export function deleteFederatedSubgraph(
     });
 
     let proposalMatchMessage: string | undefined;
-    let matchedEntity:
-      | {
-          proposalId: string;
-          proposalSubgraphId: string;
-        }
-      | undefined;
+    const matchedProposalEntities: {
+      proposalId: string;
+      proposalSubgraphId: string;
+    }[] = [];
     if (namespace.enableProposals) {
       const federatedGraphs = await fedGraphRepo.bySubgraphLabels({
         labels: subgraph.labels,
@@ -96,14 +97,15 @@ export function deleteFederatedSubgraph(
       });
       const proposalConfig = await proposalRepo.getProposalConfig({ namespaceId: namespace.id });
       if (proposalConfig) {
-        const match = await proposalRepo.matchSchemaWithProposal({
+        const matches = await proposalRepo.matchSchemaWithProposals({
           subgraphName: subgraph.name,
           namespaceId: namespace.id,
           schemaSDL: '',
           routerCompatibilityVersion: getFederatedGraphRouterCompatibilityVersion(federatedGraphs),
           isDeleted: true,
+          approvedOnly: true,
         });
-        if (!match) {
+        if (matches.length === 0) {
           if (proposalConfig.publishSeverityLevel === 'warn') {
             proposalMatchMessage = `The subgraph ${subgraph.name} is not proposed to be deleted in any of the approved proposals.`;
           } else {
@@ -119,7 +121,7 @@ export function deleteFederatedSubgraph(
             };
           }
         }
-        matchedEntity = match;
+        matchedProposalEntities.push(...matches);
       }
     }
 
@@ -130,11 +132,29 @@ export function deleteFederatedSubgraph(
         const featureFlagRepo = new FeatureFlagRepository(logger, tx, authContext.organizationId);
         const auditLogRepo = new AuditLogRepository(tx);
 
+        const affectedFeatureFlags: FeatureFlagDTO[] = [];
+
         let labels = subgraph.labels;
         if (subgraph.isFeatureSubgraph) {
           const baseSubgraph = await featureFlagRepo.getBaseSubgraphByFeatureSubgraphId({ id: subgraph.id });
           if (baseSubgraph) {
             labels = baseSubgraph.labels;
+            const enabledFeatureFlags = await featureFlagRepo.getFeatureFlagsByBaseSubgraphId({
+              baseSubgraphId: baseSubgraph.id,
+              namespaceId: namespace.id,
+              excludeDisabled: true,
+            });
+
+            for (const enabledFeatureFlag of enabledFeatureFlags) {
+              const featureFlag = await featureFlagRepo.getFeatureFlagById({
+                featureFlagId: enabledFeatureFlag.id,
+                namespaceId: namespace.id,
+              });
+
+              if (featureFlag) {
+                affectedFeatureFlags.push(featureFlag);
+              }
+            }
           }
         } else {
           await featureFlagRepo.deleteFeatureSubgraphsByBaseSubgraphId({
@@ -170,19 +190,71 @@ export function deleteFederatedSubgraph(
 
         // Recompose and deploy all affected federated graphs and their respective contracts.
         // Collects all composition and deployment errors if any.
-        const { compositionErrors, deploymentErrors, compositionWarnings } = await fedGraphRepo.composeAndDeployGraphs({
-          federatedGraphs: affectedFederatedGraphs,
-          blobStorage: opts.blobStorage,
-          admissionConfig: {
-            webhookJWTSecret: opts.admissionWebhookJWTSecret,
-            cdnBaseUrl: opts.cdnBaseUrl,
-          },
-          actorId: authContext.userId,
-          chClient: opts.chClient!,
-        });
+        const compositionService = new CompositionService(
+          tx,
+          authContext.organizationId,
+          logger,
+          { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+          opts.blobStorage,
+          opts.chClient,
+          opts.webhookProxyUrl,
+          req.disableResolvabilityValidation,
+        );
+
+        if (subgraph.isFeatureSubgraph) {
+          // To avoid having to re-fetch the feature flags for v2, we are just going to update the feature flag
+          // reference to remove the deleted feature subgraph, that way, we have an up-to-date view of the feature flag
+          for (const featureFlag of affectedFeatureFlags) {
+            featureFlag.featureSubgraphs = featureFlag.featureSubgraphs.filter((fs) => fs.id !== subgraph.id);
+          }
+        }
+
+        const { deploymentErrors, compositionErrors, compositionWarnings } =
+          await compositionService.recomposeAndDeployAffected({
+            actorId: authContext.userId,
+            affectedFederatedGraphs,
+            affectedFeatureFlags,
+            isFeatureSubgraph: subgraph.isFeatureSubgraph,
+          });
+
+        // Re-fetch the federated graphs to get the updated composedSchemaVersionId
+        const refreshedGraphs = await Promise.all(affectedFederatedGraphs.map((g) => fedGraphRepo.byId(g.id)));
+        for (let i = 0; i < affectedFederatedGraphs.length; i++) {
+          const refreshedGraph = refreshedGraphs[i];
+          if (refreshedGraph) {
+            affectedFederatedGraphs[i] = refreshedGraph;
+          }
+        }
 
         return { affectedFederatedGraphs, compositionErrors, deploymentErrors, compositionWarnings };
       });
+
+    // if this subgraph is part of a proposal, mark the proposal subgraph as published
+    // and if all proposal subgraphs are published, collect proposal details for the webhook
+    const proposalDetailsList: {
+      id: string;
+      name: string;
+      namespace: string;
+      federatedGraphId: string;
+    }[] = [];
+
+    for (const matchedEntity of matchedProposalEntities) {
+      const { allSubgraphsPublished } = await proposalRepo.markProposalSubgraphAsPublished({
+        proposalSubgraphId: matchedEntity.proposalSubgraphId,
+        proposalId: matchedEntity.proposalId,
+      });
+      if (allSubgraphsPublished) {
+        const proposal = await proposalRepo.ById(matchedEntity.proposalId);
+        if (proposal) {
+          proposalDetailsList.push({
+            id: proposal.proposal.id,
+            name: proposal.proposal.name,
+            namespace: req.namespace,
+            federatedGraphId: proposal.proposal.federatedGraphId,
+          });
+        }
+      }
+    }
 
     for (const affectedFederatedGraph of affectedFederatedGraphs) {
       const hasErrors =
@@ -196,6 +268,7 @@ export function deleteFederatedSubgraph(
               id: affectedFederatedGraph.id,
               name: affectedFederatedGraph.name,
               namespace: affectedFederatedGraph.namespace,
+              composedSchemaVersionId: affectedFederatedGraph.composedSchemaVersionId,
             },
             organization: {
               id: authContext.organizationId,
@@ -209,77 +282,48 @@ export function deleteFederatedSubgraph(
       );
     }
 
-    // if this subgraph is part of a proposal, mark the proposal subgraph as published
-    // and if all proposal subgraphs are published, update the proposal state to PUBLISHED
-    if (matchedEntity) {
-      const { allSubgraphsPublished } = await proposalRepo.markProposalSubgraphAsPublished({
-        proposalSubgraphId: matchedEntity.proposalSubgraphId,
-        proposalId: matchedEntity.proposalId,
-      });
-      if (allSubgraphsPublished) {
-        const proposal = await proposalRepo.ById(matchedEntity.proposalId);
-        if (proposal) {
-          const federatedGraph = await fedGraphRepo.byId(proposal.proposal.federatedGraphId);
-          if (federatedGraph) {
-            orgWebhooks.send(
-              {
-                eventName: OrganizationEventName.PROPOSAL_STATE_UPDATED,
-                payload: {
-                  federated_graph: {
-                    id: federatedGraph.id,
-                    name: federatedGraph.name,
-                    namespace: federatedGraph.namespace,
-                  },
-                  organization: {
-                    id: authContext.organizationId,
-                    slug: authContext.organizationSlug,
-                  },
-                  proposal: {
-                    id: proposal.proposal.id,
-                    name: proposal.proposal.name,
-                    namespace: req.namespace,
-                    state: 'PUBLISHED',
-                  },
-                  actor_id: authContext.userId,
-                },
+    // Send PROPOSAL_STATE_UPDATED webhook for each published proposal
+    for (const proposalDetails of proposalDetailsList) {
+      const federatedGraph = affectedFederatedGraphs.find((g) => g.id === proposalDetails.federatedGraphId);
+      if (federatedGraph) {
+        orgWebhooks.send(
+          {
+            eventName: OrganizationEventName.PROPOSAL_STATE_UPDATED,
+            payload: {
+              federated_graph: {
+                id: federatedGraph.id,
+                name: federatedGraph.name,
+                namespace: federatedGraph.namespace,
               },
-              authContext.userId,
-            );
-          }
-        }
+              organization: {
+                id: authContext.organizationId,
+                slug: authContext.organizationSlug,
+              },
+              proposal: {
+                id: proposalDetails.id,
+                name: proposalDetails.name,
+                namespace: proposalDetails.namespace,
+                state: 'PUBLISHED',
+              },
+              actor_id: authContext.userId,
+            },
+          },
+          authContext.userId,
+        );
       }
-    }
-
-    if (compositionErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED,
-        },
-        deploymentErrors: [],
-        compositionErrors,
-        compositionWarnings,
-        proposalMatchMessage,
-      };
-    }
-
-    if (deploymentErrors.length > 0) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR_DEPLOYMENT_FAILED,
-        },
-        deploymentErrors,
-        compositionErrors: [],
-        compositionWarnings,
-        proposalMatchMessage,
-      };
     }
 
     return {
       response: {
-        code: EnumStatusCode.OK,
+        code:
+          compositionErrors.length > 0
+            ? EnumStatusCode.ERR_SUBGRAPH_COMPOSITION_FAILED
+            : deploymentErrors.length > 0
+              ? EnumStatusCode.ERR_DEPLOYMENT_FAILED
+              : EnumStatusCode.OK,
       },
-      deploymentErrors: [],
-      compositionErrors: [],
+      deploymentErrors,
+      compositionErrors,
       compositionWarnings,
       proposalMatchMessage,
     };

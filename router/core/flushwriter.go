@@ -53,7 +53,7 @@ func (f *HttpFlushWriter) Complete() {
 		return
 	}
 	if f.sse {
-		_, _ = f.writer.Write([]byte("event: complete"))
+		_, _ = f.writer.Write([]byte("event: complete\ndata: \n\n"))
 	} else if f.multipart {
 		// Write the final boundary in the multipart response
 		if f.apolloSubscriptionMultipartPrintBoundary {
@@ -66,7 +66,7 @@ func (f *HttpFlushWriter) Complete() {
 	// Flush before closing the writer to ensure all data is sent
 	f.flusher.Flush()
 
-	f.Close(resolve.SubscriptionCloseKindNormal)
+	f.cancel()
 }
 
 func (f *HttpFlushWriter) Write(p []byte) (n int, err error) {
@@ -77,11 +77,39 @@ func (f *HttpFlushWriter) Write(p []byte) (n int, err error) {
 	return f.buf.Write(p)
 }
 
-func (f *HttpFlushWriter) Close(_ resolve.SubscriptionCloseKind) {
+func (f *HttpFlushWriter) Heartbeat() error {
+	if err := f.ctx.Err(); err != nil {
+		return err
+	}
+
+	var heartbeat []byte
+	if f.sse {
+		heartbeat = []byte(":heartbeat\n\n")
+
+		if _, err := f.writer.Write(heartbeat); err != nil {
+			return err
+		}
+
+		f.flusher.Flush()
+	} else if f.multipart {
+		if _, err := f.Write([]byte("{}")); err != nil {
+			return err
+		}
+
+		if err := f.Flush(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *HttpFlushWriter) Error(data []byte) {
 	if f.ctx.Err() != nil {
 		return
 	}
-
+	_, _ = f.buf.Write(data)
+	_ = f.Flush()
 	f.cancel()
 }
 
@@ -116,6 +144,12 @@ func (f *HttpFlushWriter) Flush() (err error) {
 		separation = ""
 	}
 
+	// resp sometimes ends with newlines. We need to remove them
+	// to cleanly add the seperation in the next step.
+	if bytes.HasSuffix(resp, []byte{'\n'}) {
+		resp = bytes.TrimRight(resp, "\n")
+	}
+
 	full := flushBreak + string(resp) + separation
 	_, err = f.writer.Write([]byte(full))
 	if err != nil {
@@ -126,7 +160,7 @@ func (f *HttpFlushWriter) Flush() (err error) {
 	f.flusher.Flush()
 
 	if f.subscribeOnce {
-		defer f.Close(resolve.SubscriptionCloseKindNormal)
+		defer f.cancel()
 	}
 
 	return nil
@@ -159,7 +193,7 @@ func GetSubscriptionResponseWriter(ctx *resolve.Context, r *http.Request, w http
 	flushWriter.ctx, flushWriter.cancel = context.WithCancel(ctx.Context())
 	ctx = ctx.WithContext(flushWriter.ctx)
 
-	if wgParams.UseMultipart {
+	if wgParams.UseMultipart || wgParams.UseSse {
 		ctx.ExecutionOptions.SendHeartbeat = true
 	}
 
@@ -186,7 +220,7 @@ func wrapMultipartMessage(resp []byte, wrapPayload bool) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	respValue, _, err := astjson.MergeValuesWithPath(payloadWrapper, respValuePreMerge, "payload")
+	respValue, _, err := astjson.MergeValuesWithPath(nil, payloadWrapper, respValuePreMerge, "payload")
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +259,7 @@ func NegotiateSubscriptionParams(r *http.Request, preferJson bool) SubscriptionP
 	// Eventually a solution will be in the stdlib: see https://github.com/golang/go/issues/19307, at which point we should
 	// remove this
 	var (
-		useMultipart = false
+		useMultipart bool
 		useSse       = q.Has(WgSseParam)
 		bestType     = ""
 		bestQ        = -1.0 // Default to lowest possible q-value

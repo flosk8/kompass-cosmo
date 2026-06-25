@@ -53,7 +53,20 @@ Additional Labels that are just rendered in metadata.labels
 {{- end }}
 
 {{/*
+Additional Pod Labels that are just rendered in metadata.labels
+*/}}
+{{- define "router.additionalPodLabels" -}}
+{{- range $key, $value := .Values.additionalPodLabels }}
+{{ $key }}: {{ quote $value }}
+{{- end }}
+{{- end }}
+
+{{/*
 Common labels
+Includes standard Kubernetes recommended labels, selector labels,
+and user-defined commonLabels. Note: commonLabels are rendered here
+(not in selectorLabels) to avoid adding mutable labels to immutable
+selector matchLabels.
 */}}
 {{- define "router.labels" -}}
 {{ $version := .Values.image.version | default .Chart.AppVersion | replace ":" "_" | trunc 63 -}}
@@ -61,17 +74,20 @@ helm.sh/chart: {{ include "router.chart" . }}
 {{ include "router.selectorLabels" . }}
 app.kubernetes.io/version: {{ $version | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- range $key, $value := .Values.commonLabels }}
+{{ $key }}: {{ quote $value }}
+{{- end }}
 {{- end }}
 
 {{/*
 Selector labels
+Used in spec.selector.matchLabels which are immutable after creation.
+Only include stable, deterministic labels here -- do not add commonLabels
+or other user-configurable values.
 */}}
 {{- define "router.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "router.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
-{{- range $key, $value := .Values.commonLabels }}
-{{ $key }}: {{ quote $value }}
-{{- end }}
 {{- end }}
 
 {{/*

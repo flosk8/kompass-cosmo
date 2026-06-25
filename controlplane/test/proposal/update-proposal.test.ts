@@ -1,7 +1,7 @@
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import { joinLabel } from '@wundergraph/cosmo-shared';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
-import { ProposalNamingConvention } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, onTestFinished, test, vi } from 'vitest';
+import { ProposalNamingConvention, ProposalOrigin } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import {
   afterAllSetup,
   beforeAllSetup,
@@ -49,14 +49,16 @@ async function createTestProposal(
     subgraphName: string;
     subgraphSchemaSDL: string;
     updatedSubgraphSDL: string;
+    origin?: ProposalOrigin;
   },
 ) {
-  const { federatedGraphName, proposalName, subgraphName, subgraphSchemaSDL, updatedSubgraphSDL } = options;
+  const { federatedGraphName, proposalName, subgraphName, subgraphSchemaSDL, updatedSubgraphSDL, origin } = options;
 
   const createProposalResponse = await client.createProposal({
     federatedGraphName,
     namespace: DEFAULT_NAMESPACE,
     name: proposalName,
+    origin: origin ?? ProposalOrigin.INTERNAL,
     subgraphs: [
       {
         name: subgraphName,
@@ -100,6 +102,7 @@ describe('Update proposal tests', () => {
         setupBilling: { plan: 'enterprise' },
         enabledFeatures: ['proposals'],
       });
+      onTestFinished(() => server.close());
 
       // Setup a federated graph with a single subgraph
       const subgraphName = genID('subgraph1');
@@ -171,8 +174,6 @@ describe('Update proposal tests', () => {
 
       expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
       expect(getProposalResponse.proposal?.state).toBe('APPROVED');
-
-      await server.close();
     },
   );
 
@@ -192,6 +193,7 @@ describe('Update proposal tests', () => {
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -255,17 +257,16 @@ describe('Update proposal tests', () => {
     });
 
     expect(updateProposalResponse.response?.code).toBe(EnumStatusCode.ERROR_NOT_AUTHORIZED);
-
-    await server.close();
   });
 
-  test('should update proposal state from DRAFT to CLOSED', async () => {
+  test('should update proposal state from DRAFT to CLOSED', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -332,17 +333,16 @@ describe('Update proposal tests', () => {
 
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.state).toBe('CLOSED');
-
-    await server.close();
   });
 
-  test('should update proposal schema changes', async () => {
+  test('should update proposal schema changes', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -429,17 +429,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.proposal?.subgraphs.length).toBe(1);
     expect(getProposalResponse.proposal?.subgraphs[0].name).toBe(subgraphName);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(furtherUpdatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should handle adding subgraphs to an existing proposal', async () => {
+  test('should handle adding subgraphs to an existing proposal', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with multiple subgraphs
     const subgraph1Name = genID('subgraph1');
@@ -512,6 +511,7 @@ describe('Update proposal tests', () => {
       federatedGraphName: fedGraphName,
       namespace: DEFAULT_NAMESPACE,
       name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
       subgraphs: [
         {
           name: subgraph1Name,
@@ -583,17 +583,16 @@ describe('Update proposal tests', () => {
     expect(subgraph2).toBeDefined();
     expect(subgraph1?.schemaSDL).toBe(updatedSubgraph1SDL);
     expect(subgraph2?.schemaSDL).toBe(updatedSubgraph2SDL);
-
-    await server.close();
   });
 
-  test('should handle removing subgraphs from an existing proposal', async () => {
+  test('should handle removing subgraphs from an existing proposal', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with multiple subgraphs
     const subgraph1Name = genID('subgraph1');
@@ -679,6 +678,7 @@ describe('Update proposal tests', () => {
       federatedGraphName: fedGraphName,
       namespace: DEFAULT_NAMESPACE,
       name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
       subgraphs: [
         {
           name: subgraph1Name,
@@ -730,17 +730,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.proposal?.subgraphs.length).toBe(1);
     expect(getProposalResponse.proposal?.subgraphs[0].name).toBe(subgraph1Name);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraph1SDL);
-
-    await server.close();
   });
 
-  test('should fail to update a non-existent proposal', async () => {
+  test('should fail to update a non-existent proposal', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -782,17 +781,16 @@ describe('Update proposal tests', () => {
 
     expect(updateProposalResponse.response?.code).toBe(EnumStatusCode.ERR_NOT_FOUND);
     expect(updateProposalResponse.response?.details).toContain(`Proposal ${nonExistentProposalName} not found`);
-
-    await server.close();
   });
 
-  test('should only allow updating proposal subgraphs when proposal is in DRAFT state', async () => {
+  test('should only allow updating proposal subgraphs when proposal is in DRAFT state', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -945,17 +943,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraphSDL);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).not.toBe(furtherUpdatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should not allow updating proposal subgraphs when proposal is in PUBLISHED state', async () => {
+  test('should not allow updating proposal subgraphs when proposal is in PUBLISHED state', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -1069,17 +1066,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraphSDL);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).not.toBe(furtherUpdatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should not allow updating proposal subgraphs when proposal is in CLOSED state', async () => {
+  test('should not allow updating proposal subgraphs when proposal is in CLOSED state', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -1184,17 +1180,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraphSDL);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).not.toBe(furtherUpdatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should fetch proposal checks after updating a proposal', async () => {
+  test('should fetch proposal checks after updating a proposal', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -1285,17 +1280,16 @@ describe('Update proposal tests', () => {
     expect(checksResponse.checks.length).toBe(2); // Two checks: initial and update
     expect(checksResponse.checks[0].id).toBe(updateProposalResponse.checkId); // Most recent first
     expect(checksResponse.checks[1].id).toBe(createProposalResponse.checkId);
-
-    await server.close();
   });
 
-  test('should successfully transition proposal through the full lifecycle', async () => {
+  test('should successfully transition proposal through the full lifecycle', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -1405,17 +1399,16 @@ describe('Update proposal tests', () => {
     expect(allProposalsResponse.proposals.length).toBe(1);
     expect(allProposalsResponse.proposals[0].id).toBe(createProposalResponse.proposalId);
     expect(allProposalsResponse.proposals[0].state).toBe('APPROVED');
-
-    await server.close();
   });
 
-  test('should change proposal state to PUBLISHED when all subgraphs have their schema published', async () => {
+  test('should change proposal state to PUBLISHED when all subgraphs have their schema published', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with two subgraphs
     const subgraph1Name = genID('subgraph1');
@@ -1502,6 +1495,7 @@ describe('Update proposal tests', () => {
       federatedGraphName: fedGraphName,
       namespace: DEFAULT_NAMESPACE,
       name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
       subgraphs: [
         {
           name: subgraph1Name,
@@ -1564,17 +1558,16 @@ describe('Update proposal tests', () => {
       proposalId: createProposalResponse.proposalId,
     });
     expect(proposalResponse.proposal?.state).toBe('PUBLISHED');
-
-    await server.close();
   });
 
-  test('should change proposal state to PUBLISHED when a subgraph proposed for deletion is deleted', async () => {
+  test('should change proposal state to PUBLISHED when a subgraph proposed for deletion is deleted', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with two subgraphs
     const subgraph1Name = genID('subgraph1');
@@ -1649,6 +1642,7 @@ describe('Update proposal tests', () => {
       federatedGraphName: fedGraphName,
       namespace: DEFAULT_NAMESPACE,
       name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
       subgraphs: [
         {
           name: subgraph1Name,
@@ -1712,17 +1706,16 @@ describe('Update proposal tests', () => {
       proposalId: createProposalResponse.proposalId,
     });
     expect(proposalResponse.proposal?.state).toBe('PUBLISHED');
-
-    await server.close();
   });
 
-  test('should change proposal state to PUBLISHED when a newly added subgraph is published', async () => {
+  test('should change proposal state to PUBLISHED when a newly added subgraph is published', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with one existing subgraph
     const existingSubgraphName = genID('existing-subgraph');
@@ -1776,6 +1769,7 @@ describe('Update proposal tests', () => {
       federatedGraphName: fedGraphName,
       namespace: DEFAULT_NAMESPACE,
       name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
       subgraphs: [
         {
           name: newSubgraphName,
@@ -1823,17 +1817,16 @@ describe('Update proposal tests', () => {
       proposalId: createProposalResponse.proposalId,
     });
     expect(proposalResponse.proposal?.state).toBe('PUBLISHED');
-
-    await server.close();
   });
 
-  test('should fail to update a proposal with "updatedSubgraphs" when no subgraphs are passed', async () => {
+  test('should fail to update a proposal with "updatedSubgraphs" when no subgraphs are passed', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -1906,17 +1899,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.subgraphs.length).toBe(1);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should fail to update a proposal when subgraphs are duplicated', async () => {
+  test('should fail to update a proposal when subgraphs are duplicated', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const subgraphName = genID('subgraph1');
@@ -2021,17 +2013,16 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
     expect(getProposalResponse.proposal?.subgraphs.length).toBe(1);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(initialUpdatedSubgraphSDL);
-
-    await server.close();
   });
 
-  test('should fail to update a proposal with conflicting operations on the same subgraph', async () => {
+  test('should fail to update a proposal with conflicting operations on the same subgraph', async (testContext) => {
     const { client, server } = await SetupTest({
       dbname,
       chClient,
       setupBilling: { plan: 'enterprise' },
       enabledFeatures: ['proposals'],
     });
+    testContext.onTestFinished(() => server.close());
 
     // Setup a federated graph with a single subgraph
     const existingSubgraphName = genID('existing-subgraph');
@@ -2135,7 +2126,216 @@ describe('Update proposal tests', () => {
     expect(getProposalResponse.proposal?.subgraphs.length).toBe(1);
     expect(getProposalResponse.proposal?.subgraphs[0].name).toBe(existingSubgraphName);
     expect(getProposalResponse.proposal?.subgraphs[0].schemaSDL).toBe(updatedSubgraphSDL);
+  });
 
-    await server.close();
+  test('should fail to update a proposal created from hub', async (testContext) => {
+    const { client, server } = await SetupTest({
+      dbname,
+      chClient,
+      setupBilling: { plan: 'enterprise' },
+      enabledFeatures: ['proposals'],
+    });
+    testContext.onTestFinished(() => server.close());
+
+    // Setup a federated graph with a single subgraph
+    const existingSubgraphName = genID('existing-subgraph');
+    const fedGraphName = genID('fedGraph');
+    const label = genUniqueLabel('label');
+    const proposalName = genID('proposal');
+    const newSubgraphName = genID('new-subgraph');
+
+    const subgraphSchemaSDL = `
+      type Query {
+        hello: String!
+      }
+    `;
+
+    await createThenPublishSubgraph(
+      client,
+      existingSubgraphName,
+      DEFAULT_NAMESPACE,
+      subgraphSchemaSDL,
+      [label],
+      DEFAULT_SUBGRAPH_URL_ONE,
+    );
+
+    await createFederatedGraph(client, fedGraphName, DEFAULT_NAMESPACE, [joinLabel(label)], DEFAULT_ROUTER_URL);
+
+    // Enable proposals for the namespace
+    const enableResponse = await enableProposalsForNamespace(client);
+    expect(enableResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    // Create initial proposal with just an update to the existing subgraph
+    const updatedSubgraphSDL = `
+      type Query {
+        hello: String!
+        newField: Int!
+      }
+    `;
+
+    const createProposalResponse = await createTestProposal(client, {
+      federatedGraphName: fedGraphName,
+      proposalName,
+      subgraphName: existingSubgraphName,
+      subgraphSchemaSDL,
+      updatedSubgraphSDL,
+      origin: ProposalOrigin.EXTERNAL,
+    });
+
+    expect(createProposalResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    // Define a schema for a new subgraph
+    const newSubgraphSchemaSDL = `
+      type Query {
+        products: [Product!]!
+      }
+      
+      type Product {
+        id: ID!
+        name: String!
+        price: Float!
+      }
+    `;
+
+    // Try to update the proposal with conflicting operations on the same subgraph
+    const updateProposalResponse = await client.updateProposal({
+      proposalName: createProposalResponse.proposalName,
+      federatedGraphName: fedGraphName,
+      namespace: DEFAULT_NAMESPACE,
+      updateAction: {
+        case: 'updatedSubgraphs',
+        value: {
+          subgraphs: [
+            {
+              name: newSubgraphName,
+              schemaSDL: newSubgraphSchemaSDL,
+              isDeleted: false,
+              isNew: true,
+              labels: [label],
+            },
+          ],
+        },
+      },
+    });
+
+    // Expect an error response
+    expect(updateProposalResponse.response?.code).toBe(EnumStatusCode.ERR_NOT_FOUND);
+    expect(updateProposalResponse.response?.details).toMatch(new RegExp(`Proposal .*${proposalName} not found`));
+  });
+
+  test('should update a proposal that includes an existing subgraph which has never been published', async () => {
+    const { client, server } = await SetupTest({
+      dbname,
+      chClient,
+      setupBilling: { plan: 'enterprise' },
+      enabledFeatures: ['proposals'],
+    });
+    onTestFinished(() => server.close());
+
+    const publishedSubgraphName = genID('subgraph1');
+    const unpublishedSubgraphName = genID('subgraph2');
+    const fedGraphName = genID('fedGraph');
+    const label = genUniqueLabel('label');
+    const proposalName = genID('proposal');
+
+    const publishedSubgraphSDL = `
+      type Query {
+        hello: String!
+      }
+    `;
+
+    // A published subgraph so the federated graph has a valid composition.
+    await createThenPublishSubgraph(
+      client,
+      publishedSubgraphName,
+      DEFAULT_NAMESPACE,
+      publishedSubgraphSDL,
+      [label],
+      DEFAULT_SUBGRAPH_URL_ONE,
+    );
+
+    // A subgraph that belongs to the federated graph (matching label) but has
+    // never been published, so it has no current schema version.
+    const createUnpublishedResponse = await client.createFederatedSubgraph({
+      name: unpublishedSubgraphName,
+      namespace: DEFAULT_NAMESPACE,
+      labels: [label],
+      routingUrl: DEFAULT_SUBGRAPH_URL_TWO,
+    });
+    expect(createUnpublishedResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    await createFederatedGraph(client, fedGraphName, DEFAULT_NAMESPACE, [joinLabel(label)], DEFAULT_ROUTER_URL);
+
+    const enableResponse = await enableProposalsForNamespace(client);
+    expect(enableResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    const updatedPublishedSDL = `
+      type Query {
+        hello: String!
+        world: String!
+      }
+    `;
+
+    const createProposalResponse = await client.createProposal({
+      federatedGraphName: fedGraphName,
+      namespace: DEFAULT_NAMESPACE,
+      name: proposalName,
+      origin: ProposalOrigin.INTERNAL,
+      subgraphs: [
+        {
+          name: publishedSubgraphName,
+          schemaSDL: updatedPublishedSDL,
+          isDeleted: false,
+          isNew: false,
+          labels: [],
+        },
+      ],
+      namingConvention: ProposalNamingConvention.INCREMENTAL,
+    });
+    expect(createProposalResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    const unpublishedSubgraphSDL = `
+      type Query {
+        goodbye: String!
+      }
+    `;
+
+    // Updating the proposal to include the unpublished subgraph must not fail
+    // with an invalid-UUID error: its missing current schema version should be
+    // stored as null rather than an empty string.
+    const updateProposalResponse = await client.updateProposal({
+      proposalName: createProposalResponse.proposalName,
+      federatedGraphName: fedGraphName,
+      namespace: DEFAULT_NAMESPACE,
+      updateAction: {
+        case: 'updatedSubgraphs',
+        value: {
+          subgraphs: [
+            {
+              name: publishedSubgraphName,
+              schemaSDL: updatedPublishedSDL,
+              isDeleted: false,
+              isNew: false,
+              labels: [],
+            },
+            {
+              name: unpublishedSubgraphName,
+              schemaSDL: unpublishedSubgraphSDL,
+              isDeleted: false,
+              isNew: false,
+              labels: [],
+            },
+          ],
+        },
+      },
+    });
+    expect(updateProposalResponse.response?.code).toBe(EnumStatusCode.OK);
+
+    const getProposalResponse = await client.getProposal({
+      proposalId: createProposalResponse.proposalId,
+    });
+    expect(getProposalResponse.response?.code).toBe(EnumStatusCode.OK);
+    expect(getProposalResponse.proposal?.subgraphs.length).toBe(2);
+    expect(getProposalResponse.proposal?.subgraphs.some((sg) => sg.name === unpublishedSubgraphName)).toBe(true);
   });
 });

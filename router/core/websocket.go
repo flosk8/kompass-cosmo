@@ -20,26 +20,30 @@ import (
 	"github.com/gobwas/ws/wsutil"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"github.com/wundergraph/astjson"
-	"go.uber.org/atomic"
-	"go.uber.org/zap"
-
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/netpoll"
-
 	"github.com/wundergraph/cosmo/router/internal/expr"
+	"github.com/wundergraph/cosmo/router/internal/persistedoperation"
 	"github.com/wundergraph/cosmo/router/internal/wsproto"
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
 	"github.com/wundergraph/cosmo/router/pkg/config"
 	"github.com/wundergraph/cosmo/router/pkg/logging"
 	"github.com/wundergraph/cosmo/router/pkg/statistics"
 	rtrace "github.com/wundergraph/cosmo/router/pkg/trace"
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/netpoll"
+	"go.uber.org/atomic"
+	"go.uber.org/zap"
 )
 
-var (
-	errClientTerminatedConnection = errors.New("client terminated connection")
-)
+// errClientTerminatedConnection is returned by HandleMessage when the client
+// sends a terminate message. It surfaces as *wsproto.CloseError so the read
+// loops handle it via the same errors.As path as any other close-kind error.
+var errClientTerminatedConnection = &wsproto.CloseError{
+	Err:  errors.New("client terminated connection"),
+	Kind: wsproto.CloseKindNormal,
+}
 
 type WebsocketMiddlewareOptions struct {
 	OperationProcessor *OperationProcessor
@@ -67,7 +71,6 @@ type WebsocketMiddlewareOptions struct {
 }
 
 func NewWebsocketMiddleware(ctx context.Context, opts WebsocketMiddlewareOptions) func(http.Handler) http.Handler {
-
 	handler := &WebsocketHandler{
 		ctx:                       ctx,
 		operationProcessor:        opts.OperationProcessor,
@@ -166,7 +169,6 @@ func newWSConnectionWrapper(conn net.Conn, readTimeout, writeTimeout time.Durati
 }
 
 func (c *wsConnectionWrapper) ReadJSON(v any) error {
-
 	if c.readTimeout > 0 {
 		err := c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
 		if err != nil {
@@ -183,7 +185,6 @@ func (c *wsConnectionWrapper) ReadJSON(v any) error {
 }
 
 func (c *wsConnectionWrapper) WriteText(text string) error {
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -269,9 +270,7 @@ type WebsocketHandler struct {
 }
 
 func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.Request) {
-	var (
-		subProtocol string
-	)
+	var subProtocol string
 
 	requestID := middleware.GetReqID(r.Context())
 	requestContext := getRequestContext(r.Context())
@@ -335,7 +334,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 	// We can parse the request options before creating the handler
 	// this avoids touching the client request across goroutines
 
-	executionOptions, traceOptions, err := h.preHandler.parseRequestOptions(r, clientInfo, requestLogger)
+	executionOptions, traceOptions, err := h.preHandler.parseExecutionAndTraceOptions(r, clientInfo, requestLogger)
 	if err != nil {
 		requestLogger.Error("Parse request options", zap.Error(err))
 		_ = c.Close()
@@ -365,7 +364,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 		Protocol:                     protocol,
 		Logger:                       requestLogger,
 		Stats:                        h.stats,
-		ConnectionID:                 resolve.ConnectionIDs.Inc(),
+		ConnectionID:                 resolve.NewConnectionID(),
 		ClientInfo:                   clientInfo,
 		InitRequestID:                requestID,
 		ForwardUpgradeHeaders:        h.forwardUpgradeHeadersConfig,
@@ -382,7 +381,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 
 		requestLogger.Debug("Initializing websocket connection", zap.Error(err))
 
-		handler.Close(false)
+		handler.Close(false, wsproto.CloseKindOf(err))
 		return
 	}
 
@@ -397,12 +396,14 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 			handler.request, err = h.accessController.Access(w, r)
 			if err != nil {
 				statusCode := http.StatusForbidden
+				errorMessage := err
 				if errors.Is(err, ErrUnauthorized) {
 					statusCode = http.StatusUnauthorized
+					errorMessage = ErrUnauthorized
 				}
 				http.Error(handler.w, http.StatusText(statusCode), statusCode)
-				_ = handler.writeErrorMessage(requestID, err)
-				handler.Close(false)
+				_ = handler.writeErrorMessage(requestID, errorMessage)
+				handler.Close(false, wsproto.CloseKindNormal)
 				return
 			}
 		}
@@ -414,7 +415,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 			if err != nil {
 				requestLogger.Error("Error parsing initial payload: %v", zap.Error(err))
 				_ = handler.writeErrorMessage(requestID, err)
-				handler.Close(false)
+				handler.Close(false, wsproto.CloseKindNormal)
 				return
 			}
 			jwtToken, ok := initialPayloadMap[fromInitialPayloadConfig.Key].(string)
@@ -422,7 +423,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 				err := fmt.Errorf("invalid JWT token in initial payload: JWT token is not a string")
 				requestLogger.Error(err.Error())
 				_ = handler.writeErrorMessage(requestID, err)
-				handler.Close(false)
+				handler.Close(false, wsproto.CloseKindNormal)
 				return
 			}
 			handler.request.Header.Set(fromInitialPayloadConfig.ExportToken.HeaderKey, jwtToken)
@@ -436,7 +437,7 @@ func (h *WebsocketHandler) handleUpgradeRequest(w http.ResponseWriter, r *http.R
 		err = h.addConnection(c, handler)
 		if err != nil {
 			requestLogger.Error("Adding connection to net poller", zap.Error(err))
-			handler.Close(true)
+			handler.Close(true, wsproto.CloseKindNormal)
 		}
 		return
 	}
@@ -450,11 +451,11 @@ func (h *WebsocketHandler) handleConnectionSync(handler *WebSocketConnectionHand
 	h.stats.ConnectionsInc()
 	defer h.stats.ConnectionsDec()
 	serverDone := h.ctx.Done()
-	defer handler.Close(true)
 
 	for {
 		select {
 		case <-serverDone:
+			handler.Close(true, wsproto.CloseKindGoingAway)
 			return
 		default:
 			msg, err := handler.protocol.ReadMessage()
@@ -462,13 +463,16 @@ func (h *WebsocketHandler) handleConnectionSync(handler *WebSocketConnectionHand
 				if isReadTimeout(err) {
 					continue
 				}
-				h.logger.Debug("Client closed connection")
+				h.logger.Debug("Client closed connection", zap.Error(err))
+				handler.Close(true, wsproto.CloseKindOf(err))
 				return
 			}
 			err = h.HandleMessage(handler, msg)
 			if err != nil {
 				h.logger.Debug("Handling websocket message", zap.Error(err))
-				if errors.Is(err, errClientTerminatedConnection) {
+				var closeErr *wsproto.CloseError
+				if errors.As(err, &closeErr) {
+					handler.Close(true, closeErr.Kind)
 					return
 				}
 			}
@@ -488,7 +492,7 @@ func (h *WebsocketHandler) addConnection(conn net.Conn, handler *WebSocketConnec
 	return h.netPoll.Add(conn)
 }
 
-func (h *WebsocketHandler) removeConnection(conn net.Conn, handler *WebSocketConnectionHandler, fd int) {
+func (h *WebsocketHandler) removeConnection(conn net.Conn, handler *WebSocketConnectionHandler, fd int, closeKind wsproto.CloseKind) {
 	h.stats.ConnectionsDec()
 	h.connectionsMu.Lock()
 	delete(h.connections, fd)
@@ -497,7 +501,7 @@ func (h *WebsocketHandler) removeConnection(conn net.Conn, handler *WebSocketCon
 	if err != nil {
 		h.logger.Warn("Removing connection from net poller", zap.Error(err))
 	}
-	handler.Close(true)
+	handler.Close(true, closeKind)
 }
 
 func socketFd(conn net.Conn) int {
@@ -532,13 +536,12 @@ func isReadTimeout(err error) bool {
 func (h *WebsocketHandler) runPoller() {
 	done := h.ctx.Done()
 	defer func() {
-		h.connectionsMu.Lock()
-		_ = h.netPoll.Close(true)
-		h.connectionsMu.Unlock()
+		_ = h.netPoll.Close(false)
 	}()
 	for {
 		select {
 		case <-done:
+			h.closeAllConnections()
 			return
 		default:
 			connections, err := h.netPoll.Wait(128)
@@ -564,26 +567,48 @@ func (h *WebsocketHandler) runPoller() {
 
 				if fd == 0 {
 					h.logger.Debug("Invalid socket fd", zap.Int("fd", fd))
-					h.removeConnection(conn, handler, fd)
+					h.removeConnection(conn, handler, fd, wsproto.CloseKindNormal)
 					continue
 				}
 
 				msg, err := handler.protocol.ReadMessage()
 				if err != nil {
+					if isReadTimeout(err) {
+						continue
+					}
 					h.logger.Debug("Client closed connection", zap.Error(err))
-					h.removeConnection(conn, handler, fd)
+					h.removeConnection(conn, handler, fd, wsproto.CloseKindOf(err))
 					continue
 				}
 				err = h.HandleMessage(handler, msg)
 				if err != nil {
 					h.logger.Debug("Handling websocket message", zap.Error(err))
-					if errors.Is(err, errClientTerminatedConnection) {
-						h.removeConnection(conn, handler, fd)
+
+					// Only closeErr closes, which is why we're not using wsproto.CloseKindOf,
+					// which defaults to CloseKindNormal
+					var closeErr *wsproto.CloseError
+					if errors.As(err, &closeErr) {
+						h.removeConnection(conn, handler, fd, closeErr.Kind)
 						continue
 					}
 				}
 			}
 		}
+	}
+}
+
+func (h *WebsocketHandler) closeAllConnections() {
+	h.connectionsMu.Lock()
+	handlers := make([]*WebSocketConnectionHandler, 0, len(h.connections))
+	for fd, handler := range h.connections {
+		handlers = append(handlers, handler)
+		delete(h.connections, fd)
+	}
+	h.connectionsMu.Unlock()
+
+	for _, handler := range handlers {
+		h.stats.ConnectionsDec()
+		handler.Close(true, wsproto.CloseKindGoingAway)
 	}
 }
 
@@ -596,12 +621,15 @@ type websocketResponseWriter struct {
 	logger          *zap.Logger
 	stats           statistics.EngineStatistics
 	propagateErrors bool
+	subscriptions   *sync.Map
 }
 
-var _ http.ResponseWriter = (*websocketResponseWriter)(nil)
-var _ resolve.SubscriptionResponseWriter = (*websocketResponseWriter)(nil)
+var (
+	_ http.ResponseWriter                = (*websocketResponseWriter)(nil)
+	_ resolve.SubscriptionResponseWriter = (*websocketResponseWriter)(nil)
+)
 
-func newWebsocketResponseWriter(id string, protocol wsproto.Proto, propagateErrors bool, logger *zap.Logger, stats statistics.EngineStatistics) *websocketResponseWriter {
+func newWebsocketResponseWriter(id string, protocol wsproto.Proto, propagateErrors bool, logger *zap.Logger, stats statistics.EngineStatistics, subscriptions *sync.Map) *websocketResponseWriter {
 	return &websocketResponseWriter{
 		id:              id,
 		protocol:        protocol,
@@ -609,6 +637,7 @@ func newWebsocketResponseWriter(id string, protocol wsproto.Proto, propagateErro
 		logger:          logger.With(zap.String("subscription_id", id)),
 		stats:           stats,
 		propagateErrors: propagateErrors,
+		subscriptions:   subscriptions,
 	}
 }
 
@@ -621,16 +650,52 @@ func (rw *websocketResponseWriter) WriteHeader(statusCode int) {
 }
 
 func (rw *websocketResponseWriter) Complete() {
+	if rw.subscriptions != nil {
+		rw.subscriptions.Delete(rw.id)
+	}
 	err := rw.protocol.Complete(rw.id)
 	if err != nil {
 		rw.logger.Debug("Sending complete message", zap.Error(err))
 	}
 }
 
-func (rw *websocketResponseWriter) Close(kind resolve.SubscriptionCloseKind) {
-	err := rw.protocol.Close(kind.WSCode, kind.Reason)
-	if err != nil {
+// Heartbeat is a no-op function for WebSocket subscriptions.
+func (rw *websocketResponseWriter) Heartbeat() error {
+	return nil
+}
+
+// Error delivers a terminal error payload. The subscription will not
+// produce any further messages after this call, so protocols that need
+// an explicit termination frame (subscriptions-transport-ws: complete
+// after data+errors) emit it here. Non-terminal per-update errors must
+// use Flush with errors buffered via Write, which keeps the subscription
+// alive.
+func (rw *websocketResponseWriter) Error(data []byte) {
+	if rw.subscriptions != nil {
+		rw.subscriptions.Delete(rw.id)
+	}
+	var errors json.RawMessage
+	if rw.propagateErrors {
+		errorsResult := gjson.GetBytes(data, "errors")
+		if errorsResult.Type == gjson.JSON {
+			errors = json.RawMessage(errorsResult.Raw)
+		} else {
+			errors = data
+		}
+	} else {
+		errors = json.RawMessage(`[{"message":"Unable to subscribe"}]`)
+	}
+	if err := rw.protocol.WriteGraphQLErrors(rw.id, errors, nil); err != nil {
 		rw.logger.Debug("Sending error message", zap.Error(err))
+		return
+	}
+	// subscriptions-transport-ws clients rely on an explicit "complete" to end
+	// the stream after a data+errors frame. graphql-transport-ws treats the
+	// "error" frame as terminal per spec, so no follow-up is needed there.
+	if rw.protocol.Subprotocol() == wsproto.SubscriptionsTransportWSSubprotocol {
+		if err := rw.protocol.Complete(rw.id); err != nil {
+			rw.logger.Debug("Sending complete after error", zap.Error(err))
+		}
 	}
 }
 
@@ -641,7 +706,6 @@ func (rw *websocketResponseWriter) Write(data []byte) (int, error) {
 
 func (rw *websocketResponseWriter) Flush() error {
 	if rw.buf.Len() > 0 {
-		rw.logger.Debug("flushing", zap.Int("bytes", rw.buf.Len()))
 		payload := rw.buf.Bytes()
 		var extensions []byte
 		var err error
@@ -655,17 +719,17 @@ func (rw *websocketResponseWriter) Flush() error {
 			}
 		}
 
-		// Check if the result is an error
-		errorsResult := gjson.GetBytes(payload, "errors")
-		if errorsResult.Type == gjson.JSON {
-			if rw.propagateErrors {
-				err = rw.protocol.WriteGraphQLErrors(rw.id, json.RawMessage(errorsResult.Raw), extensions)
-			} else {
-				err = rw.protocol.WriteGraphQLErrors(rw.id, json.RawMessage(`[{"message":"Unable to subscribe"}]`), extensions)
+		// Errors inside the buffered payload are emitted inline as part of the
+		// execution result (a non-terminal "next"/"data" frame) so the
+		// subscription stays alive. Terminal errors go through Error, which uses
+		// the protocol-level error frame.
+		if !rw.propagateErrors {
+			if errorsResult := gjson.GetBytes(payload, "errors"); errorsResult.Type == gjson.JSON {
+				payload, _ = sjson.SetRawBytes(payload, "errors", []byte(`[{"message":"Unable to subscribe"}]`))
 			}
-		} else {
-			err = rw.protocol.WriteGraphQLData(rw.id, payload, extensions)
 		}
+
+		err = rw.protocol.WriteGraphQLData(rw.id, payload, extensions)
 		rw.buf.Reset()
 		if err != nil {
 			return err
@@ -699,7 +763,7 @@ type WebSocketConnectionHandlerOptions struct {
 	Logger                       *zap.Logger
 	Stats                        statistics.EngineStatistics
 	PlanOptions                  PlanOptions
-	ConnectionID                 int64
+	ConnectionID                 resolve.ConnectionID
 	ClientInfo                   *ClientInfo
 	InitRequestID                string
 	ForwardUpgradeHeaders        forwardConfig
@@ -731,7 +795,7 @@ type WebSocketConnectionHandler struct {
 	upgradeRequestQueryParams json.RawMessage
 
 	initRequestID   string
-	connectionID    int64
+	connectionID    resolve.ConnectionID
 	subscriptionIDs atomic.Int64
 	subscriptions   sync.Map
 	stats           statistics.EngineStatistics
@@ -756,9 +820,7 @@ type forwardConfig struct {
 	regexAllowList      []*regexp.Regexp
 }
 
-var (
-	detectNonRegex = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-)
+var detectNonRegex = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func NewWebsocketConnectionHandler(ctx context.Context, opts WebSocketConnectionHandlerOptions) *WebSocketConnectionHandler {
 	return &WebSocketConnectionHandler{
@@ -798,10 +860,24 @@ func (h *WebSocketConnectionHandler) requestError(err error) error {
 }
 
 func (h *WebSocketConnectionHandler) writeErrorMessage(operationID string, err error) error {
-	gqlErrors := []graphqlError{
-		{Message: err.Error()},
+	var gqlErr graphqlError
+
+	var poNotFoundErr *persistedoperation.PersistentOperationNotFoundError
+	switch {
+	case errors.As(err, &poNotFoundErr):
+		// We follow the same pattern of not mentioning the sha256hash
+		// in the normal http requests for the same case
+		gqlErr = graphqlError{
+			Message: "PersistedQueryNotFound",
+			Extensions: &Extensions{
+				Code: ExtCodeErrPersistedQueryNotFound,
+			},
+		}
+	default:
+		gqlErr = graphqlError{Message: err.Error()}
 	}
-	payload, err := json.Marshal(gqlErrors)
+
+	payload, err := json.Marshal([]graphqlError{gqlErr})
 	if err != nil {
 		return fmt.Errorf("encoding GraphQL errors: %w", err)
 	}
@@ -809,7 +885,6 @@ func (h *WebSocketConnectionHandler) writeErrorMessage(operationID string, err e
 }
 
 func (h *WebSocketConnectionHandler) parseAndPlan(registration *SubscriptionRegistration) (*ParsedOperation, *operationContext, error) {
-
 	operationKit, err := h.operationProcessor.NewKit()
 	if err != nil {
 		return nil, nil, err
@@ -831,10 +906,39 @@ func (h *WebSocketConnectionHandler) parseAndPlan(registration *SubscriptionRegi
 		isApq     bool
 	)
 
-	if operationKit.parsedOperation.IsPersistedOperation {
-		skipParse, isApq, err = operationKit.FetchPersistedOperation(h.ctx, h.clientInfo)
+	if h.shouldComputeOperationSha256(operationKit) {
+		err = operationKit.ComputeOperationSha256()
 		if err != nil {
 			return nil, nil, err
+		}
+
+		// Ensure if operation has both hash and query, that the hash matches the query
+		if operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash() && operationKit.parsedOperation.Request.Query != "" {
+			if operationKit.parsedOperation.Sha256Hash != operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash {
+				return nil, nil, errors.New("persistedQuery sha256 hash does not match query body")
+			}
+		}
+
+		if h.operationBlocker.safelistEnabled || h.operationBlocker.logUnknownOperationsEnabled {
+			// Set the request hash to the parsed hash, to see if it matches a persisted operation
+			operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery = &GraphQLRequestExtensionsPersistedQuery{
+				Sha256Hash: operationKit.parsedOperation.Sha256Hash,
+			}
+		}
+	}
+
+	if operationKit.parsedOperation.IsPersistedOperation || h.operationBlocker.safelistEnabled || h.operationBlocker.logUnknownOperationsEnabled {
+		skipParse, isApq, err = operationKit.FetchPersistedOperation(h.ctx, h.clientInfo)
+		if err != nil {
+			var poNotFoundErr *persistedoperation.PersistentOperationNotFoundError
+			if h.operationBlocker.logUnknownOperationsEnabled && errors.As(err, &poNotFoundErr) {
+				h.logger.Warn("Unknown persisted operation found", zap.String("query", operationKit.parsedOperation.Request.Query), zap.String("sha256Hash", poNotFoundErr.Sha256Hash))
+				if h.operationBlocker.safelistEnabled {
+					return nil, nil, err
+				}
+			} else {
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -868,18 +972,21 @@ func (h *WebSocketConnectionHandler) parseAndPlan(registration *SubscriptionRegi
 		opContext.normalizationTime = time.Since(startNormalization)
 		return nil, nil, err
 	}
-
 	opContext.normalizationCacheHit = operationKit.parsedOperation.NormalizationCacheHit
 
-	if _, err := operationKit.NormalizeVariables(); err != nil {
+	cached, _, err := operationKit.NormalizeVariables()
+	if err != nil {
 		opContext.normalizationTime = time.Since(startNormalization)
 		return nil, nil, err
 	}
+	opContext.variablesNormalizationCacheHit = cached
 
-	if err := operationKit.RemapVariables(h.disableVariablesRemapping); err != nil {
+	cached, err = operationKit.RemapVariables(h.disableVariablesRemapping)
+	if err != nil {
 		opContext.normalizationTime = time.Since(startNormalization)
 		return nil, nil, err
 	}
+	opContext.variablesRemappingCacheHit = cached
 
 	opContext.hash = operationKit.parsedOperation.ID
 	opContext.internalHash = operationKit.parsedOperation.InternalID
@@ -887,12 +994,19 @@ func (h *WebSocketConnectionHandler) parseAndPlan(registration *SubscriptionRegi
 
 	opContext.normalizationTime = time.Since(startNormalization)
 	opContext.content = operationKit.parsedOperation.NormalizedRepresentation
+	opContext.variablesHash = operationKit.parsedOperation.VariablesHash
 	opContext.variables, err = astjson.ParseBytes(operationKit.parsedOperation.Request.Variables)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	startValidation := time.Now()
+
+	_, _, err = operationKit.ValidateQueryComplexity()
+	if err != nil {
+		opContext.validationTime = time.Since(startValidation)
+		return nil, nil, err
+	}
 
 	if _, err := operationKit.Validate(h.plannerOptions.ExecutionOptions.SkipLoader, opContext.remapVariables, &h.apolloCompatibilityFlags); err != nil {
 		opContext.validationTime = time.Since(startValidation)
@@ -911,14 +1025,17 @@ func (h *WebSocketConnectionHandler) parseAndPlan(registration *SubscriptionRegi
 
 	opContext.planningTime = time.Since(startPlanning)
 
+	if err := operationKit.ValidateStaticCost(opContext); err != nil {
+		return operationKit.parsedOperation, nil, err
+	}
+
 	opContext.initialPayload = h.initialPayload
 
 	return operationKit.parsedOperation, opContext, nil
 }
 
 func (h *WebSocketConnectionHandler) executeSubscription(registration *SubscriptionRegistration) {
-
-	rw := newWebsocketResponseWriter(registration.msg.ID, h.protocol, h.graphqlHandler.subgraphErrorPropagation.Enabled, h.logger, h.stats)
+	rw := newWebsocketResponseWriter(registration.msg.ID, h.protocol, h.graphqlHandler.subgraphErrorPropagation.Enabled, h.logger, h.stats, &h.subscriptions)
 
 	_, operationCtx, err := h.parseAndPlan(registration)
 	if err != nil {
@@ -963,21 +1080,6 @@ func (h *WebSocketConnectionHandler) executeSubscription(registration *Subscript
 			return
 		}
 	}
-	resolveCtx := &resolve.Context{
-		Variables: operationCtx.Variables(),
-		Request: resolve.Request{
-			Header: registration.clientRequest.Header,
-			ID:     h.initRequestID,
-		},
-		RenameTypeNames: h.graphqlHandler.executor.RenameTypeNames,
-		RemapVariables:  operationCtx.remapVariables,
-		TracingOptions:  operationCtx.traceOptions,
-		Extensions:      operationCtx.extensions,
-	}
-	if h.forwardInitialPayload && operationCtx.initialPayload != nil {
-		resolveCtx.InitialPayload = operationCtx.initialPayload
-	}
-
 	reqContext := buildRequestContext(requestContextOptions{
 		operationContext:    operationCtx,
 		requestLogger:       h.logger,
@@ -985,7 +1087,39 @@ func (h *WebSocketConnectionHandler) executeSubscription(registration *Subscript
 		w:                   nil,
 		r:                   registration.clientRequest,
 	})
-	resolveCtx = resolveCtx.WithContext(withRequestContext(h.ctx, reqContext))
+
+	reqContext.operation.protocol = OperationProtocolWS
+	reqContext.operation.executionOptions = h.plannerOptions.ExecutionOptions
+	reqContext.operation.traceOptions = h.plannerOptions.TraceOptions
+
+	resolveCtx := resolve.NewContext(withRequestContext(h.ctx, reqContext))
+
+	resolveCtx.Variables = operationCtx.Variables()
+	resolveCtx.RemapVariables = operationCtx.remapVariables
+	resolveCtx.VariablesHash = operationCtx.variablesHash
+	resolveCtx.Request = resolve.Request{
+		Header: registration.clientRequest.Header,
+		ID:     operationCtx.internalHash,
+	}
+	resolveCtx.RenameTypeNames = h.graphqlHandler.executor.RenameTypeNames
+	resolveCtx.TracingOptions = operationCtx.traceOptions
+	resolveCtx.Extensions = operationCtx.extensions
+	resolveCtx.ExecutionOptions = operationCtx.executionOptions
+
+	if operationCtx.initialPayload != nil {
+		resolveCtx.InitialPayload = operationCtx.initialPayload
+	}
+
+	if origCtx := getRequestContext(h.request.Context()); origCtx != nil {
+		reqContext.expressionContext = *origCtx.expressionContext.Clone()
+		if h.graphqlHandler.headerPropagation != nil {
+			resolveCtx.SubgraphHeadersBuilder = SubgraphHeadersBuilder(
+				origCtx,
+				h.graphqlHandler.headerPropagation,
+				operationCtx.preparedPlan.preparedPlan,
+			)
+		}
+	}
 	if h.graphqlHandler.authorizer != nil {
 		resolveCtx = WithAuthorizationExtension(resolveCtx)
 		resolveCtx.SetAuthorizer(h.graphqlHandler.authorizer)
@@ -1011,7 +1145,9 @@ func (h *WebSocketConnectionHandler) executeSubscription(registration *Subscript
 		err = h.graphqlHandler.executor.Resolver.AsyncResolveGraphQLSubscription(resolveCtx, p.Response, rw.SubscriptionResponseWriter(), registration.id)
 		if err != nil {
 			h.logger.Warn("Resolving GraphQL subscription", zap.Error(err))
-			h.graphqlHandler.WriteError(resolveCtx, err, p.Response.Response, rw)
+			// Subscription setup failed so no updates will follow. Send a terminal
+			// error frame and stop.
+			h.graphqlHandler.WriteTerminalError(resolveCtx, err, p.Response.Response, rw)
 			return
 		}
 	}
@@ -1065,7 +1201,8 @@ func (h *WebSocketConnectionHandler) handleComplete(msg *wsproto.Message) error 
 		ConnectionID:   h.connectionID,
 		SubscriptionID: subscriptionID,
 	}
-	return h.graphqlHandler.executor.Resolver.AsyncCompleteSubscription(id)
+	_ = h.protocol.Complete(msg.ID)
+	return h.graphqlHandler.executor.Resolver.UnsubscribeSubscription(id)
 }
 
 func (h *WebsocketHandler) HandleMessage(handler *WebSocketConnectionHandler, msg *wsproto.Message) (err error) {
@@ -1081,7 +1218,7 @@ func (h *WebsocketHandler) HandleMessage(handler *WebSocketConnectionHandler, ms
 		registration, err := handler.registerSubscription(msg)
 		if err != nil {
 			h.logger.Warn("Handling subscription registration", zap.Error(err))
-			return handler.requestError(fmt.Errorf("error registering subscription id: %s", msg.ID))
+			return &wsproto.CloseError{Kind: wsproto.CloseKind{Code: 4409, Reason: "Subscriber for " + msg.ID + " already exists"}}
 		}
 		handler.executeSubscription(registration)
 	case wsproto.MessageTypeComplete:
@@ -1099,7 +1236,7 @@ func (h *WebSocketConnectionHandler) Initialize() (err error) {
 	h.logger.Debug("Websocket connection", zap.String("protocol", h.protocol.Subprotocol()))
 	h.initialPayload, err = h.protocol.Initialize()
 	if err != nil {
-		_ = h.requestError(fmt.Errorf("error initializing session"))
+		_ = h.requestError(fmt.Errorf("error initializing session: %w", err))
 		return err
 	}
 
@@ -1197,26 +1334,34 @@ func (h *WebSocketConnectionHandler) ignoreHeader(k string) bool {
 	return h.forwardUpgradeHeaders.withStaticAllowList || h.forwardUpgradeHeaders.withRegexAllowList
 }
 
-func (h *WebSocketConnectionHandler) Complete(rw *websocketResponseWriter) {
-	h.subscriptions.Delete(rw.id)
-	err := rw.protocol.Complete(rw.id)
-	if err != nil {
-		return
+func (h *WebSocketConnectionHandler) shouldComputeOperationSha256(operationKit *OperationKit) bool {
+	hasPersistedHash := operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash()
+
+	if hasPersistedHash && operationKit.parsedOperation.Request.Query != "" {
+		return true
 	}
-	_ = rw.Flush()
+
+	if !hasPersistedHash && (h.operationBlocker.safelistEnabled || h.operationBlocker.logUnknownOperationsEnabled) {
+		return true
+	}
+
+	return false
 }
 
-func (h *WebSocketConnectionHandler) Close(unsubscribe bool) {
+func (h *WebSocketConnectionHandler) Close(unsubscribe bool, closeKind wsproto.CloseKind) {
 	if unsubscribe {
 		// Remove any pending IDs associated with this connection
-		err := h.graphqlHandler.executor.Resolver.AsyncUnsubscribeClient(h.connectionID)
+		err := h.graphqlHandler.executor.Resolver.UnsubscribeClient(h.connectionID)
 		if err != nil {
 			h.logger.Debug("Unsubscribing client", zap.Error(err))
 		}
 	}
 
-	err := h.conn.Close()
-	if err != nil {
+	if err := h.conn.WriteCloseFrame(closeKind.Code, closeKind.Reason); err != nil {
+		h.logger.Debug("Writing close frame", zap.Error(err))
+	}
+
+	if err := h.conn.Close(); err != nil {
 		h.logger.Debug("Closing websocket connection", zap.Error(err))
 	}
 }

@@ -1,19 +1,32 @@
+import crypto from 'node:crypto';
 import { OverrideChange } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
-import { aliasedTable, and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
+import { SQL, aliasedTable, and, asc, count, desc, eq, isNull, sql } from 'drizzle-orm';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { PlainMessage } from '@bufbuild/protobuf';
+import { FastifyBaseLogger } from 'fastify';
 import { DBSchemaChangeType } from '../../db/models.js';
 import * as schema from '../../db/schema.js';
 import { federatedGraphClients, federatedGraphPersistedOperations, users } from '../../db/schema.js';
+import type { BlobStorage } from '../blobstorage/index.js';
+import { createManifestBlobStoragePath } from '../bufservices/persisted-operation/utils.js';
 import {
   ClientDTO,
+  ClientDTOWithOperationMetadata,
   PersistedOperationDTO,
   PersistedOperationWithClientDTO,
   SchemaChangeType,
   SchemaCheckDetailsDTO,
   UpdatedPersistedOperation,
 } from '../../types/index.js';
+import { traced } from '../tracing.js';
 import { SchemaCheckRepository } from './SchemaCheckRepository.js';
+
+export interface PQLManifest {
+  version: 1;
+  revision: string;
+  generatedAt: string;
+  operations: Record<string, string>; // sha256 hash -> operation body
+}
 
 type ChangeOverride = IgnoreAllOverride & {
   changeType: DBSchemaChangeType;
@@ -29,6 +42,7 @@ type IgnoreAllOverride = {
   hash: string;
 };
 
+@traced
 export class OperationsRepository {
   constructor(
     private db: PostgresJsDatabase<typeof schema>,
@@ -95,31 +109,80 @@ export class OperationsRepository {
     const operations: PersistedOperationDTO[] = [];
 
     for (const row of operationsResult) {
-      operations.push({
-        id: row.id,
-        operationId: row.operationId,
-        hash: row.hash,
-        filePath: row.filePath,
-        createdAt: row.createdAt.toISOString(),
-        lastUpdatedAt: row?.updatedAt?.toISOString() || '',
-        createdBy: row.createdBy?.email,
-        lastUpdatedBy: row.updatedBy?.email ?? '',
-        contents: row.operationContent ?? '',
-        operationNames: row.operationNames ?? [],
-      });
+      operations.push(OperationsRepository.createPersistedOperationDTO(row));
     }
     return operations;
   }
 
-  public async getPersistedOperation({
+  public getPersistedOperation({
     operationId,
+    clientName,
   }: {
     operationId: string;
+    clientName?: string;
   }): Promise<PersistedOperationWithClientDTO | undefined> {
+    return this.findPersistedOperationWithClient({
+      operationId,
+      clientName,
+    });
+  }
+
+  public deletePersistedOperation({
+    operationId,
+    clientName,
+  }: {
+    operationId: string;
+    clientName: string;
+  }): Promise<PersistedOperationWithClientDTO | undefined> {
+    return this.db.transaction(async (tx) => {
+      const clientResult = await tx.query.federatedGraphClients.findFirst({
+        where: and(
+          eq(federatedGraphClients.name, clientName),
+          eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+        ),
+      });
+
+      if (!clientResult) {
+        return undefined;
+      }
+
+      const operation = await this.findPersistedOperationWithClient({
+        operationId,
+        clientName,
+        db: tx as PostgresJsDatabase<typeof schema>,
+      });
+
+      if (!operation) {
+        return undefined;
+      }
+
+      await tx
+        .delete(federatedGraphPersistedOperations)
+        .where(
+          and(
+            eq(federatedGraphPersistedOperations.operationId, operationId),
+            eq(federatedGraphPersistedOperations.clientId, clientResult.id),
+          ),
+        );
+
+      return operation;
+    });
+  }
+
+  private async findPersistedOperationWithClient({
+    operationId,
+    clientName,
+    db,
+  }: {
+    operationId: string;
+    clientName?: string;
+    db?: PostgresJsDatabase<typeof schema>;
+  }): Promise<PersistedOperationWithClientDTO | undefined> {
+    const database = db ?? this.db;
     const users1 = aliasedTable(users, 'users1');
     const users2 = aliasedTable(users, 'users2');
 
-    const operationResult = await this.db
+    const operationResult = await database
       .select({
         id: federatedGraphPersistedOperations.id,
         operationId: federatedGraphPersistedOperations.operationId,
@@ -141,6 +204,7 @@ export class OperationsRepository {
         and(
           eq(federatedGraphPersistedOperations.federatedGraphId, this.federatedGraphId),
           eq(federatedGraphPersistedOperations.operationId, operationId),
+          clientName ? eq(federatedGraphClients.name, clientName) : undefined,
         ),
       );
 
@@ -148,24 +212,10 @@ export class OperationsRepository {
       return undefined;
     }
 
-    return {
-      id: operationResult[0].id,
-      operationId: operationResult[0].operationId,
-      hash: operationResult[0].hash,
-      filePath: operationResult[0].filePath,
-      createdAt: operationResult[0].createdAt.toISOString(),
-      lastUpdatedAt: operationResult[0]?.updatedAt?.toISOString() || '',
-      createdBy: operationResult[0].createdBy ?? '',
-      lastUpdatedBy: operationResult[0].updatedBy ?? '',
-      contents: operationResult[0].operationContent ?? '',
-      clientName: operationResult[0].clientName,
-    };
+    return OperationsRepository.createPersistedOperationWithClientDTO(operationResult[0]);
   }
 
   public async registerClient(clientName: string, userId: string): Promise<string> {
-    if (!clientName) {
-      throw new Error('client name is empty');
-    }
     const updatedAt = new Date();
     await this.db
       .insert(federatedGraphClients)
@@ -191,6 +241,38 @@ export class OperationsRepository {
     return result!.id;
   }
 
+  public async getAllPersistedOperationsForGraph(): Promise<
+    Array<{
+      hash: string;
+      operationContent: string;
+      operationId: string;
+      operationNames: string[];
+      clientName: string;
+    }>
+  > {
+    const results = await this.db
+      .select({
+        hash: federatedGraphPersistedOperations.hash,
+        operationContent: federatedGraphPersistedOperations.operationContent,
+        operationId: federatedGraphPersistedOperations.operationId,
+        operationNames: federatedGraphPersistedOperations.operationNames,
+        clientName: federatedGraphClients.name,
+      })
+      .from(federatedGraphPersistedOperations)
+      .innerJoin(federatedGraphClients, eq(federatedGraphClients.id, federatedGraphPersistedOperations.clientId))
+      .where(eq(federatedGraphPersistedOperations.federatedGraphId, this.federatedGraphId));
+
+    return results
+      .filter((r) => r.operationContent != null)
+      .map((r) => ({
+        hash: r.hash,
+        operationContent: r.operationContent!,
+        operationId: r.operationId,
+        operationNames: r.operationNames ?? [],
+        clientName: r.clientName,
+      }));
+  }
+
   public async getRegisteredClients(): Promise<ClientDTO[]> {
     const fedGraphClients = await this.db.query.federatedGraphClients.findMany({
       where: eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
@@ -214,6 +296,152 @@ export class OperationsRepository {
     }
 
     return clients;
+  }
+
+  public async getRegisteredClientByName(clientName: string): Promise<ClientDTO | undefined> {
+    const client = await this.db.query.federatedGraphClients.findFirst({
+      where: and(
+        eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+        eq(federatedGraphClients.name, clientName),
+      ),
+      with: {
+        createdBy: true,
+        updatedBy: true,
+      },
+    });
+
+    if (!client) {
+      return undefined;
+    }
+
+    return {
+      id: client.id,
+      name: client.name,
+      createdAt: client.createdAt.toISOString(),
+      lastUpdatedAt: client.updatedAt?.toISOString() || '',
+      createdBy: client.createdBy?.email ?? '',
+      lastUpdatedBy: client.updatedBy?.email ?? '',
+    };
+  }
+
+  public async previewDeleteClient(clientName: string): Promise<ClientDTOWithOperationMetadata | undefined> {
+    const clients = await this.getRegisteredClientsWithOperationMetadata({ clientName });
+
+    return clients[0];
+  }
+
+  public async getRegisteredClientsWithOperationMetadata(input?: {
+    clientName?: string;
+  }): Promise<ClientDTOWithOperationMetadata[]> {
+    const createdBy = aliasedTable(users, 'created_by');
+    const updatedBy = aliasedTable(users, 'updated_by');
+    const conditions: (SQL<unknown> | undefined)[] = [
+      eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+      input?.clientName ? eq(federatedGraphClients.name, input.clientName) : undefined,
+    ];
+
+    const clients = await this.db
+      .select({
+        id: federatedGraphClients.id,
+        name: federatedGraphClients.name,
+        createdAt: federatedGraphClients.createdAt,
+        updatedAt: federatedGraphClients.updatedAt,
+        createdBy: createdBy.email,
+        updatedBy: updatedBy.email,
+        persistedOperationsCount: sql<number>`cast(count(${federatedGraphPersistedOperations.id}) as int)`,
+      })
+      .from(federatedGraphClients)
+      .leftJoin(createdBy, eq(createdBy.id, federatedGraphClients.createdById))
+      .leftJoin(updatedBy, eq(updatedBy.id, federatedGraphClients.updatedById))
+      .leftJoin(
+        federatedGraphPersistedOperations,
+        and(
+          eq(federatedGraphPersistedOperations.federatedGraphId, this.federatedGraphId),
+          eq(federatedGraphPersistedOperations.clientId, federatedGraphClients.id),
+        ),
+      )
+      .where(and(...conditions))
+      .groupBy(federatedGraphClients.id, createdBy.email, updatedBy.email)
+      .orderBy(desc(sql`coalesce(${federatedGraphClients.updatedAt}, ${federatedGraphClients.createdAt})`));
+
+    return clients.map((client) => ({
+      id: client.id,
+      name: client.name,
+      createdAt: client.createdAt.toISOString(),
+      lastUpdatedAt: client.updatedAt?.toISOString() || '',
+      createdBy: client.createdBy ?? '',
+      lastUpdatedBy: client.updatedBy ?? '',
+      persistedOperationsCount: client.persistedOperationsCount,
+    }));
+  }
+
+  public deleteClient(clientName: string): Promise<
+    | {
+        client: ClientDTO;
+      }
+    | undefined
+  > {
+    return this.db.transaction(async (tx) => {
+      const client = await tx.query.federatedGraphClients.findFirst({
+        where: and(
+          eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+          eq(federatedGraphClients.name, clientName),
+        ),
+        with: {
+          createdBy: true,
+          updatedBy: true,
+        },
+      });
+
+      if (!client) {
+        return undefined;
+      }
+
+      // Lock parent so concurrent persisted-operation INSERTs (which take FOR KEY SHARE on this row) block until commit; otherwise they'd be cascade-deleted but missing from the returned snapshot.
+      const lockedRows = await tx
+        .select({ id: federatedGraphClients.id })
+        .from(federatedGraphClients)
+        .where(
+          and(
+            eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+            eq(federatedGraphClients.name, clientName),
+            eq(federatedGraphClients.id, client.id),
+          ),
+        )
+        .for('update');
+
+      if (lockedRows.length === 0) {
+        // Another transaction deleted the client before this transaction acquired the lock.
+        return undefined;
+      }
+
+      // Operations are deleted via cascade when clients are dropped
+      const deletedRows = await tx
+        .delete(federatedGraphClients)
+        .where(
+          and(
+            eq(federatedGraphClients.federatedGraphId, this.federatedGraphId),
+            eq(federatedGraphClients.id, client.id),
+          ),
+        )
+        .returning({ id: federatedGraphClients.id });
+
+      if (deletedRows.length === 0) {
+        // Another transaction deleted the client after the operation snapshot was read.
+        return undefined;
+      }
+
+      return {
+        client: {
+          id: client.id,
+          name: client.name,
+          createdAt: client.createdAt.toISOString(),
+          lastUpdatedAt: client.updatedAt?.toISOString() || '',
+          createdBy: client.createdBy?.email ?? '',
+          lastUpdatedBy: client.updatedBy?.email ?? '',
+        },
+      };
+    });
   }
 
   public createOperationOverrides(data: {
@@ -388,7 +616,7 @@ export class OperationsRepository {
 
     const allOperations = affectedOperations.map((operation) => ({
       ...operation,
-      impactingChanges: checkDetails.changes
+      impactingChanges: [...checkDetails.changes, ...checkDetails.composedSchemaBreakingChanges]
         .filter(({ id }) => operation.schemaChangeIds.includes(id))
         .map((c) => ({
           ...c,
@@ -407,7 +635,7 @@ export class OperationsRepository {
     };
   }
 
-  public getConsolidatedOverridesView(data: { namespaceId: string }) {
+  public async getConsolidatedOverridesView(data: { namespaceId: string; limit: number; offset: number }) {
     const change = this.db
       .select({
         hash: schema.operationChangeOverrides.hash,
@@ -448,7 +676,7 @@ export class OperationsRepository {
     // We need to retrieve a consolidated view of overrides from both tables.
     // There is no guarantee that an entry for hash exists in both.
 
-    return this.db
+    const baseQuery = this.db
       .select({
         hash: sql<string>`coalesce(${change.hash}, ${ignore.hash})`,
         name: sql<string>`coalesce(${change.name}, ${ignore.name})`,
@@ -461,6 +689,143 @@ export class OperationsRepository {
       .from(change)
       .fullJoin(ignore, and(eq(change.hash, ignore.hash), eq(change.namespaceId, ignore.namespaceId)))
       .leftJoin(changeCounts, and(eq(change.hash, changeCounts.hash), eq(change.namespaceId, changeCounts.namespaceId)))
-      .orderBy(({ name, hash }) => [asc(name), asc(hash)]);
+      .orderBy(({ name, hash }) => [asc(name), asc(hash)])
+      .limit(data.limit)
+      .offset(data.offset);
+
+    // For pagination, we need the total count of unique operations that have an override. This is obtained by counting the full join of the two tables.
+    const countQuery = this.db
+      .select({
+        count: count(),
+      })
+      .from(change)
+      .fullJoin(ignore, and(eq(change.hash, ignore.hash), eq(change.namespaceId, ignore.namespaceId)));
+
+    const [overrides, countResult] = await Promise.all([baseQuery, countQuery]);
+
+    return {
+      overrides,
+      totalCount: countResult[0]?.count ?? 0,
+    };
+  }
+
+  public async generateAndUploadManifest(params: {
+    organizationId: string;
+    blobStorage: BlobStorage;
+    logger: FastifyBaseLogger;
+  }): Promise<{ revision: string; operationCount: number }> {
+    const { organizationId, blobStorage, logger } = params;
+
+    const allOperations = await this.getAllPersistedOperationsForGraph();
+
+    if (allOperations.length === 0) {
+      logger.warn(
+        { federatedGraphId: this.federatedGraphId },
+        'No persisted operations with content found for manifest generation',
+      );
+    }
+
+    const operations: Record<string, string> = {};
+    for (const op of allOperations) {
+      operations[op.operationId] = op.operationContent;
+    }
+
+    // Compute revision as SHA256 of the deterministic JSON serialization (sorted keys)
+    const sortedKeys = Object.keys(operations).sort();
+    const sortedOperations: Record<string, string> = {};
+    for (const key of sortedKeys) {
+      sortedOperations[key] = operations[key];
+    }
+    const serialized = JSON.stringify(sortedOperations);
+    const revision = crypto.createHash('sha256').update(serialized).digest('hex');
+
+    const manifest: PQLManifest = {
+      version: 1,
+      revision,
+      generatedAt: new Date().toISOString(),
+      operations: sortedOperations,
+    };
+
+    const path = createManifestBlobStoragePath({ organizationId, fedGraphId: this.federatedGraphId });
+
+    await blobStorage.putObject({
+      key: path,
+      body: Buffer.from(JSON.stringify(manifest), 'utf8'),
+      contentType: 'application/json; charset=utf-8',
+      metadata: { version: revision },
+    });
+
+    logger.debug({ revision, operationCount: allOperations.length, path }, 'PQL manifest generated and uploaded');
+
+    return { revision, operationCount: allOperations.length };
+  }
+
+  private static createPersistedOperationDTO({
+    id,
+    operationId,
+    hash,
+    filePath,
+    createdAt,
+    updatedAt,
+    createdBy,
+    updatedBy,
+    operationContent,
+    operationNames,
+  }: typeof federatedGraphPersistedOperations.$inferSelect & {
+    createdBy: typeof users.$inferSelect | null;
+    updatedBy: typeof users.$inferSelect | null;
+  }): PersistedOperationDTO {
+    return {
+      id,
+      operationId,
+      hash,
+      filePath,
+      createdAt: createdAt.toISOString(),
+      lastUpdatedAt: updatedAt?.toISOString() || '',
+      createdBy: createdBy?.email,
+      lastUpdatedBy: updatedBy?.email ?? '',
+      contents: operationContent ?? '',
+      operationNames: operationNames ?? [],
+    };
+  }
+
+  private static createPersistedOperationWithClientDTO({
+    id,
+    operationId,
+    hash,
+    filePath,
+    createdAt,
+    updatedAt,
+    operationContent,
+    operationNames,
+    clientName,
+    createdBy,
+    updatedBy,
+  }: {
+    id: string;
+    operationId: string;
+    hash: string;
+    filePath: string;
+    createdAt: Date;
+    updatedAt: Date | null;
+    operationContent: string | null;
+    operationNames: string[] | null;
+    clientName: string;
+    createdBy: string | null;
+    updatedBy: string | null;
+  }): PersistedOperationWithClientDTO {
+    return {
+      id,
+      operationId,
+      operationNames: operationNames ?? [],
+      hash,
+      filePath,
+      createdAt: createdAt.toISOString(),
+      lastUpdatedAt: updatedAt?.toISOString() || '',
+      createdBy: createdBy ?? '',
+      lastUpdatedBy: updatedBy ?? '',
+      contents: operationContent ?? '',
+      clientName,
+    };
   }
 }

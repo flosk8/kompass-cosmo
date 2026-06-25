@@ -8,7 +8,9 @@ import {
 import { OrganizationRepository } from '../../repositories/OrganizationRepository.js';
 import { ProposalRepository } from '../../repositories/ProposalRepository.js';
 import type { RouterOptions } from '../../routes.js';
-import { enrichLogger, getLogger, handleError, validateDateRanges } from '../../util.js';
+import { clamp, enrichLogger, getLogger, handleError, validateDateRanges } from '../../util.js';
+import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
+import { UnauthorizedError } from '../../errors/errors.js';
 
 export function getProposalChecks(
   opts: RouterOptions,
@@ -21,8 +23,9 @@ export function getProposalChecks(
     const authContext = await opts.authenticator.authenticate(ctx.requestHeader);
     logger = enrichLogger(ctx, logger, authContext);
 
-    const proposalRepo = new ProposalRepository(opts.db);
+    const proposalRepo = new ProposalRepository(opts.db, authContext.organizationId);
     const orgRepo = new OrganizationRepository(logger, opts.db, opts.billingDefaultPlanId);
+    const federatedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
 
     // Check if the proposal exists
     const proposal = await proposalRepo.ById(req.proposalId);
@@ -35,6 +38,22 @@ export function getProposalChecks(
         checks: [],
         totalChecksCount: 0,
       };
+    }
+
+    const federatedGraph = await federatedGraphRepo.byId(proposal.proposal.federatedGraphId);
+    if (!federatedGraph) {
+      return {
+        response: {
+          code: EnumStatusCode.ERR_NOT_FOUND,
+          details: `Federated graph of the proposal not found`,
+        },
+        checks: [],
+        totalChecksCount: 0,
+      };
+    }
+
+    if (!authContext.rbac.hasFederatedGraphReadAccess(federatedGraph)) {
+      throw new UnauthorizedError();
     }
 
     const breakingChangeRetention = await orgRepo.getFeature({
@@ -61,17 +80,9 @@ export function getProposalChecks(
       };
     }
 
-    // check that the limit is less than the max option provided in the ui
-    if (req.limit > 50) {
-      return {
-        response: {
-          code: EnumStatusCode.ERR,
-          details: 'Invalid limit',
-        },
-        checks: [],
-        totalChecksCount: 0,
-      };
-    }
+    // default to 10 if no limit is provided
+    req.limit = clamp(req.limit || 10, 1, 50);
+    req.offset = clamp(req.offset || 0, 0, 500_000);
 
     // Get checks for the proposal
     const { checks, checksCount } = await proposalRepo.getChecksByProposalId({
@@ -81,6 +92,7 @@ export function getProposalChecks(
       offset: req.offset,
       startDate: dateRange?.start,
       endDate: dateRange?.end,
+      organizationId: authContext.organizationId,
     });
 
     return {

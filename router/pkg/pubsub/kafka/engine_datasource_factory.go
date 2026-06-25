@@ -3,9 +3,13 @@ package kafka
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 
+	"github.com/buger/jsonparser"
+	"github.com/cespare/xxhash/v2"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
+	"go.uber.org/zap"
 )
 
 type EventType int
@@ -20,8 +24,9 @@ type EngineDataSourceFactory struct {
 	eventType  EventType
 	topics     []string
 	providerId string
+	logger     *zap.Logger
 
-	KafkaAdapter Adapter
+	KafkaAdapter datasource.Adapter
 }
 
 func (c *EngineDataSourceFactory) GetFieldName() string {
@@ -45,28 +50,54 @@ func (c *EngineDataSourceFactory) ResolveDataSource() (resolve.DataSource, error
 
 func (c *EngineDataSourceFactory) ResolveDataSourceInput(eventData []byte) (string, error) {
 	if len(c.topics) != 1 {
-		return "", fmt.Errorf("publish events should define one topic but received %d", len(c.topics))
+		return "", fmt.Errorf("publish event definition should define one topic but has %d", len(c.topics))
 	}
 
-	evtCfg := PublishEventConfiguration{
-		ProviderID: c.providerId,
-		Topic:      c.topics[0],
-		Data:       eventData,
+	evtCfg := publishData{
+		Provider:  c.providerId,
+		Topic:     c.topics[0],
+		Event:     MutableEvent{Data: eventData},
+		FieldName: c.fieldName,
 	}
 
-	return evtCfg.MarshalJSONTemplate(), nil
+	return evtCfg.MarshalJSONTemplate()
 }
 
-func (c *EngineDataSourceFactory) ResolveDataSourceSubscription() (resolve.SubscriptionDataSource, error) {
-	return &SubscriptionDataSource{
-		pubSub: c.KafkaAdapter,
-	}, nil
+func (c *EngineDataSourceFactory) ResolveDataSourceSubscription() (datasource.SubscriptionDataSource, error) {
+	triggerHashInputFn := func(input []byte, xxh *xxhash.Digest) error {
+		val, _, _, err := jsonparser.Get(input, "topics")
+		if err != nil {
+			return err
+		}
+
+		_, err = xxh.Write(val)
+		if err != nil {
+			return err
+		}
+
+		val, _, _, err = jsonparser.Get(input, "providerId")
+		if err != nil {
+			return err
+		}
+
+		_, err = xxh.Write(val)
+		return err
+	}
+
+	eventCreateFn := func(data []byte) datasource.MutableStreamEvent {
+		return &MutableEvent{Data: data}
+	}
+
+	return datasource.NewPubSubSubscriptionDataSource[*SubscriptionEventConfiguration](
+		c.KafkaAdapter, triggerHashInputFn, c.logger, eventCreateFn,
+	), nil
 }
 
 func (c *EngineDataSourceFactory) ResolveDataSourceSubscriptionInput() (string, error) {
 	evtCfg := SubscriptionEventConfiguration{
-		ProviderID: c.providerId,
-		Topics:     c.topics,
+		Provider:  c.providerId,
+		Topics:    c.topics,
+		FieldName: c.fieldName,
 	}
 	object, err := json.Marshal(evtCfg)
 	if err != nil {
@@ -76,5 +107,29 @@ func (c *EngineDataSourceFactory) ResolveDataSourceSubscriptionInput() (string, 
 }
 
 func (c *EngineDataSourceFactory) TransformEventData(extractFn datasource.ArgumentTemplateCallback) error {
+	switch c.eventType {
+	case EventTypePublish:
+		if len(c.topics) != 1 {
+			return fmt.Errorf("publish event definition should define one topic but has %d", len(c.topics))
+		}
+
+		extractedTopic, err := extractFn(c.topics[0])
+		if err != nil {
+			return fmt.Errorf("unable to parse topic with id %s", c.topics[0])
+		}
+		c.topics = []string{extractedTopic}
+	case EventTypeSubscribe:
+		extractedTopics := make([]string, 0, len(c.topics))
+		for _, rawTopic := range c.topics {
+			extractedTopic, err := extractFn(rawTopic)
+			if err != nil {
+				return nil
+			}
+			extractedTopics = append(extractedTopics, extractedTopic)
+		}
+		slices.Sort(extractedTopics)
+		c.topics = extractedTopics
+	}
+
 	return nil
 }

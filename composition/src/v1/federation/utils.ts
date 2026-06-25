@@ -1,38 +1,25 @@
-import { BREAK, ConstDirectiveNode, Kind, StringValueNode, visit } from 'graphql';
-import { FieldSetConditionData, RequiredFieldConfiguration } from '../../router-configuration/types';
+import { BREAK, type ConstDirectiveNode, Kind, type StringValueNode, visit } from 'graphql';
+import { type FieldSetConditionData, type RequiredFieldConfiguration } from '../../router-configuration/types';
 import {
-  AuthorizationData,
-  CompositeOutputData,
-  ConditionalFieldData,
-  EntityData,
-  EntityInterfaceFederationData,
-  FieldData,
-  InterfaceDefinitionData,
-  ObjectDefinitionData,
-  ParentDefinitionData,
-} from '../../schema-building/types';
-import { Graph } from '../../resolvability-graph/graph';
-import { getTypeNodeNamedTypeName, MutableFieldNode } from '../../schema-building/ast';
-import { BASE_SCALARS } from '../utils/constants';
+  type CompositeOutputData,
+  type ConditionalFieldData,
+  type EntityData,
+  type EntityInterfaceFederationData,
+  type FieldData,
+  type InterfaceDefinitionData,
+  type ObjectDefinitionData,
+  type ParentDefinitionData,
+} from '../../schema-building/types/types';
+import { getTypeNodeNamedTypeName, type MutableFieldNode } from '../../schema-building/ast';
+import { BASE_SCALARS } from '../constants/constants';
 import { isKindAbstract } from '../../ast/utils';
-import { GraphNode } from '../../resolvability-graph/graph-nodes';
-
-import { Warning } from '../../warnings/types';
-import { InternalSubgraph } from '../../subgraph/types';
-import { ContractTagOptions } from '../../federation/types';
+import { type GraphNode } from '../../resolvability-graph/graph-nodes';
+import { type InternalSubgraph } from '../../subgraph/types';
+import { type ContractTagOptions } from '../../federation/types/types';
 import { getOrThrowError, getValueOrDefault } from '../../utils/utils';
-import { KeyFieldSetData } from '../normalization/types';
-
-export type FederationFactoryParams = {
-  authorizationDataByParentTypeName: Map<string, AuthorizationData>;
-  concreteTypeNamesByAbstractTypeName: Map<string, Set<string>>;
-  entityDataByTypeName: Map<string, EntityData>;
-  entityInterfaceFederationDataByTypeName: Map<string, EntityInterfaceFederationData>;
-  fieldCoordsByNamedTypeName: Map<string, Set<string>>;
-  internalGraph: Graph;
-  internalSubgraphBySubgraphName: Map<string, InternalSubgraph>;
-  warnings: Warning[];
-};
+import { type KeyFieldSetData } from '../normalization/types/types';
+import { type TypeName } from '../../types/types';
+import { TYPENAME } from '../../utils/string-constants';
 
 export type ParentTagData = {
   childTagDataByChildName: Map<string, ChildTagData>;
@@ -88,7 +75,7 @@ export type VisitFieldSetOptions = {
   entityData: EntityData;
   implicitKeys: Array<RequiredFieldConfiguration>;
   objectData: ObjectDefinitionData | InterfaceDefinitionData;
-  parentDefinitionDataByTypeName: Map<string, ParentDefinitionData>;
+  parentDefinitionDataByTypeName: Map<TypeName, ParentDefinitionData>;
   graphNode?: GraphNode;
 };
 
@@ -135,6 +122,9 @@ export function validateImplicitFieldSets({
             return BREAK;
           }
           const fieldName = node.name.value;
+          if (fieldName === TYPENAME) {
+            return;
+          }
           const fieldData = parentData.fieldDataByName.get(fieldName);
           // undefined if the field does not exist on the parent
           if (!fieldData || fieldData.argumentDataByName.size || definedFields[currentDepth].has(fieldName)) {

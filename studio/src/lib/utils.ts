@@ -1,10 +1,25 @@
-import { LintConfig } from "@wundergraph/cosmo-connect/dist/platform/v1/platform_pb";
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-import { lintCategories } from "./constants";
+import { LintConfig, SocialLoginProvider } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
+import { lintCategories } from './constants';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
+}
+
+// Display label for a social login provider (e.g. GOOGLE → "Google").
+export function socialProviderLabel(provider?: SocialLoginProvider): string {
+  switch (provider) {
+    case SocialLoginProvider.GOOGLE: {
+      return 'Google';
+    }
+    case SocialLoginProvider.GITHUB: {
+      return 'GitHub';
+    }
+    default: {
+      return 'social login';
+    }
+  }
 }
 
 export function clamp(value: number, min: number, max: number): number {
@@ -12,13 +27,20 @@ export function clamp(value: number, min: number, max: number): number {
   return Number.isNaN(result) ? min : result;
 }
 
-export const checkUserAccess = ({
-  rolesToBe,
-  userRoles,
-}: {
-  rolesToBe: string[];
-  userRoles: string[];
-}) => {
+export function distinctBy<T, TKey>(source: T[], keySelector: (item: T) => TKey) {
+  const keys = new Set<TKey>();
+  return source.filter((item) => {
+    const key = keySelector(item);
+    if (keys.has(key)) {
+      return false;
+    }
+
+    keys.add(key);
+    return true;
+  });
+}
+
+export const checkUserAccess = ({ rolesToBe, userRoles }: { rolesToBe: string[]; userRoles: string[] }) => {
   for (const role of rolesToBe) {
     if (userRoles.includes(role)) {
       return true;
@@ -31,18 +53,14 @@ export const capitalize = (str: string) => {
   return str.charAt(0).toUpperCase() + str.slice(1);
 };
 
-export const getHighestPriorityRole = ({
-  userRoles,
-}: {
-  userRoles: string[];
-}) => {
-  if (userRoles.includes("admin")) {
-    return "admin";
+export const getHighestPriorityRole = ({ userRoles }: { userRoles: string[] }) => {
+  if (userRoles.includes('admin')) {
+    return 'admin';
   }
-  if (userRoles.includes("developer")) {
-    return "developer";
+  if (userRoles.includes('developer')) {
+    return 'developer';
   }
-  return "viewer";
+  return 'viewer';
 };
 
 export const countLintConfigsByCategory = (lintConfigs: LintConfig[]) => {
@@ -64,9 +82,5 @@ export const countLintConfigsByCategory = (lintConfigs: LintConfig[]) => {
     }
   }
 
-  return [
-    countNamingConventionRules,
-    countAlphabeticalSortRules,
-    countOtherRules,
-  ];
+  return [countNamingConventionRules, countAlphabeticalSortRules, countOtherRules];
 };

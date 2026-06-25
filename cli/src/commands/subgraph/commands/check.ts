@@ -9,6 +9,7 @@ import { config, getBaseHeaders } from '../../../core/config.js';
 import { BaseCommandOptions } from '../../../core/types/types.js';
 import { verifyGitHubIntegration } from '../../../github.js';
 import { handleCheckResult } from '../../../handle-check-result.js';
+import { limitMaxValue } from '../../../constants.js';
 
 export default (opts: BaseCommandOptions) => {
   const command = new Command('check');
@@ -27,9 +28,17 @@ export default (opts: BaseCommandOptions) => {
       ' This parameter is always ignored if the subgraph already exists.',
     [],
   );
+  command.option(
+    '--disable-resolvability-validation',
+    'This flag will disable the validation for whether all nodes of the federated graph are resolvable. Do NOT use unless troubleshooting.',
+  );
+  command.option('-l, --limit [number]', 'The amount of entries shown in the schema checks output.', '50');
+  command.option('-j, --json', 'Prints to the console in json format instead of table');
+  command.option('-o, --out [string]', 'Destination file for the json output.');
 
   command.action(async (name, options) => {
     let schemaFile;
+    let outFile;
 
     if (!options.schema && !options.delete) {
       program.error("required option '--schema <path-to-schema>' or '--delete' not specified.");
@@ -44,6 +53,17 @@ export default (opts: BaseCommandOptions) => {
           ),
         );
       }
+    }
+
+    if (options.out) {
+      outFile = resolve(options.out);
+    }
+
+    const limit = Number(options.limit);
+    if (Number.isNaN(limit) || limit <= 0 || limit > limitMaxValue) {
+      program.error(
+        pc.red(`The limit must be a valid number between 1 and ${limitMaxValue}. Received: '${options.limit}'`),
+      );
     }
 
     const { gitInfo, ignoreErrorsDueToGitHubIntegration } = await verifyGitHubIntegration(opts.client);
@@ -62,21 +82,28 @@ export default (opts: BaseCommandOptions) => {
 
     const resp = await opts.client.platform.checkSubgraphSchema(
       {
-        subgraphName: name,
-        namespace: options.namespace,
-        schema: new Uint8Array(schema),
-        gitInfo,
         delete: options.delete,
-        skipTrafficCheck: options.skipTrafficCheck,
-        vcsContext,
+        disableResolvabilityValidation: options.disableResolvabilityValidation,
+        gitInfo,
+        namespace: options.namespace,
         labels: options.label.map((label: string) => splitLabel(label)),
+        schema: new Uint8Array(schema),
+        skipTrafficCheck: options.skipTrafficCheck,
+        subgraphName: name,
+        limit,
+        vcsContext,
       },
       {
         headers: getBaseHeaders(),
       },
     );
 
-    const success = handleCheckResult(resp);
+    const success = await handleCheckResult({
+      response: resp,
+      rowLimit: limit,
+      shouldOutputJson: options.json || !!outFile,
+      outFile,
+    });
 
     if (!success && !ignoreErrorsDueToGitHubIntegration) {
       process.exitCode = 1;

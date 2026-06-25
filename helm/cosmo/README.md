@@ -2,7 +2,7 @@
 
 For a detailed deployment guide of the chart, including the full documentation, see the [DEV.md](DEV.md) file.
 
-![Version: 0.13.1](https://img.shields.io/badge/Version-0.13.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
+![Version: 0.19.0](https://img.shields.io/badge/Version-0.19.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
 
 This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle GraphQL API Management Solution.
 
@@ -25,10 +25,10 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 |  | router | ^0 |
 |  | studio | ^0 |
 | https://charts.bitnami.com/bitnami | clickhouse | 6.2.14 |
-| https://charts.bitnami.com/bitnami | keycloak | 22.0.0 |
 | https://charts.bitnami.com/bitnami | minio | 14.6.25 |
 | https://charts.bitnami.com/bitnami | postgresql | 12.12.10 |
 | https://charts.bitnami.com/bitnami | redis | 19.3.3 |
+| https://codecentric.github.io/helm-charts | keycloak(keycloakx) | 7.1.8 |
 
 ## Values
 
@@ -44,6 +44,8 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 | clickhouse.auth.password | string | `"changeme"` |  |
 | clickhouse.auth.username | string | `"default"` |  |
 | clickhouse.commonAnnotations."kapp.k14s.io/change-group" | string | `"cosmo.apps.clickhouse.wundergraph.com/deployment"` |  |
+| clickhouse.image.registry | string | `"docker.io"` |  |
+| clickhouse.image.repository | string | `"bitnamilegacy/clickhouse"` |  |
 | clickhouse.initdbScripts."db-init.sh" | string | `"#!/bin/bash\nset -e\nclickhouse-client --user $CLICKHOUSE_ADMIN_USER --password $CLICKHOUSE_ADMIN_PASSWORD -n <<-EOSQL\n  CREATE DATABASE IF NOT EXISTS cosmo;\nEOSQL\n"` |  |
 | clickhouse.persistence.annotations."kapp.k14s.io/owned-for-deletion" | string | `""` |  |
 | clickhouse.persistence.size | string | `"2Gi"` |  |
@@ -120,7 +122,7 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 | global.helmTests.enabled | bool | `false` |  |
 | global.keycloak.adminPassword | string | `"changeme"` |  |
 | global.keycloak.adminUser | string | `"admin"` |  |
-| global.keycloak.apiUrl | string | `"http://cosmo-keycloak:8080"` |  |
+| global.keycloak.apiUrl | string | `"http://cosmo-keycloak-http:8080"` |  |
 | global.keycloak.clientId | string | `"studio"` |  |
 | global.keycloak.database | string | `"keycloak"` |  |
 | global.keycloak.databasePassword | string | `"changeme"` |  |
@@ -166,42 +168,39 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 | graphqlmetrics.configuration.prometheus.port | int | `8088` | The port where metrics are exposed. Default is port 8088. |
 | ingress.annotations | object | `{}` |  |
 | ingress.enabled | bool | `true` |  |
-| keycloak.auth.adminPassword | string | `"changeme"` |  |
-| keycloak.auth.adminUser | string | `"admin"` |  |
-| keycloak.cache.enabled | bool | `false` |  |
-| keycloak.externalDatabase.database | string | `"keycloak"` |  |
-| keycloak.externalDatabase.host | string | `"cosmo-postgresql"` |  |
-| keycloak.externalDatabase.port | int | `5432` |  |
-| keycloak.externalDatabase.user | string | `"postgres"` |  |
-| keycloak.extraEnvVars[0].name | string | `"KEYCLOAK_EXTRA_ARGS"` |  |
-| keycloak.extraEnvVars[0].value | string | `"--import-realm --optimized"` |  |
-| keycloak.extraEnvVars[1].name | string | `"KEYCLOAK_ENABLE_HEALTH_ENDPOINTS"` |  |
-| keycloak.extraEnvVars[1].value | string | `"true"` |  |
-| keycloak.extraEnvVars[2].name | string | `"KEYCLOAK_DATABASE_PASSWORD"` |  |
-| keycloak.extraEnvVars[2].value | string | `"changeme"` |  |
-| keycloak.extraVolumeMounts[0].mountPath | string | `"/opt/bitnami/keycloak/data/import/realm.json"` |  |
-| keycloak.extraVolumeMounts[0].name | string | `"realm-config-volume"` |  |
-| keycloak.extraVolumeMounts[0].readOnly | bool | `true` |  |
-| keycloak.extraVolumeMounts[0].subPath | string | `"realm.json"` |  |
-| keycloak.extraVolumes[0].configMap.name | string | `"keycloak-realm"` |  |
-| keycloak.extraVolumes[0].name | string | `"realm-config-volume"` |  |
+| keycloak.args[0] | string | `"start"` |  |
+| keycloak.args[1] | string | `"--import-realm"` |  |
+| keycloak.args[2] | string | `"--optimized"` |  |
+| keycloak.cache.stack | string | `"custom"` |  |
+| keycloak.database.database | string | `"keycloak"` |  |
+| keycloak.database.hostname | string | `"cosmo-postgresql"` |  |
+| keycloak.database.password | string | `"changeme"` |  |
+| keycloak.database.port | int | `5432` |  |
+| keycloak.database.username | string | `"postgres"` |  |
+| keycloak.database.vendor | string | `"postgres"` |  |
+| keycloak.extraEnv | string | `"- name: KC_BOOTSTRAP_ADMIN_USERNAME\n  valueFrom:\n    secretKeyRef:\n      name: {{ include \"keycloak.fullname\" . }}-bootstrap\n      key: adminUser\n- name: KC_BOOTSTRAP_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: {{ include \"keycloak.fullname\" . }}-bootstrap\n      key: adminPassword\n- name: KC_HOSTNAME_STRICT\n  value: 'false'\n"` |  |
+| keycloak.extraVolumeMounts | string | `"- mountPath: /opt/keycloak/data/import/realm.json\n  name: realm-config-volume\n  readOnly: true\n  subPath: realm.json\n"` |  |
+| keycloak.extraVolumes | string | `"- name: realm-config-volume\n  configMap:\n    name: keycloak-realm\n"` |  |
+| keycloak.health.enabled | bool | `true` |  |
+| keycloak.http.relativePath | string | `"/"` |  |
 | keycloak.image.pullPolicy | string | `"IfNotPresent"` |  |
-| keycloak.image.registry | string | `"ghcr.io"` |  |
-| keycloak.image.repository | string | `"wundergraph/cosmo/keycloak"` |  |
-| keycloak.image.tag | string | `"0.10.4"` |  |
+| keycloak.image.repository | string | `"ghcr.io/wundergraph/cosmo/keycloak"` |  |
+| keycloak.image.tag | string | `"0.13.0"` |  |
 | keycloak.metrics.enabled | bool | `true` |  |
 | keycloak.podAnnotations."kapp.k14s.io/change-group" | string | `"cosmo.apps.keycloak.wundergraph.com/deployment"` | Support for k14s.io. This annotation will form a group to coordinate deployments with kapp. |
 | keycloak.podAnnotations."kapp.k14s.io/change-rule.postgresql" | string | `"upsert after upserting cosmo.apps.postgresql.wundergraph.com/deployment"` | Support for k14s.io. This annotation will wait for the postgresql deployments to be ready before deploying. |
-| keycloak.postgresql.enabled | bool | `false` |  |
-| keycloak.production | bool | `false` |  |
-| keycloak.replicaCount | int | `1` |  |
-| keycloak.resourcesPreset | string | `"none"` | Is set to 'small' by default which is too small and runs in OOMKilled |
-| keycloak.service.ports.http | int | `8080` |  |
-| keycloak.startupProbe.enabled | bool | `true` |  |
+| keycloak.replicas | int | `1` |  |
+| keycloak.secrets.bootstrap.stringData.adminPassword | string | `"{{ .Values.global.keycloak.adminPassword }}"` |  |
+| keycloak.secrets.bootstrap.stringData.adminUser | string | `"{{ .Values.global.keycloak.adminUser }}"` |  |
+| keycloak.service.httpPort | int | `8080` |  |
+| keycloak.statefulsetAnnotations."kapp.k14s.io/update-strategy" | string | `"fallback-on-replace"` |  |
 | minio.auth.rootPassword | string | `"changeme"` |  |
 | minio.auth.rootUser | string | `"minio"` |  |
 | minio.commonAnnotations."kapp.k14s.io/change-group" | string | `"cosmo.apps.minio.wundergraph.com/deployment"` |  |
 | minio.defaultBuckets | string | `"cosmo"` |  |
+| minio.image.registry | string | `"docker.io"` |  |
+| minio.image.repository | string | `"bitnamilegacy/minio"` |  |
+| minio.image.tag | string | `"2025.7.23-debian-12-r5"` |  |
 | minio.persistence.annotations."kapp.k14s.io/owned-for-deletion" | string | `""` |  |
 | minio.persistence.size | string | `"1Gi"` |  |
 | minio.service.ports.minio | int | `9000` |  |
@@ -219,6 +218,8 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 | postgresql.auth.password | string | `"changeme"` |  |
 | postgresql.auth.username | string | `"postgres"` |  |
 | postgresql.commonAnnotations."kapp.k14s.io/change-group" | string | `"cosmo.apps.postgresql.wundergraph.com/deployment"` |  |
+| postgresql.image.registry | string | `"docker.io"` |  |
+| postgresql.image.repository | string | `"bitnamilegacy/postgresql"` |  |
 | postgresql.primary.initdb.password | string | `"changeme"` |  |
 | postgresql.primary.initdb.scripts."01_init_keycloak.sql" | string | `"-- Create the database for Keycloak\nCREATE DATABASE \"keycloak\";\n"` |  |
 | postgresql.primary.initdb.user | string | `"postgres"` |  |
@@ -228,10 +229,13 @@ This is the official Helm Chart for WunderGraph Cosmo - The Full Lifecycle Graph
 | redis.auth.enabled | bool | `false` |  |
 | redis.commonAnnotations."kapp.k14s.io/change-group" | string | `"cosmo.apps.redis.wundergraph.com/deployment"` |  |
 | redis.commonConfiguration | string | `"# Enable AOF https://redis.io/topics/persistence#append-only-file\nappendonly yes\n# Enable RDB persistence (backup every 24h)\nsave \"86400 1\"\n# Disable maxmemory-policy https://redis.io/topics/lru-cache#eviction-policies\nmaxmemory-policy noeviction\n# Set maxmemory to 100mb\nmaxmemory 100mb"` |  |
+| redis.image.registry | string | `"docker.io"` |  |
+| redis.image.repository | string | `"bitnamilegacy/redis"` |  |
 | redis.master.persistence.annotations."kapp.k14s.io/owned-for-deletion" | string | `""` |  |
 | redis.master.persistence.enabled | bool | `true` |  |
 | redis.master.persistence.size | string | `"1Gi"` |  |
 | redis.replica.replicaCount | int | `0` |  |
+| router.additionalPodLabels | object | `{}` | Add labels to pod resources |
 | router.commonLabels | object | `{}` | Add labels to all deployed resources |
 | router.configuration.cdnUrl | string | `"http://cosmo-cdn:8787"` | The URL of the Cosmo CDN. Should be internal to the cluster. |
 | router.configuration.controlplaneUrl | string | `"http://cosmo-controlplane:3001"` | The URL of the Cosmo Controlplane. Should be internal to the cluster. |

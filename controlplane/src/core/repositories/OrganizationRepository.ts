@@ -7,7 +7,7 @@ import {
   WebhookDelivery,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import { addDays } from 'date-fns';
-import { SQL, and, asc, count, desc, eq, gt, inArray, like, lt, not, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, gt, inArray, like, lt, not, SQL, sql } from 'drizzle-orm';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { FastifyBaseLogger } from 'fastify';
 import { NewOrganizationFeature } from '../../db/models.js';
@@ -18,19 +18,20 @@ import {
   organizationBilling,
   organizationFeatures,
   organizationIntegrations,
-  organizationWebhooks,
   organizations,
   organizationsMembers,
+  organizationWebhooks,
   slackIntegrationConfigs,
   slackSchemaUpdateEventConfigs,
   users,
 } from '../../db/schema.js';
 import {
+  COMPOSITION_IGNORE_EXTERNAL_KEYS_FEATURE_ID,
   Feature,
   FeatureIds,
   OrganizationDTO,
-  OrganizationMemberDTO,
   OrganizationGroupDTO,
+  OrganizationMemberDTO,
   WebhooksConfigDTO,
 } from '../../types/index.js';
 import Keycloak from '../services/Keycloak.js';
@@ -39,6 +40,7 @@ import { BlobStorage } from '../blobstorage/index.js';
 import { delayForManualOrgDeletionInDays, delayForOrgAuditLogsDeletionInDays } from '../constants.js';
 import { DeleteOrganizationAuditLogsQueue } from '../workers/DeleteOrganizationAuditLogsWorker.js';
 import { RBACEvaluator } from '../services/RBACEvaluator.js';
+import { traced } from '../tracing.js';
 import { BillingRepository } from './BillingRepository.js';
 import { FederatedGraphRepository } from './FederatedGraphRepository.js';
 import { TargetRepository } from './TargetRepository.js';
@@ -47,6 +49,7 @@ import { OrganizationGroupRepository } from './OrganizationGroupRepository.js';
 /**
  * Repository for organization related operations.
  */
+@traced
 export class OrganizationRepository {
   protected billing: BillingRepository;
 
@@ -95,12 +98,13 @@ export class OrganizationRepository {
     return org;
   }
 
-  public async updateOrganization(input: { id: string; slug?: string; name?: string }) {
+  public async updateOrganization(input: { id: string; slug?: string; name?: string; kcGroupId?: string }) {
     await this.db
       .update(organizations)
       .set({
         name: input.name,
         slug: input.slug,
+        kcGroupId: input.kcGroupId,
       })
       .where(eq(organizations.id, input.id))
       .execute();
@@ -130,7 +134,7 @@ export class OrganizationRepository {
       .from(organizations)
       .leftJoin(organizationBilling, eq(organizations.id, organizationBilling.organizationId))
       .leftJoin(billingSubscriptions, eq(organizations.id, billingSubscriptions.organizationId))
-      .where(eq(organizations.slug, slug))
+      .where(eq(sql`lower(${organizations.slug})`, slug.toLowerCase()))
       .limit(1)
       .execute();
 
@@ -246,10 +250,16 @@ export class OrganizationRepository {
         slug: organizations.slug,
       })
       .from(organizationsMembers)
-      .innerJoin(organizations, eq(organizations.id, input.organizationId))
+      .innerJoin(organizations, eq(organizations.id, organizationsMembers.organizationId))
       .innerJoin(users, eq(users.id, organizationsMembers.userId))
+      .where(
+        and(
+          eq(organizationsMembers.organizationId, input.organizationId),
+          eq(organizationsMembers.userId, input.userId),
+          eq(organizationsMembers.active, true),
+        ),
+      )
       .limit(1)
-      .where(eq(users.id, input.userId))
       .execute();
 
     return userOrganizations.length > 0;
@@ -278,13 +288,14 @@ export class OrganizationRepository {
         queuedForDeletionAt: organizations.queuedForDeletionAt,
         queuedForDeletionBy: organizations.queuedForDeletionBy,
         kcGroupId: organizations.kcGroupId,
+        active: organizationsMembers.active,
       })
       .from(organizationsMembers)
       .innerJoin(organizations, eq(organizations.id, organizationsMembers.organizationId))
       .innerJoin(users, eq(users.id, organizationsMembers.userId))
       .leftJoin(organizationBilling, eq(organizations.id, organizationBilling.organizationId))
       .leftJoin(billingSubscriptions, eq(organizations.id, billingSubscriptions.organizationId))
-      .where(eq(users.id, input.userId))
+      .where(and(eq(users.id, input.userId), eq(organizationsMembers.active, true)))
       .execute();
 
     return Promise.all(
@@ -364,7 +375,7 @@ export class OrganizationRepository {
         userID: users.id,
         email: users.email,
         memberID: organizationsMembers.id,
-        active: users.active,
+        active: organizationsMembers.active,
         createdAt: organizationsMembers.createdAt,
       })
       .from(organizationsMembers)
@@ -402,7 +413,7 @@ export class OrganizationRepository {
         userID: users.id,
         email: users.email,
         memberID: organizationsMembers.id,
-        active: users.active,
+        active: organizationsMembers.active,
         createdAt: organizationsMembers.createdAt,
       })
       .from(organizationsMembers)
@@ -458,7 +469,7 @@ export class OrganizationRepository {
         userID: users.id,
         email: users.email,
         memberID: organizationsMembers.id,
-        active: users.active,
+        active: organizationsMembers.active,
         createdAt: organizationsMembers.createdAt,
       })
       .from(organizationsMembers)
@@ -495,10 +506,36 @@ export class OrganizationRepository {
       .values({
         userId: input.userID,
         organizationId: input.organizationID,
+        active: true,
       })
+      .onConflictDoNothing()
       .returning()
       .execute();
-    return insertedMember[0];
+
+    if (insertedMember.length > 0) {
+      // The user wasn't part of the organization, so
+      return insertedMember[0];
+    }
+
+    const existingMember = await this.db
+      .select()
+      .from(organizationsMembers)
+      .where(
+        and(
+          eq(organizationsMembers.organizationId, input.organizationID),
+          eq(organizationsMembers.userId, input.userID),
+        ),
+      )
+      .execute();
+
+    return existingMember[0];
+  }
+
+  public setOrganizationMemberActive(input: { id: string; organizationId: string; active: boolean }) {
+    return this.db
+      .update(organizationsMembers)
+      .set({ active: input.active })
+      .where(and(eq(organizationsMembers.organizationId, input.organizationId), eq(organizationsMembers.id, input.id)));
   }
 
   public async removeOrganizationMember(input: { userID: string; organizationID: string }) {
@@ -923,33 +960,32 @@ export class OrganizationRepository {
     return result[0];
   }
 
-  public queueOrganizationDeletion(input: {
+  public async queueOrganizationDeletion(input: {
     organizationId: string;
     queuedBy?: string;
     deleteOrganizationQueue: DeleteOrganizationQueue;
+    deleteDelayInDays?: number;
   }) {
-    return this.db.transaction(async (tx) => {
-      const now = new Date();
-      await tx
-        .update(schema.organizations)
-        .set({
-          queuedForDeletionAt: now,
-          queuedForDeletionBy: input.queuedBy,
-        })
-        .where(eq(schema.organizations.id, input.organizationId));
+    const now = new Date();
+    await this.db
+      .update(schema.organizations)
+      .set({
+        queuedForDeletionAt: now,
+        queuedForDeletionBy: input.queuedBy,
+      })
+      .where(eq(schema.organizations.id, input.organizationId));
 
-      const deleteAt = addDays(now, delayForManualOrgDeletionInDays);
-      const delay = Number(deleteAt) - Number(now);
+    const deleteAt = addDays(now, input.deleteDelayInDays || delayForManualOrgDeletionInDays);
+    const delay = Number(deleteAt) - Number(now);
 
-      return await input.deleteOrganizationQueue.addJob(
-        {
-          organizationId: input.organizationId,
-        },
-        {
-          delay,
-        },
-      );
-    });
+    return await input.deleteOrganizationQueue.addJob(
+      {
+        organizationId: input.organizationId,
+      },
+      {
+        delay,
+      },
+    );
   }
 
   public restoreOrganization(input: { organizationId: string; deleteOrganizationQueue: DeleteOrganizationQueue }) {
@@ -994,6 +1030,9 @@ export class OrganizationRepository {
         const blobStorageDirectory = `${organizationId}/${graph.id}`;
         blobPromises.push(blobStorage.removeDirectory({ key: blobStorageDirectory }));
       }
+
+      blobPromises.push(blobStorage.removeDirectory({ key: `${organizationId}/subgraph_checks` }));
+
       await Promise.allSettled(blobPromises);
 
       // Delete organization from db
@@ -1365,17 +1404,24 @@ export class OrganizationRepository {
       'federated-graphs': 30,
       'feature-flags': 0,
       'field-pruning-grace-period': 0,
+      plugins: 0,
+      'persisted-operations': 3000,
       users: 25,
       requests: 30,
-      rbac: false,
-      sso: false,
-      security: false,
-      support: false,
-      oidc: false,
+      // Boolean features
       ai: false,
-      scim: false,
+      [COMPOSITION_IGNORE_EXTERNAL_KEYS_FEATURE_ID]: false,
       'cache-warmer': false,
+      oidc: false,
       proposals: false,
+      rbac: false,
+      scim: false,
+      security: false,
+      sso: false,
+      'subgraph-check-extensions': false,
+      support: false,
+      'split-config-loading': false,
+      'login-method-restrictions': false,
     };
 
     for (const feature of features) {

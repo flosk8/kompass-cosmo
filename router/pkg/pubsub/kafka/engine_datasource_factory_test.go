@@ -1,13 +1,14 @@
 package kafka
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
 	"github.com/wundergraph/cosmo/router/pkg/pubsub/pubsubtest"
 )
 
@@ -29,11 +30,13 @@ func TestKafkaEngineDataSourceFactory(t *testing.T) {
 // TestEngineDataSourceFactoryWithMockAdapter tests the EngineDataSourceFactory with a mocked adapter
 func TestEngineDataSourceFactoryWithMockAdapter(t *testing.T) {
 	// Create mock adapter
-	mockAdapter := NewMockAdapter(t)
+	mockAdapter := datasource.NewMockProvider(t)
 
 	// Configure mock expectations for Publish
-	mockAdapter.On("Publish", mock.Anything, mock.MatchedBy(func(event PublishEventConfiguration) bool {
-		return event.ProviderID == "test-provider" && event.Topic == "test-topic"
+	mockAdapter.On("Publish", mock.Anything, mock.MatchedBy(func(event *PublishEventConfiguration) bool {
+		return event.ProviderID() == "test-provider" && event.Topic == "test-topic"
+	}), mock.MatchedBy(func(events []datasource.StreamEvent) bool {
+		return len(events) == 1 && strings.EqualFold(string(events[0].GetData()), `{"test":"data"}`)
 	})).Return(nil)
 
 	// Create the data source with mock adapter
@@ -54,16 +57,15 @@ func TestEngineDataSourceFactoryWithMockAdapter(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call Load on the data source
-	out := &bytes.Buffer{}
-	err = ds.Load(context.Background(), []byte(input), out)
+	data, err := ds.Load(context.Background(), nil, []byte(input))
 	require.NoError(t, err)
-	require.Equal(t, `{"success": true}`, out.String())
+	require.Equal(t, `{"__typename": "edfs__PublishResult", "success": true}`, string(data))
 }
 
 // TestEngineDataSourceFactory_GetResolveDataSource_WrongType tests the EngineDataSourceFactory with a mocked adapter
 func TestEngineDataSourceFactory_GetResolveDataSource_WrongType(t *testing.T) {
 	// Create mock adapter
-	mockAdapter := NewMockAdapter(t)
+	mockAdapter := datasource.NewMockProvider(t)
 
 	// Create the data source with mock adapter
 	pubsub := &EngineDataSourceFactory{
@@ -136,4 +138,76 @@ func TestKafkaEngineDataSourceFactoryMultiTopicSubscription(t *testing.T) {
 	require.Equal(t, 2, len(subscriptionConfig.Topics), "Expected 2 topics in subscription configuration")
 	require.Equal(t, "test-topic-1", subscriptionConfig.Topics[0], "Expected first topic to be 'test-topic-1'")
 	require.Equal(t, "test-topic-2", subscriptionConfig.Topics[1], "Expected second topic to be 'test-topic-2'")
+}
+
+func TestTransformEventConfig(t *testing.T) {
+	t.Run("publish event", func(t *testing.T) {
+		cfg := &EngineDataSourceFactory{
+			providerId: "test-provider",
+			eventType:  EventTypePublish,
+			topics:     []string{"original.topic"},
+			fieldName:  "testField",
+		}
+
+		transformFn := func(s string) (string, error) {
+			return "transformed." + s, nil
+		}
+
+		err := cfg.TransformEventData(transformFn)
+		require.NoError(t, err)
+		require.Equal(t, []string{"transformed.original.topic"}, cfg.topics)
+	})
+
+	t.Run("publish event invalid topic count", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			topics      []string
+			expectedErr string
+		}{
+			{
+				name:        "no topics",
+				topics:      nil,
+				expectedErr: "publish event definition should define one topic but has 0",
+			},
+			{
+				name:        "multiple topics",
+				topics:      []string{"topic.one", "topic.two"},
+				expectedErr: "publish event definition should define one topic but has 2",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				cfg := &EngineDataSourceFactory{
+					providerId: "test-provider",
+					eventType:  EventTypePublish,
+					topics:     append([]string(nil), tc.topics...),
+					fieldName:  "testField",
+				}
+
+				err := cfg.TransformEventData(func(s string) (string, error) {
+					return "transformed." + s, nil
+				})
+				require.ErrorContains(t, err, tc.expectedErr)
+				require.Equal(t, tc.topics, cfg.topics)
+			})
+		}
+	})
+
+	t.Run("subscribe event", func(t *testing.T) {
+		cfg := &EngineDataSourceFactory{
+			providerId: "test-provider",
+			eventType:  EventTypeSubscribe,
+			topics:     []string{"original.topic2", "original.topic1"},
+			fieldName:  "testField",
+		}
+
+		transformFn := func(s string) (string, error) {
+			return "transformed." + s, nil
+		}
+
+		err := cfg.TransformEventData(transformFn)
+		require.NoError(t, err)
+		require.Equal(t, []string{"transformed.original.topic1", "transformed.original.topic2"}, cfg.topics)
+	})
 }

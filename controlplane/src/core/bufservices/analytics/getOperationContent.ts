@@ -6,7 +6,9 @@ import {
   GetOperationContentResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
 import type { RouterOptions } from '../../routes.js';
+import { UnauthorizedError } from '../../errors/errors.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
+import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
 
 // Get operation content by hash
 // TODO: Specify daterange to improve clickhouse performance
@@ -30,26 +32,45 @@ export function getOperationContent(
       };
     }
 
-    const query = `
-          SELECT OperationContent as operationContent
-          FROM ${opts.chClient?.database}.gql_metrics_operations
-          WHERE OperationHash = '${req.hash}'
-          LIMIT 1 SETTINGS use_query_cache = true, query_cache_ttl = 2629800
-        `;
-
-    const result = await opts.chClient.queryPromise(query);
-
-    if (!Array.isArray(result)) {
+    const fedGraphRepo = new FederatedGraphRepository(logger, opts.db, authContext.organizationId);
+    const graph = await fedGraphRepo.byName(req.federatedGraphName, req.namespace);
+    if (!graph) {
       return {
         response: {
           code: EnumStatusCode.ERR_NOT_FOUND,
-          details: 'Requested operation not found',
+          details: `Federated graph '${req.federatedGraphName}' not found`,
         },
         operationContent: '',
       };
     }
 
-    if (result.length === 0) {
+    if (!authContext.rbac.hasFederatedGraphReadAccess(graph)) {
+      throw new UnauthorizedError();
+    }
+
+    const query = `
+      SELECT OperationContent as operationContent
+      FROM ${opts.chClient?.database}.gql_metrics_operations
+      WHERE OrganizationID = {organizationId:String} 
+      AND FederatedGraphID = {federatedGraphId:String}
+      AND OperationHash = {operationHash:String}
+      ${req.name === undefined ? '' : 'AND OperationName = {operationName:String}'}
+      LIMIT 1 SETTINGS use_query_cache = true, query_cache_ttl = 2629800
+    `;
+
+    const params: Record<string, string | number | boolean> = {
+      organizationId: authContext.organizationId,
+      federatedGraphId: graph.id,
+      operationHash: req.hash.replace(/'/g, "''"),
+    };
+
+    if (req.name !== undefined) {
+      params.operationName = req.name.replace(/'/g, "''");
+    }
+
+    const result = await opts.chClient.queryPromise(query, params);
+
+    if (!Array.isArray(result) || result.length === 0) {
       return {
         response: {
           code: EnumStatusCode.ERR_NOT_FOUND,

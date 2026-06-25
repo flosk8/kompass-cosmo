@@ -3,12 +3,14 @@ package metric
 import (
 	"net/url"
 	"regexp"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/wundergraph/cosmo/router/pkg/config"
 	"github.com/wundergraph/cosmo/router/pkg/otel/otelconfig"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 )
 
 // DefaultServerName Default resource name.
@@ -16,6 +18,27 @@ const DefaultServerName = "cosmo-router"
 
 // DefaultCardinalityLimit is the hard limit on the number of metric streams that can be collected for a single instrument.
 const DefaultCardinalityLimit = 2000
+
+type ExemplarFilter string
+
+const (
+	ExemplarFilterTraceBased ExemplarFilter = "trace_based"
+	ExemplarFilterAlwaysOff  ExemplarFilter = "always_off"
+	ExemplarFilterAlwaysOn   ExemplarFilter = "always_on"
+)
+
+func (e ExemplarFilter) toOtelExemplarFilter() exemplar.Filter {
+	switch e {
+	case ExemplarFilterTraceBased:
+		return exemplar.TraceBasedFilter
+	case ExemplarFilterAlwaysOff:
+		return exemplar.AlwaysOffFilter
+	case ExemplarFilterAlwaysOn:
+		return exemplar.AlwaysOnFilter
+	default:
+		return exemplar.AlwaysOffFilter
+	}
+}
 
 type PrometheusConfig struct {
 	Enabled         bool
@@ -25,6 +48,7 @@ type PrometheusConfig struct {
 	GraphqlCache    bool
 	EngineStats     EngineStatsConfig
 	CircuitBreaker  bool
+	CostStats       config.CostStats
 	// Metrics to exclude from Prometheus exporter
 	ExcludeMetrics []*regexp.Regexp
 	// Metric labels to exclude from Prometheus exporter
@@ -35,11 +59,21 @@ type PrometheusConfig struct {
 	ExcludeScopeInfo bool
 	// Prometheus schema field usage configuration
 	PromSchemaFieldUsage PrometheusSchemaFieldUsage
+	Streams              bool
+	ExemplarFilter       ExemplarFilter
 }
 
 type PrometheusSchemaFieldUsage struct {
 	Enabled             bool
 	IncludeOperationSha bool
+	Exporter            PrometheusSchemaFieldUsageExporter
+}
+
+type PrometheusSchemaFieldUsageExporter struct {
+	BatchSize     int
+	QueueSize     int
+	Interval      time.Duration
+	ExportTimeout time.Duration
 }
 
 type OpenTelemetryExporter struct {
@@ -65,12 +99,22 @@ func (e *EngineStatsConfig) Enabled() bool {
 	return e.Subscription
 }
 
+type LogExporterConfig struct {
+	Enabled        bool
+	ExcludeMetrics []*regexp.Regexp
+	// IncludeMetrics is an allowlist. If set, only metrics matching these patterns are logged.
+	IncludeMetrics []*regexp.Regexp
+	// ExportInterval overrides the default export interval. If zero, the default interval is used.
+	ExportInterval time.Duration
+}
+
 type OpenTelemetry struct {
 	Enabled         bool
 	ConnectionStats bool
 	RouterRuntime   bool
 	GraphqlCache    bool
 	CircuitBreaker  bool
+	CostStats       config.CostStats
 	EngineStats     EngineStatsConfig
 	Exporters       []*OpenTelemetryExporter
 	// Metrics to exclude from the OTLP exporter.
@@ -78,7 +122,10 @@ type OpenTelemetry struct {
 	// Metric labels to exclude from the OTLP exporter.
 	ExcludeMetricLabels []*regexp.Regexp
 	// TestReader is used for testing purposes. If set, the reader will be used instead of the configured exporters.
-	TestReader sdkmetric.Reader
+	TestReader     sdkmetric.Reader
+	Streams        bool
+	LogExporter    LogExporterConfig
+	ExemplarFilter ExemplarFilter
 }
 
 func GetDefaultExporter(cfg *Config) *OpenTelemetryExporter {
@@ -147,7 +194,7 @@ func DefaultConfig(serviceVersion string) *Config {
 				{
 					Disabled: false,
 					Endpoint: "http://localhost:4318",
-					Exporter: otelconfig.ExporterOLTPHTTP,
+					Exporter: otelconfig.ExporterOTLPHTTP,
 					HTTPPath: otelconfig.DefaultMetricsPath,
 				},
 			},

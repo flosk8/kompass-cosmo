@@ -1,9 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import {
   CONDITION,
-  federateSubgraphs,
-  FederationResultFailure,
-  FederationResultSuccess,
   FIRST_ORDINAL,
   inaccessibleSubscriptionFieldConditionFieldPathFieldErrorMessage,
   invalidArgumentValueErrorMessage,
@@ -17,154 +14,116 @@ import {
   LIST,
   nonKeyComposingObjectTypeNamesEventDrivenErrorMessage,
   nonLeafSubscriptionFieldConditionFieldPathFinalFieldErrorMessage,
-  NormalizationResultFailure,
-  NormalizationResultSuccess,
-  normalizeSubgraph,
+  type NormalizationSuccess,
   NULL,
   OBJECT,
   parse,
   ROUTER_COMPATIBILITY_VERSION_ONE,
-  Subgraph,
+  type Subgraph,
   subgraphValidationError,
   SUBSCRIPTION,
   SUBSCRIPTION_FILTER,
   subscriptionFieldConditionEmptyValuesArrayErrorMessage,
-  subscriptionFieldConditionInvalidInputFieldErrorMessage,
+  subscriptionFieldConditionInvalidInputFieldError,
   subscriptionFieldConditionInvalidValuesArrayErrorMessage,
-  subscriptionFilterArrayConditionInvalidLengthErrorMessage,
-  subscriptionFilterConditionDepthExceededErrorMessage,
-  subscriptionFilterConditionInvalidInputFieldErrorMessage,
-  subscriptionFilterConditionInvalidInputFieldTypeErrorMessage,
+  subscriptionFilterArrayConditionInvalidLengthError,
+  subscriptionFilterConditionDepthExceededError,
+  subscriptionFilterConditionInvalidInputFieldError,
+  subscriptionFilterConditionInvalidInputFieldTypeError,
+  subscriptionFilterInterfaceImplementationInvalidError,
+  subscriptionFilterUnionMemberInvalidError,
+  undefinedSubscriptionFieldConditionFieldPathFieldErrorMessage,
 } from '../../../src';
-import { versionOnePersistedDirectiveDefinitions } from '../utils/utils';
-import { normalizeString, schemaToSortedNormalizedString } from '../../utils/utils';
+import {
+  federateSubgraphsFailure,
+  federateSubgraphsSuccess,
+  normalizeString,
+  normalizeSubgraphFailure,
+  normalizeSubgraphSuccess,
+  schemaToSortedNormalizedString,
+} from '../../utils/utils';
+import {
+  OPENFED_FIELD_SET,
+  OPENFED_SUBSCRIPTION_FIELD_CONDITION,
+  OPENFED_SUBSCRIPTION_FILTER_CONDITION,
+  OPENFED_SUBSCRIPTION_FILTER_VALUE,
+} from '../utils/utils';
 
 describe('@openfed__subscriptionFilter tests', () => {
   describe('Normalization tests', () => {
     test('that an error is returned if the directive is defined on a non-subscription root field', () => {
-      const result = normalizeSubgraph(
-        subgraphA.definitions,
-        subgraphA.name,
-        undefined,
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as NormalizationResultFailure;
-      expect(result.success).toBe(false);
-      expect(result.errors).toHaveLength(2);
-      expect(result.errors[0]).toStrictEqual(invalidSubscriptionFilterLocationError('Object.field'));
-      expect(result.errors[1]).toStrictEqual(
+      const { errors } = normalizeSubgraphFailure(subgraphA, ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toStrictEqual(invalidSubscriptionFilterLocationError('Object.field'));
+      expect(errors[1]).toStrictEqual(
         invalidEventDrivenGraphError([nonKeyComposingObjectTypeNamesEventDrivenErrorMessage([OBJECT])]),
       );
     });
 
     test('that subscriptionFilter inputs and scalar are injected', () => {
-      const result = normalizeSubgraph(
-        subgraphC.definitions,
-        subgraphC.name,
-        undefined,
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as NormalizationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.schema)).toBe(
-        normalizeString(`
+      const { schema } = normalizeSubgraphSuccess(subgraphC, ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(schemaToSortedNormalizedString(schema)).toBe(
+        normalizeString(
+          `
         schema {
           subscription: Subscription
         }
-        
+
         directive @edfs__kafkaSubscribe(providerId: String! = "default", topics: [String!]!) on FIELD_DEFINITION
-        directive @extends on INTERFACE | OBJECT
         directive @external on FIELD_DEFINITION | OBJECT
         directive @key(fields: openfed__FieldSet!, resolvable: Boolean = true) repeatable on INTERFACE | OBJECT
         directive @openfed__subscriptionFilter(condition: openfed__SubscriptionFilterCondition!) on FIELD_DEFINITION
-        directive @provides(fields: openfed__FieldSet!) on FIELD_DEFINITION
-        directive @requires(fields: openfed__FieldSet!) on FIELD_DEFINITION
-        directive @tag(name: String!) repeatable on ARGUMENT_DEFINITION | ENUM | ENUM_VALUE | FIELD_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION
-        
+
         type Entity @key(fields: "id", resolvable: false) {
           id: ID! @external
         }
-        
+
         type Subscription {
           field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: {IN: {fieldPath: "id", values: ["1"]}})
         }
-        
-        scalar openfed__FieldSet
-        
-        input openfed__SubscriptionFieldCondition {
-          fieldPath: String!
-          values: [openfed__SubscriptionFilterValue]!
-        }
-        
-        input openfed__SubscriptionFilterCondition {
-          AND: [openfed__SubscriptionFilterCondition!]
-          IN: openfed__SubscriptionFieldCondition
-          NOT: openfed__SubscriptionFilterCondition
-          OR: [openfed__SubscriptionFilterCondition!]
-        }
-        
-        scalar openfed__SubscriptionFilterValue
-      `),
+      ` +
+            OPENFED_FIELD_SET +
+            OPENFED_SUBSCRIPTION_FIELD_CONDITION +
+            OPENFED_SUBSCRIPTION_FILTER_CONDITION +
+            OPENFED_SUBSCRIPTION_FILTER_VALUE,
+        ),
       );
     });
 
     test('that inputs and scalars that are injected can be self-defined', () => {
-      const result = normalizeSubgraph(
-        subgraphG.definitions,
-        subgraphG.name,
-        undefined,
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as NormalizationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.schema)).toBe(
-        normalizeString(`
+      const { schema } = normalizeSubgraphSuccess(subgraphG, ROUTER_COMPATIBILITY_VERSION_ONE) as NormalizationSuccess;
+      expect(schemaToSortedNormalizedString(schema)).toBe(
+        normalizeString(
+          `
         schema {
           subscription: Subscription
         }
-        
+
         directive @edfs__kafkaSubscribe(providerId: String! = "default", topics: [String!]!) on FIELD_DEFINITION
-        directive @extends on INTERFACE | OBJECT
         directive @external on FIELD_DEFINITION | OBJECT
         directive @key(fields: openfed__FieldSet!, resolvable: Boolean = true) repeatable on INTERFACE | OBJECT
         directive @openfed__subscriptionFilter(condition: openfed__SubscriptionFilterCondition!) on FIELD_DEFINITION
-        directive @provides(fields: openfed__FieldSet!) on FIELD_DEFINITION
-        directive @requires(fields: openfed__FieldSet!) on FIELD_DEFINITION
-        directive @tag(name: String!) repeatable on ARGUMENT_DEFINITION | ENUM | ENUM_VALUE | FIELD_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION
-        
+
         type Entity @key(fields: "id", resolvable: false) {
           id: ID! @external
         }
-        
+
         type Subscription {
           field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: {IN: {fieldPath: "id", values: [1]}})
         }
-        
-        scalar openfed__FieldSet
-
-        input openfed__SubscriptionFieldCondition {
-          fieldPath: String!
-          values: [openfed__SubscriptionFilterValue]!
-        }
-        
-        input openfed__SubscriptionFilterCondition {
-          AND: [openfed__SubscriptionFilterCondition!]
-          IN: openfed__SubscriptionFieldCondition
-          NOT: openfed__SubscriptionFilterCondition
-          OR: [openfed__SubscriptionFilterCondition!]
-        }
-        
-        scalar openfed__SubscriptionFilterValue
-      `),
+      ` +
+            OPENFED_FIELD_SET +
+            OPENFED_SUBSCRIPTION_FIELD_CONDITION +
+            OPENFED_SUBSCRIPTION_FILTER_CONDITION +
+            OPENFED_SUBSCRIPTION_FILTER_VALUE,
+        ),
       );
     });
 
     test('that an error is returned if @openfed__subscriptionFilter is repeated', () => {
-      const result = normalizeSubgraph(
-        subgraphK.definitions,
-        subgraphK.name,
-        undefined,
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as NormalizationResultFailure;
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors).toStrictEqual([
+      const { errors } = normalizeSubgraphFailure(subgraphK, ROUTER_COMPATIBILITY_VERSION_ONE);
+      expect(errors).toHaveLength(1);
+      expect(errors).toStrictEqual([
         invalidDirectiveError('openfed__subscriptionFilter', 'Subscription.one', FIRST_ORDINAL, [
           invalidRepeatedDirectiveErrorMessage('openfed__subscriptionFilter'),
         ]),
@@ -174,10 +133,7 @@ describe('@openfed__subscriptionFilter tests', () => {
 
   describe('Federation tests', () => {
     test('that configuration is generated correctly #1', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphC],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
+      const result = federateSubgraphsSuccess([subgraphB, subgraphC], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(true);
       expect(result.fieldConfigurations).toStrictEqual([
         {
@@ -195,10 +151,7 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that configuration is generated correctly #2', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphD],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
+      const result = federateSubgraphsSuccess([subgraphB, subgraphD], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(true);
       expect(result.fieldConfigurations).toStrictEqual([
         {
@@ -250,15 +203,12 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is returned if condition.IN.fieldPath references a field that is not defined in the same subgraph as the directive', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphF],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphF], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(false);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toStrictEqual(
         invalidSubscriptionFilterDirectiveError(`Subscription.field`, [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.AND[0].NOT.OR[0].IN',
             [],
             [],
@@ -278,10 +228,7 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is returned if a non-object condition is provided', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphE],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphE], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(false);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toStrictEqual(
@@ -299,14 +246,11 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is returned if invalid condition.IN inputs are provided', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphH],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphH], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(2);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             ['fieldPath', 'values'],
             [],
@@ -315,20 +259,17 @@ describe('@openfed__subscriptionFilter tests', () => {
           ),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.two', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage('condition.IN', [], ['fieldPath', 'values'], [], []),
+          subscriptionFieldConditionInvalidInputFieldError('condition.IN', [], ['fieldPath', 'values'], [], []),
         ]),
       ]);
     });
 
     test('that an error is returned if condition.IN.values is provided an invalid value', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphI],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphI], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(4);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -337,7 +278,7 @@ describe('@openfed__subscriptionFilter tests', () => {
           ),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.two', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -346,7 +287,7 @@ describe('@openfed__subscriptionFilter tests', () => {
           ),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.three', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -355,7 +296,7 @@ describe('@openfed__subscriptionFilter tests', () => {
           ),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.four', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -367,10 +308,7 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that valid non-list values provided to condition.IN.values will be coerced into a list', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphJ],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
+      const result = federateSubgraphsSuccess([subgraphB, subgraphJ], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.success).toBe(true);
       expect(result.fieldConfigurations).toStrictEqual([
         {
@@ -421,39 +359,33 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is returned if condition input value fields are invalid', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphL],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphL], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(5);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFilterConditionInvalidInputFieldErrorMessage('condition', 'OUT'),
+          subscriptionFilterConditionInvalidInputFieldError('condition', 'OUT'),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.two', [
-          subscriptionFilterConditionInvalidInputFieldTypeErrorMessage('condition.AND', LIST, OBJECT),
+          subscriptionFilterConditionInvalidInputFieldTypeError('condition.AND', LIST, OBJECT),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.three', [
-          subscriptionFilterConditionInvalidInputFieldTypeErrorMessage('condition.OR', LIST, OBJECT),
+          subscriptionFilterConditionInvalidInputFieldTypeError('condition.OR', LIST, OBJECT),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.four', [
-          subscriptionFilterConditionInvalidInputFieldTypeErrorMessage('condition.IN', OBJECT, LIST),
+          subscriptionFilterConditionInvalidInputFieldTypeError('condition.IN', OBJECT, LIST),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.five', [
-          subscriptionFilterConditionInvalidInputFieldTypeErrorMessage('condition.NOT', OBJECT, LIST),
+          subscriptionFilterConditionInvalidInputFieldTypeError('condition.NOT', OBJECT, LIST),
         ]),
       ]);
     });
 
     test('that an error is returned if fieldPath references a non-leaf kind', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphM],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphM], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(1);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -473,14 +405,11 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is returned if fieldPath references an inaccessible field', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphN],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphN], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(1);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFieldConditionInvalidInputFieldErrorMessage(
+          subscriptionFieldConditionInvalidInputFieldError(
             'condition.IN',
             [],
             [],
@@ -499,81 +428,191 @@ describe('@openfed__subscriptionFilter tests', () => {
     });
 
     test('that an error is if condition.AND or condition.OR contain no elements or more than 5 elements', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphO],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphO], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(4);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFilterArrayConditionInvalidLengthErrorMessage('condition.AND', 6),
+          subscriptionFilterArrayConditionInvalidLengthError('condition.AND', 6),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.two', [
-          subscriptionFilterArrayConditionInvalidLengthErrorMessage('condition.AND', 0),
+          subscriptionFilterArrayConditionInvalidLengthError('condition.AND', 0),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.three', [
-          subscriptionFilterArrayConditionInvalidLengthErrorMessage('condition.OR', 6),
+          subscriptionFilterArrayConditionInvalidLengthError('condition.OR', 6),
         ]),
         invalidSubscriptionFilterDirectiveError('Subscription.four', [
-          subscriptionFilterArrayConditionInvalidLengthErrorMessage('condition.OR', 0),
+          subscriptionFilterArrayConditionInvalidLengthError('condition.OR', 0),
         ]),
       ]);
     });
 
     test('that an error is returned if a condition has more than 5 layers of nesting', () => {
-      const result = federateSubgraphs(
-        [subgraphB, subgraphP],
-        ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultFailure;
+      const result = federateSubgraphsFailure([subgraphB, subgraphP], ROUTER_COMPATIBILITY_VERSION_ONE);
       expect(result.errors).toHaveLength(1);
       expect(result.errors).toStrictEqual([
         invalidSubscriptionFilterDirectiveError('Subscription.one', [
-          subscriptionFilterConditionDepthExceededErrorMessage('condition.NOT.NOT.NOT.NOT.NOT.IN'),
+          subscriptionFilterConditionDepthExceededError('condition.NOT.NOT.NOT.NOT.NOT.IN'),
         ]),
       ]);
     });
 
+    test('that a subscription filter is emitted when the return type is a union', () => {
+      const result = federateSubgraphsSuccess(
+        [subgraphUnionResolver, subgraphUnionEDG],
+        ROUTER_COMPATIBILITY_VERSION_ONE,
+      );
+      expect(result.success).toBe(true);
+      const subscriptionFields = result.fieldConfigurations.filter(
+        (fc) => fc.typeName === SUBSCRIPTION && fc.fieldName === 'onEntityEvent',
+      );
+      expect(subscriptionFields).toHaveLength(1);
+      expect(subscriptionFields[0]).toStrictEqual({
+        argumentNames: ['entityCode'],
+        fieldName: 'onEntityEvent',
+        typeName: SUBSCRIPTION,
+        subscriptionFilterCondition: {
+          in: {
+            fieldPath: ['entityCode'],
+            values: ['{{ args.entityCode }}'],
+          },
+        },
+      });
+    });
+
+    test('that a subscription filter is emitted when the return type is an interface', () => {
+      const result = federateSubgraphsSuccess(
+        [subgraphInterfaceResolver, subgraphInterfaceEDG],
+        ROUTER_COMPATIBILITY_VERSION_ONE,
+      );
+      expect(result.success).toBe(true);
+      const subscriptionFields = result.fieldConfigurations.filter(
+        (fc) => fc.typeName === SUBSCRIPTION && fc.fieldName === 'onEntityEvent',
+      );
+      expect(subscriptionFields).toHaveLength(1);
+      expect(subscriptionFields[0]).toStrictEqual({
+        argumentNames: ['entityCode'],
+        fieldName: 'onEntityEvent',
+        typeName: SUBSCRIPTION,
+        subscriptionFilterCondition: {
+          in: {
+            fieldPath: ['entityCode'],
+            values: ['{{ args.entityCode }}'],
+          },
+        },
+      });
+    });
+
+    test('that composition fails when a union member is missing the filter fieldPath', () => {
+      const result = federateSubgraphsFailure(
+        [subgraphUnionResolverPartial, subgraphUnionMemberMissingField],
+        ROUTER_COMPATIBILITY_VERSION_ONE,
+      );
+      expect(result.success).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors![0]).toStrictEqual(
+        invalidSubscriptionFilterDirectiveError(`Subscription.onEntityEvent`, [
+          subscriptionFilterUnionMemberInvalidError(
+            'EntityEvent',
+            'EntityDeleted',
+            subscriptionFieldConditionInvalidInputFieldError(
+              'condition.IN',
+              [],
+              [],
+              [],
+              [
+                undefinedSubscriptionFieldConditionFieldPathFieldErrorMessage(
+                  'condition.IN.fieldPath',
+                  'entityCode',
+                  'entityCode',
+                  'entityCode',
+                  'EntityDeleted',
+                ),
+              ],
+            ).message,
+          ),
+        ]),
+      );
+    });
+
+    test('that composition fails when an interface implementer is missing the filter fieldPath', () => {
+      const result = federateSubgraphsFailure(
+        [subgraphInterfaceResolverPartial, subgraphInterfaceImplementerMissingField],
+        ROUTER_COMPATIBILITY_VERSION_ONE,
+      );
+      expect(result.success).toBe(false);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors![0]).toStrictEqual(
+        invalidSubscriptionFilterDirectiveError(`Subscription.onEntityEvent`, [
+          subscriptionFilterInterfaceImplementationInvalidError(
+            'EntityEvent',
+            'EntityDeleted',
+            subscriptionFieldConditionInvalidInputFieldError(
+              'condition.IN',
+              [],
+              [],
+              [],
+              [
+                undefinedSubscriptionFieldConditionFieldPathFieldErrorMessage(
+                  'condition.IN.fieldPath',
+                  'entityCode',
+                  'entityCode',
+                  'entityCode',
+                  'EntityDeleted',
+                ),
+              ],
+            ).message,
+          ),
+        ]),
+      );
+    });
+
+    test('that composition succeeds when an @inaccessible union member is missing the filter fieldPath', () => {
+      const result = federateSubgraphsSuccess(
+        [subgraphUnionResolverPartial, subgraphUnionInaccessibleMemberMissingField],
+        ROUTER_COMPATIBILITY_VERSION_ONE,
+      );
+      expect(result.success).toBe(true);
+      const subscriptionFields = result.fieldConfigurations.filter(
+        (fc) => fc.typeName === SUBSCRIPTION && fc.fieldName === 'onEntityEvent',
+      );
+      expect(subscriptionFields).toHaveLength(1);
+      expect(subscriptionFields[0]).toStrictEqual({
+        argumentNames: ['entityCode'],
+        fieldName: 'onEntityEvent',
+        typeName: SUBSCRIPTION,
+        subscriptionFilterCondition: {
+          in: {
+            fieldPath: ['entityCode'],
+            values: ['{{ args.entityCode }}'],
+          },
+        },
+      });
+    });
+
     test('that an entity can be defined as an extension in an EDG', () => {
-      const result = federateSubgraphs(
+      const { federatedGraphSchema } = federateSubgraphsSuccess(
         [subgraphQ, subgraphR],
         ROUTER_COMPATIBILITY_VERSION_ONE,
-      ) as FederationResultSuccess;
-      expect(result.success).toBe(true);
-      expect(schemaToSortedNormalizedString(result.federatedGraphSchema)).toBe(
+      );
+      expect(schemaToSortedNormalizedString(federatedGraphSchema)).toBe(
         normalizeString(
           `schema {
           query: Query
           subscription: Subscription
         }
-        ` +
-            versionOnePersistedDirectiveDefinitions +
-            `
+
         type Entity {
           id: ID!
           name: String!
         }
-        
+
         type Query {
           entity: Entity!
         }
-        
+
         type Subscription {
           field: Entity!
         }
-
-        input openfed__SubscriptionFieldCondition {
-          fieldPath: String!
-          values: [openfed__SubscriptionFilterValue]!
-        }
-        
-        input openfed__SubscriptionFilterCondition {
-          AND: [openfed__SubscriptionFilterCondition!]
-          IN: openfed__SubscriptionFieldCondition
-          NOT: openfed__SubscriptionFilterCondition
-          OR: [openfed__SubscriptionFilterCondition!]
-        }
-        
-        scalar openfed__SubscriptionFilterValue
       `,
         ),
       );
@@ -588,11 +627,11 @@ const subgraphA: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Object {
       field: String! @openfed__subscriptionFilter(condition: { IN: { fieldPath: "" } })
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"])
     }
@@ -611,7 +650,7 @@ const subgraphB: Subgraph = {
       OC
       SA
     }
-    
+
     type Entity @key(fields: "id") @key(fields: "id object { name, age } product { sku, continent }") {
       age: Int!
       id: ID!
@@ -619,23 +658,23 @@ const subgraphB: Subgraph = {
       object: Object!
       product: Product!
     }
-    
+
     type NestedObject {
       name: String!
     }
-    
+
     type Object {
       id: ID!
       name: String!
       age: Int!
       field: NestedObject!
     }
-  
+
     type Product {
       continent: Continent!
       sku: String!
     }
-    
+
     type Query {
       entities: [Entity!]!
     }
@@ -649,7 +688,7 @@ const subgraphC: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: ["1"] } })
     }
@@ -668,34 +707,34 @@ const subgraphD: Subgraph = {
       OC
       SA
     }
-  
+
     type Entity @key(fields: "id object { name, age } product { sku, continent }", resolvable: false) {
       id: ID! @external
       object: Object! @external
       product: Product! @external
     }
-    
+
     type Object @external {
       name: String!
       age: Int!
     }
-    
+
     type Product @external {
       continent: Continent!
       sku: String!
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
         condition: { AND: [
-          { NOT: 
+          { NOT:
             { OR: [
               { IN: { fieldPath: "object.name", values: ["Jens", "Stefan"] } },
               { IN: { fieldPath: "object.age", values: ["11", "22"] } },
             ] },
           },
           { AND: [
-            { NOT: 
+            { NOT:
               { IN: { fieldPath: "product.sku", values: ["aaa"] } },
             },
             { IN: { fieldPath: "product.continent" values: ["NA"] } },
@@ -713,7 +752,7 @@ const subgraphE: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: 1)
     }
@@ -727,18 +766,18 @@ const subgraphF: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
         condition: { AND: [
-          { NOT: 
+          { NOT:
             { OR: [
               { IN: { fieldPath: "object.field.name", values: ["Jens", "Stefan"] } },
               { IN: { fieldPath: "object.age", values: ["11", "22"] } },
             ] },
           },
           { AND: [
-            { NOT: 
+            { NOT:
               { IN: { fieldPath: "product.sku", values: ["aaa"] } },
             },
             { IN: { fieldPath: "product.continent" values: ["NA"] } },
@@ -756,23 +795,23 @@ const subgraphG: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: [1] } })
     }
-    
+
     input openfed__SubscriptionFieldCondition {
       fieldPath: String!
       values: [openfed__SubscriptionFilterValue]!
     }
-    
+
     input openfed__SubscriptionFilterCondition {
       AND: [openfed__SubscriptionFilterCondition!]
       IN: openfed__SubscriptionFieldCondition
       NOT: openfed__SubscriptionFilterCondition
       OR: [openfed__SubscriptionFilterCondition!]
     }
-    
+
     scalar openfed__SubscriptionFilterValue
   `),
 };
@@ -784,7 +823,7 @@ const subgraphH: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { field: "id", value: [1], } })
       two: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: [1], fieldPath: "id", values: [1] } })
@@ -799,7 +838,7 @@ const subgraphI: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: { hello: "world" } } })
       two: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: [{ hello: "world" }] } })
@@ -816,7 +855,7 @@ const subgraphJ: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: "string" } })
       two: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: 1 } })
@@ -833,7 +872,7 @@ const subgraphK: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"])
         @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: "string" } })
@@ -849,7 +888,7 @@ const subgraphL: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"])
         @openfed__subscriptionFilter(condition: { OUT: { fieldPath: "id", values: "string" } })
@@ -873,11 +912,11 @@ const subgraphM: Subgraph = {
       id: ID! @external
       object: Object! @external
     }
-    
+
     type Object {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "object", values: [1], } })
     }
@@ -892,11 +931,11 @@ const subgraphN: Subgraph = {
       id: ID! @external
       object: Object! @external
     }
-    
+
     type Object {
       id: ID! @external @inaccessible
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "object.id", values: [1], } })
     }
@@ -910,10 +949,10 @@ const subgraphO: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
-        condition: { 
+        condition: {
           AND: [
             { fieldPath: "id", values: [1], },
             { fieldPath: "id", values: [2], },
@@ -921,17 +960,17 @@ const subgraphO: Subgraph = {
             { fieldPath: "id", values: [4], },
             { fieldPath: "id", values: [5], },
             { fieldPath: "id", values: [6], },
-          ] 
+          ]
         }
       )
       two: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
-        condition: { 
+        condition: {
           AND: [
-          ] 
+          ]
         }
       )
       three: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
-        condition: { 
+        condition: {
           OR: [
             { fieldPath: "id", values: [1], },
             { fieldPath: "id", values: [2], },
@@ -939,13 +978,13 @@ const subgraphO: Subgraph = {
             { fieldPath: "id", values: [4], },
             { fieldPath: "id", values: [5], },
             { fieldPath: "id", values: [6], },
-          ] 
+          ]
         }
       )
       four: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
-        condition: { 
+        condition: {
           OR: [
-          ] 
+          ]
         }
       )
     }
@@ -959,10 +998,10 @@ const subgraphP: Subgraph = {
     type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       one: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(
-        condition: { 
+        condition: {
           NOT: {
             NOT: {
               NOT: {
@@ -989,7 +1028,7 @@ const subgraphQ: Subgraph = {
     extend type Entity @key(fields: "id", resolvable: false) {
       id: ID! @external
     }
-    
+
     type Subscription {
       field: Entity! @edfs__kafkaSubscribe(topics: ["employeeUpdated"]) @openfed__subscriptionFilter(condition: { IN: { fieldPath: "id", values: [1] } })
     }
@@ -1017,10 +1056,222 @@ const subgraphR: Subgraph = {
     type Query{
       entity: Entity!
     }
-    
+
     type Entity @key(fields: "id") {
-      id: ID! 
-      name: String! 
+      id: ID!
+      name: String!
+    }
+  `),
+};
+
+// Fixtures for union and interface return types
+
+const subgraphUnionResolver: Subgraph = {
+  name: 'subgraph-union-resolver',
+  url: '',
+  definitions: parse(`
+    type Query {
+      task(id: ID!): EntityUpdated
+    }
+
+    type EntityUpdated @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+      title: String!
+    }
+
+    type EntityDeleted @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+    }
+  `),
+};
+
+const subgraphUnionEDG: Subgraph = {
+  name: 'subgraph-union-edg',
+  url: '',
+  definitions: parse(`
+    type EntityUpdated @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type EntityDeleted @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    union EntityEvent = EntityUpdated | EntityDeleted
+
+    type Subscription {
+      onEntityEvent(entityCode: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entityEvent"])
+        @openfed__subscriptionFilter(condition: { IN: { fieldPath: "entityCode", values: ["{{ args.entityCode }}"] } })
+    }
+  `),
+};
+
+const subgraphInterfaceResolver: Subgraph = {
+  name: 'subgraph-interface-resolver',
+  url: '',
+  definitions: parse(`
+    type Query {
+      entityById(id: ID!): EntityUpdated
+    }
+
+    interface EntityEvent {
+      id: ID!
+      entityCode: String!
+    }
+
+    type EntityUpdated implements EntityEvent @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+      title: String!
+    }
+
+    type EntityDeleted implements EntityEvent @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+    }
+  `),
+};
+
+const subgraphInterfaceEDG: Subgraph = {
+  name: 'subgraph-interface-edg',
+  url: '',
+  definitions: parse(`
+    interface EntityEvent {
+      id: ID!
+      entityCode: String!
+    }
+
+    type EntityUpdated implements EntityEvent @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type EntityDeleted implements EntityEvent @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type Subscription {
+      onEntityEvent(entityCode: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entityEvent"])
+        @openfed__subscriptionFilter(condition: { IN: { fieldPath: "entityCode", values: ["{{ args.entityCode }}"] } })
+    }
+  `),
+};
+
+// Partial resolver — EntityDeleted has only `id`, so entityCode is genuinely absent.
+const subgraphUnionResolverPartial: Subgraph = {
+  name: 'subgraph-union-resolver-partial',
+  url: '',
+  definitions: parse(`
+    type Query {
+      entity(id: ID!): EntityUpdated
+    }
+
+    type EntityUpdated @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+      title: String!
+    }
+
+    type EntityDeleted @key(fields: "id") {
+      id: ID!
+    }
+  `),
+};
+
+const subgraphUnionMemberMissingField: Subgraph = {
+  name: 'subgraph-union-member-missing-field',
+  url: '',
+  definitions: parse(`
+    type EntityUpdated @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type EntityDeleted @key(fields: "id", resolvable: false) {
+      id: ID! @external
+    }
+
+    union EntityEvent = EntityUpdated | EntityDeleted
+
+    type Subscription {
+      onEntityEvent(entityCode: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entityEvent"])
+        @openfed__subscriptionFilter(condition: { IN: { fieldPath: "entityCode", values: ["{{ args.entityCode }}"] } })
+    }
+  `),
+};
+
+const subgraphUnionInaccessibleMemberMissingField: Subgraph = {
+  name: 'subgraph-union-inaccessible-member-missing-field',
+  url: '',
+  definitions: parse(`
+    type EntityUpdated @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type EntityDeleted @inaccessible @key(fields: "id", resolvable: false) {
+      id: ID! @external
+    }
+
+    union EntityEvent = EntityUpdated | EntityDeleted
+
+    type Subscription {
+      onEntityEvent(entityCode: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entityEvent"])
+        @openfed__subscriptionFilter(condition: { IN: { fieldPath: "entityCode", values: ["{{ args.entityCode }}"] } })
+    }
+  `),
+};
+
+const subgraphInterfaceResolverPartial: Subgraph = {
+  name: 'subgraph-interface-resolver-partial',
+  url: '',
+  definitions: parse(`
+    type Query {
+      entityById(id: ID!): EntityUpdated
+    }
+
+    type EntityUpdated @key(fields: "id entityCode") {
+      id: ID!
+      entityCode: String!
+      title: String!
+    }
+
+    type EntityDeleted @key(fields: "id") {
+      id: ID!
+    }
+  `),
+};
+
+const subgraphInterfaceImplementerMissingField: Subgraph = {
+  name: 'subgraph-interface-implementer-missing-field',
+  url: '',
+  definitions: parse(`
+    interface EntityEvent {
+      id: ID!
+    }
+
+    type EntityUpdated implements EntityEvent @key(fields: "id entityCode", resolvable: false) {
+      id: ID! @external
+      entityCode: String! @external
+    }
+
+    type EntityDeleted implements EntityEvent @key(fields: "id", resolvable: false) {
+      id: ID! @external
+    }
+
+    type Subscription {
+      onEntityEvent(entityCode: String!): EntityEvent!
+        @edfs__kafkaSubscribe(topics: ["entityEvent"])
+        @openfed__subscriptionFilter(condition: { IN: { fieldPath: "entityCode", values: ["{{ args.entityCode }}"] } })
     }
   `),
 };

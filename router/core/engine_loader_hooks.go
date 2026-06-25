@@ -4,14 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
+	"sync/atomic"
 	"time"
+
+	"github.com/wundergraph/cosmo/router/internal/expr"
 
 	rcontext "github.com/wundergraph/cosmo/router/internal/context"
 	"github.com/wundergraph/cosmo/router/internal/requestlogger"
 	"github.com/wundergraph/cosmo/router/internal/unique"
 	"github.com/wundergraph/cosmo/router/pkg/metric"
 	rotel "github.com/wundergraph/cosmo/router/pkg/otel"
+	rtrace "github.com/wundergraph/cosmo/router/pkg/trace"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -44,6 +49,7 @@ type engineLoaderHooks struct {
 	metricAttributeExpressions    *attributeExpressions
 
 	storeSubgraphResponseBody bool
+	headerPropagation         *HeaderPropagation
 }
 
 type engineLoaderHooksRequestContext struct {
@@ -58,6 +64,7 @@ func NewEngineRequestHooks(
 	telemetryAttributes *attributeExpressions,
 	metricAttributes *attributeExpressions,
 	storeSubgraphResponseBody bool,
+	headerPropagation *HeaderPropagation,
 ) resolve.LoaderHooks {
 	var tracer trace.Tracer
 	if tracerProvider != nil {
@@ -80,6 +87,7 @@ func NewEngineRequestHooks(
 		metricAttributeExpressions:    metricAttributes,
 		accessLogger:                  logger,
 		storeSubgraphResponseBody:     storeSubgraphResponseBody,
+		headerPropagation:             headerPropagation,
 	}
 }
 
@@ -92,6 +100,9 @@ func (f *engineLoaderHooks) OnLoad(ctx context.Context, ds resolve.DataSourceInf
 	start := time.Now()
 
 	ctx = context.WithValue(ctx, rcontext.CurrentSubgraphContextKey{}, ds.Name)
+
+	duration := atomic.Int64{}
+	ctx = context.WithValue(ctx, rcontext.FetchTimingKey, &duration)
 
 	reqContext := getRequestContext(ctx)
 	if reqContext == nil {
@@ -116,6 +127,21 @@ func (f *engineLoaderHooks) OnFinished(ctx context.Context, ds resolve.DataSourc
 		return
 	}
 
+	if responseInfo == nil {
+		responseInfo = &resolve.ResponseInfo{}
+	}
+
+	// Apply response header rules for ALL fetches (primary, entity resolution,
+	// singleflight leaders and followers). Must run before the tracing/metrics
+	// early returns below, which may not pass for all fetch contexts.
+	if f.headerPropagation != nil {
+		headers := responseInfo.ResponseHeaders
+		if headers == nil {
+			headers = make(http.Header)
+		}
+		f.headerPropagation.ApplyResponseHeaderRules(ctx, headers, ds.Name, responseInfo.StatusCode, responseInfo.Request)
+	}
+
 	reqContext := getRequestContext(ctx)
 
 	if reqContext == nil {
@@ -131,10 +157,6 @@ func (f *engineLoaderHooks) OnFinished(ctx context.Context, ds resolve.DataSourc
 
 	span := trace.SpanFromContext(ctx)
 	defer span.End()
-
-	if responseInfo == nil {
-		responseInfo = &resolve.ResponseInfo{}
-	}
 
 	commonAttrs := []attribute.KeyValue{
 		semconv.HTTPStatusCode(responseInfo.StatusCode),
@@ -153,6 +175,12 @@ func (f *engineLoaderHooks) OnFinished(ctx context.Context, ds resolve.DataSourc
 	exprCtx.Subgraph.Name = ds.Name
 	exprCtx.Subgraph.Request.Error = WrapExprError(responseInfo.Err)
 
+	if value := ctx.Value(rcontext.FetchTimingKey); value != nil {
+		if fetchTiming, ok := value.(*atomic.Int64); ok {
+			exprCtx.Subgraph.Request.ClientTrace.FetchDuration = time.Duration(fetchTiming.Load())
+		}
+	}
+
 	if f.storeSubgraphResponseBody {
 		exprCtx.Subgraph.Response.Body.Raw = responseInfo.GetResponseBody()
 	}
@@ -162,30 +190,36 @@ func (f *engineLoaderHooks) OnFinished(ctx context.Context, ds resolve.DataSourc
 	metricAttrs = append(metricAttrs, reqContext.telemetry.metricAttrs...)
 	metricAttrs = append(metricAttrs, commonAttrs...)
 
-	if f.telemetryAttributeExpressions != nil {
-		telemetryValues, err := f.telemetryAttributeExpressions.expressionsAttributesWithSubgraph(exprCtx)
-		if err != nil {
-			reqContext.Logger().Warn("failed to resolve expression for telemetry", zap.Error(err))
-		}
-		traceAttrs = append(traceAttrs, telemetryValues...)
-		metricAttrs = append(metricAttrs, telemetryValues...)
-	}
-
-	if f.tracingAttributeExpressions != nil {
-		tracingValues, err := f.tracingAttributeExpressions.expressionsAttributesWithSubgraph(exprCtx)
-		if err != nil {
-			reqContext.Logger().Warn("failed to resolve expression for tracing", zap.Error(err))
-		}
-		traceAttrs = append(traceAttrs, tracingValues...)
-	}
-
-	if f.metricAttributeExpressions != nil {
-		metricValues, err := f.metricAttributeExpressions.expressionsAttributesWithSubgraph(exprCtx)
-		if err != nil {
-			reqContext.Logger().Warn("failed to resolve expression for metrics", zap.Error(err))
-		}
-		metricAttrs = append(metricAttrs, metricValues...)
-	}
+	addExpressions(AddExprOpts{
+		logger:      reqContext.logger,
+		expressions: f.telemetryAttributeExpressions,
+		key:         expr.BucketSubgraph,
+		currSpan:    span,
+		exprCtx:     exprCtx,
+		attrAddFunc: func(telemetryValues ...attribute.KeyValue) {
+			traceAttrs = append(traceAttrs, telemetryValues...)
+			metricAttrs = append(metricAttrs, telemetryValues...)
+		},
+	})
+	addExpressions(AddExprOpts{
+		logger:      reqContext.logger,
+		expressions: f.tracingAttributeExpressions,
+		key:         expr.BucketSubgraph,
+		currSpan:    span,
+		exprCtx:     exprCtx,
+		attrAddFunc: func(telemetryValues ...attribute.KeyValue) {
+			traceAttrs = append(traceAttrs, telemetryValues...)
+		},
+	})
+	addExpressions(AddExprOpts{
+		logger:      reqContext.logger,
+		expressions: f.metricAttributeExpressions,
+		key:         expr.BucketSubgraph,
+		exprCtx:     exprCtx,
+		attrAddFunc: func(telemetryValues ...attribute.KeyValue) {
+			metricAttrs = append(metricAttrs, telemetryValues...)
+		},
+	})
 
 	metricAddOpt := otelmetric.WithAttributeSet(attribute.NewSet(metricAttrs...))
 
@@ -203,70 +237,97 @@ func (f *engineLoaderHooks) OnFinished(ctx context.Context, ds resolve.DataSourc
 				path = responseInfo.Request.URL.Path
 			}
 		}
-		f.accessLogger.Info(path, fields)
+
+		if responseInfo.Err != nil && !errors.Is(responseInfo.Err, context.Canceled) {
+			f.accessLogger.Error(path, fields)
+		} else {
+			f.accessLogger.Info(path, fields)
+		}
 	}
 
+	measureSliceAttrs := reqContext.telemetry.metricSliceAttrs
+
 	if responseInfo.Err != nil {
-		// Set error status. This is the fetch error from the engine
-		// Downstream errors are extracted from the subgraph response
-		span.SetStatus(codes.Error, responseInfo.Err.Error())
-		span.RecordError(responseInfo.Err)
+		// Client disconnections (context.Canceled) are not server-side errors.
+		// Record the error for observability but don't set the span status to ERROR
+		// and don't count it as a request error in metrics.
+		if errors.Is(responseInfo.Err, context.Canceled) {
+			span.RecordError(responseInfo.Err)
+		} else {
+			errorSliceAttrs := *reqContext.telemetry.AcquireAttributes()
+			defer reqContext.telemetry.ReleaseAttributes(&errorSliceAttrs)
+			errorSliceAttrs = append(errorSliceAttrs, reqContext.telemetry.metricSliceAttrs...)
 
-		var errorCodesAttr []string
+			measureSliceAttrs, metricAddOpt = f.recordFetchError(ctx, span, responseInfo.Err, reqContext, metricAttrs, metricAddOpt, errorSliceAttrs)
+		}
+	}
 
-		if unwrapped, ok := responseInfo.Err.(multiError); ok {
-			errs := unwrapped.Unwrap()
-			for _, e := range errs {
-				var subgraphError *resolve.SubgraphError
-				if errors.As(e, &subgraphError) {
-					for i, downstreamError := range subgraphError.DownstreamErrors {
-						var errorCode string
-						if downstreamError.Extensions != nil {
-							if ok := downstreamError.Extensions["code"]; ok != nil {
-								if code, ok := downstreamError.Extensions["code"].(string); ok {
-									errorCode = code
-								}
-							}
-						}
+	f.metricStore.MeasureRequestCount(ctx, measureSliceAttrs, metricAddOpt)
+	f.metricStore.MeasureLatency(ctx, latency, measureSliceAttrs, metricAddOpt)
 
-						if errorCode != "" {
-							errorCodesAttr = append(errorCodesAttr, errorCode)
-							span.AddEvent(fmt.Sprintf("Downstream error %d", i+1),
-								trace.WithAttributes(
-									rotel.WgSubgraphErrorExtendedCode.String(errorCode),
-									rotel.WgSubgraphErrorMessage.String(downstreamError.Message),
-								),
-							)
-						}
+	span.SetAttributes(traceAttrs...)
+}
+
+// recordFetchError sets the span status to ERROR, extracts downstream error codes,
+// records the request error metric, and returns the enriched slice attributes and
+// measurement option for the caller to use in MeasureRequestCount/MeasureLatency.
+func (f *engineLoaderHooks) recordFetchError(
+	ctx context.Context,
+	span trace.Span,
+	fetchErr error,
+	reqContext *requestContext,
+	metricAttrs []attribute.KeyValue,
+	metricAddOpt otelmetric.AddOption,
+	metricSliceAttrs []attribute.KeyValue,
+) ([]attribute.KeyValue, otelmetric.MeasurementOption) {
+	rtrace.SetSanitizedSpanStatus(span, codes.Error, fetchErr.Error())
+	span.SetAttributes(rotel.WgRequestError.Bool(true))
+	span.RecordError(fetchErr)
+
+	// Extract downstream error codes from subgraph errors
+	var errorCodesAttr []string
+
+	if unwrapped, ok := fetchErr.(multiError); ok {
+		for _, e := range unwrapped.Unwrap() {
+			var subgraphError *resolve.SubgraphError
+			if !errors.As(e, &subgraphError) {
+				continue
+			}
+
+			for i, downstreamError := range subgraphError.DownstreamErrors {
+				var errorCode string
+				if downstreamError.Extensions != nil {
+					if value := downstreamError.Extensions.Get("code"); value != nil {
+						errorCode = string(value.GetStringBytes())
 					}
 				}
+
+				if errorCode == "" {
+					continue
+				}
+
+				errorCodesAttr = append(errorCodesAttr, errorCode)
+				span.AddEvent(fmt.Sprintf("Downstream error %d", i+1),
+					trace.WithAttributes(
+						rotel.WgSubgraphErrorExtendedCode.String(errorCode),
+						rotel.WgSubgraphErrorMessage.String(downstreamError.Message),
+					),
+				)
 			}
 		}
 
 		errorCodesAttr = unique.SliceElements(errorCodesAttr)
-		// Reduce cardinality of error codes
 		slices.Sort(errorCodesAttr)
-
-		metricSliceAttrs := *reqContext.telemetry.AcquireAttributes()
-		defer reqContext.telemetry.ReleaseAttributes(&metricSliceAttrs)
-		metricSliceAttrs = append(metricSliceAttrs, reqContext.telemetry.metricSliceAttrs...)
-
-		// We can't add this earlier because this is done per subgraph response
-		if v, ok := reqContext.telemetry.metricSetAttrs[ContextFieldGraphQLErrorCodes]; ok && len(errorCodesAttr) > 0 {
-			metricSliceAttrs = append(metricSliceAttrs, attribute.StringSlice(v, errorCodesAttr))
-		}
-
-		f.metricStore.MeasureRequestError(ctx, metricSliceAttrs, metricAddOpt)
-
-		metricAttrs = append(metricAttrs, rotel.WgRequestError.Bool(true))
-
-		attrOpt := otelmetric.WithAttributeSet(attribute.NewSet(metricAttrs...))
-		f.metricStore.MeasureRequestCount(ctx, metricSliceAttrs, attrOpt)
-		f.metricStore.MeasureLatency(ctx, latency, metricSliceAttrs, attrOpt)
-	} else {
-		f.metricStore.MeasureRequestCount(ctx, reqContext.telemetry.metricSliceAttrs, metricAddOpt)
-		f.metricStore.MeasureLatency(ctx, latency, reqContext.telemetry.metricSliceAttrs, metricAddOpt)
 	}
 
-	span.SetAttributes(traceAttrs...)
+	if v, ok := reqContext.telemetry.metricSetAttrs[ContextFieldGraphQLErrorCodes]; ok && len(errorCodesAttr) > 0 {
+		metricSliceAttrs = append(metricSliceAttrs, attribute.StringSlice(v, errorCodesAttr))
+	}
+
+	f.metricStore.MeasureRequestError(ctx, metricSliceAttrs, metricAddOpt)
+
+	metricAttrs = append(metricAttrs, rotel.WgRequestError.Bool(true))
+	attrOpt := otelmetric.WithAttributeSet(attribute.NewSet(metricAttrs...))
+
+	return metricSliceAttrs, attrOpt
 }

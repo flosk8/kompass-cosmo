@@ -1,9 +1,17 @@
-import { PlaygroundContext, PlaygroundUrlState, PostOperationUrlState, PreOperationUrlState, TabsState, TabState } from '@/components/playground/types';
+import {
+  PlaygroundContext,
+  PlaygroundUrlState,
+  PostOperationUrlState,
+  PreOperationUrlState,
+  TabsState,
+  TabState,
+} from '@/components/playground/types';
 import { useToast } from '@/components/ui/use-toast';
 import { useLocalStorage } from '@/hooks/use-local-storage';
+import { PLAYGROUND_STATE_QUERY_PARAM } from '@/lib/constants';
 import { extractStateFromUrl } from '@/lib/playground-url-state-decoding';
 import { useRouter } from 'next/router';
-import { useContext, useEffect, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 
 type ScriptData = {
   id?: string;
@@ -16,14 +24,14 @@ type ScriptData = {
 
 /**
  * Pending Items:
- * 
+ *
  * 1. [ENG-7093] Ensure sharing of scripts is working. Right now, after the hydration is completed, the GraphiQL
- *    is adding a new tab internally which overrides the script:tabsState as for the new tab, 
- *    it is missing in the localstorage. We don't have a clean way to prevent GraphiQL from 
+ *    is adding a new tab internally which overrides the script:tabsState as for the new tab,
+ *    it is missing in the localstorage. We don't have a clean way to prevent GraphiQL from
  *    adding a new tab. Instead of building hacks on top of hacks, we should revisit this
  *    and consider creating our own GraphiQL component.
  * 2. Add sharing of pre-flight enabled state.
- * 3. For now, the customers won't be shown the scripts options (preflight, preOperation and 
+ * 3. For now, the customers won't be shown the scripts options (preflight, preOperation and
  *    postOperation) for sharing
  */
 export const useHydratePlaygroundStateFromUrl = (
@@ -35,14 +43,18 @@ export const useHydratePlaygroundStateFromUrl = (
   isGraphiqlRendered: boolean,
 ) => {
   const router = useRouter();
+  const { isReady, pathname, query: routerQuery, replace } = router;
   const { toast } = useToast();
-  
+  const toastRef = useRef<typeof toast>(toast);
+
   // `setIsHydrated` is used to avoid race conditions.
-  // First hydration should be done from the URL, and 
+  // First hydration should be done from the URL, and
   // then only childrens of Playground should be able to update state.
   const { setIsHydrated } = useContext(PlaygroundContext);
 
-  const [, setScriptsTabState] = useLocalStorage<{ [key: string]: Record<string, any> }>('playground:script:tabState', {});
+  const [, setScriptsTabState] = useLocalStorage<{
+    [key: string]: Record<string, any>;
+  }>('playground:script:tabState', {});
   const [, setPreFlightSelected] = useLocalStorage<any>('playground:pre-flight:selected', null);
   // todo: add sharing of pre-flight enabled state
   const [, setPreFlightEnabled] = useLocalStorage<any>('playground:pre-flight:enabled', null);
@@ -50,48 +62,63 @@ export const useHydratePlaygroundStateFromUrl = (
   const [, setPostOpSelected] = useLocalStorage<ScriptData | null>('playground:post-operation:selected', null);
 
   const [pendingHydrationState, setPendingHydrationState] = useState<PlaygroundUrlState | null>(null);
+  // The playground page can be reused for multiple shared links, so only skip the exact URL state already processed.
+  const processedUrlStateKey = useRef<string | null>(null);
 
   // On mount: extract and clear URL state
   useEffect(() => {
-    const { playgroundUrlState, ...query } = router.query;
+    if (!isReady) {
+      return;
+    }
+
+    const { [PLAYGROUND_STATE_QUERY_PARAM]: playgroundUrlState, ...query } = routerQuery;
+
+    if (!playgroundUrlState || typeof playgroundUrlState !== 'string') {
+      setIsHydrated(true);
+      return;
+    }
+
+    const urlStateKey = `${pathname}:${playgroundUrlState}`;
+    if (processedUrlStateKey.current === urlStateKey) {
+      return;
+    }
+
+    processedUrlStateKey.current = urlStateKey;
+
     try {
-      if (playgroundUrlState && typeof playgroundUrlState === 'string') {
-        const state = extractStateFromUrl();
-        if (!state) {
-          setIsHydrated(true);
-          return;
-        }
-  
-        setPendingHydrationState(state);
-      } else {
+      const state = extractStateFromUrl();
+      if (!state) {
         setIsHydrated(true);
         return;
       }
-    }
-    catch (err) {
+
+      setPendingHydrationState(state);
+
+      // Clear the URL param immediately
+      replace({ pathname, query }, undefined, {
+        shallow: true,
+      });
+    } catch (err) {
       if (process.env.NODE_ENV === 'development') {
         console.error('[Playground] Error extracting state from URL:', (err as Error)?.message);
       }
-      toast({
+      // We avoid effect run by storing toast in ref. There's low chance of hitting the error and at that
+      // point it wouldn't matter that much anyway.
+      toastRef.current({
         title: 'Unable to Load Shared Playground State',
         description: 'The shared URL may be incorrect. Please double-check and try again.',
         variant: 'destructive',
       });
       setIsHydrated(true);
     }
-    finally {
-      // Clear the URL param immediately
-      router.replace({ pathname: router.pathname, query }, undefined, { shallow: true });
-    }
-    // eslint-disable-next-line
-  }, []);
- 
+  }, [isReady, pathname, replace, routerQuery, setIsHydrated]);
+
   const setOperationScripts = (
     preOperation: PreOperationUrlState,
     postOperation: PostOperationUrlState,
-    newTabId: string
+    newTabId: string,
   ) => {
-    setScriptsTabState(prev => {
+    setScriptsTabState((prev) => {
       const updated = { ...prev };
       updated[newTabId] = { ...(updated[newTabId] || {}) };
 
@@ -107,7 +134,7 @@ export const useHydratePlaygroundStateFromUrl = (
 
       return updated;
     });
-  }
+  };
 
   const addNewTabForHydration = (state: PlaygroundUrlState) => {
     // Create a new tab with the shared state
@@ -131,7 +158,7 @@ export const useHydratePlaygroundStateFromUrl = (
     });
 
     return newTabId;
-  }
+  };
 
   useEffect(() => {
     // We have an early bailout condition to avoid race condition with GraphiQL.
@@ -147,7 +174,7 @@ export const useHydratePlaygroundStateFromUrl = (
     if (process.env.NODE_ENV === 'development') {
       console.info('[Playground] New tab added for hydration: ', newTabId);
     }
-    
+
     // Set the state for the new tab
     setQuery(pendingHydrationState.operation);
     if (pendingHydrationState.variables) {
@@ -163,16 +190,12 @@ export const useHydratePlaygroundStateFromUrl = (
     }
 
     if (pendingHydrationState.preOperation || pendingHydrationState.postOperation) {
-      setOperationScripts(
-        pendingHydrationState.preOperation,
-        pendingHydrationState.postOperation,
-        newTabId
-      );
+      setOperationScripts(pendingHydrationState.preOperation, pendingHydrationState.postOperation, newTabId);
     }
 
     setIsHydrated(true);
     setPendingHydrationState(null);
-    
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingHydrationState, isGraphiqlRendered, tabsState.tabs.length]);
 };

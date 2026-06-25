@@ -2,19 +2,17 @@ package trace
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"net/url"
 
 	"github.com/wundergraph/cosmo/router/pkg/otel/otelconfig"
-	"github.com/wundergraph/cosmo/router/pkg/trace/redact"
+	"github.com/wundergraph/cosmo/router/pkg/trace/attributeprocessor"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.uber.org/zap"
 
 	_ "google.golang.org/grpc/encoding/gzip" // Required for gzip support over grpc
@@ -25,26 +23,16 @@ var (
 )
 
 type (
-	IPAnonymizationMethod string
-
-	IPAnonymizationConfig struct {
-		Enabled bool
-		Method  IPAnonymizationMethod
-	}
-
 	ProviderConfig struct {
 		Logger            *zap.Logger
 		Config            *Config
 		ServiceInstanceID string
-		IPAnonymization   *IPAnonymizationConfig
+		IPAnonymization   *attributeprocessor.IPAnonymizationConfig
+		// SanitizeUTF8 configures sanitization of invalid UTF-8 sequences in span attribute values
+		SanitizeUTF8 *attributeprocessor.SanitizeUTF8Config
 		// MemoryExporter is used for testing purposes
 		MemoryExporter sdktrace.SpanExporter
 	}
-)
-
-const (
-	Hash   IPAnonymizationMethod = "hash"
-	Redact IPAnonymizationMethod = "redact"
 )
 
 func createExporter(log *zap.Logger, exp *ExporterConfig) (sdktrace.SpanExporter, error) {
@@ -55,7 +43,7 @@ func createExporter(log *zap.Logger, exp *ExporterConfig) (sdktrace.SpanExporter
 	var exporter sdktrace.SpanExporter
 	// Just support OTLP and gRPC for now. Jaeger has native OTLP support.
 	switch exp.Exporter {
-	case otelconfig.ExporterOLTPHTTP:
+	case otelconfig.ExporterOTLPHTTP:
 		opts := []otlptracehttp.Option{
 			// Includes host and port
 			otlptracehttp.WithEndpoint(u.Host),
@@ -76,7 +64,7 @@ func createExporter(log *zap.Logger, exp *ExporterConfig) (sdktrace.SpanExporter
 			context.Background(),
 			opts...,
 		)
-	case otelconfig.ExporterOLTPGRPC:
+	case otelconfig.ExporterOTLPGRPC:
 		opts := []otlptracegrpc.Option{
 			// Includes host and port
 			otlptracegrpc.WithEndpoint(u.Host),
@@ -158,39 +146,52 @@ func NewTracerProvider(ctx context.Context, config *ProviderConfig) (*sdktrace.T
 		)
 	}
 
+	// Rename new semconv attribute keys (v1.40.0) back to old names (v1.17–v1.21)
+	// so downstream systems that query by old names continue to work.
+	// Must be registered before attribute transformers (e.g. IP redaction)
+	// because those match on old key names.
+	opts = append(opts, sdktrace.WithSpanProcessor(&semconvProcessor{}))
+
+	// Build list of attribute transformers based on config
+	var transformers []attributeprocessor.AttributeTransformer
+
+	// The orders of the transformers indicate the priority.
 	if config.IPAnonymization != nil && config.IPAnonymization.Enabled {
-
-		var rFunc redact.RedactFunc
-
-		if config.IPAnonymization.Method == Hash {
-			rFunc = func(key attribute.KeyValue) string {
-				h := sha256.New()
-				return string(h.Sum([]byte(key.Value.AsString())))
-			}
-		} else if config.IPAnonymization.Method == Redact {
-			rFunc = func(key attribute.KeyValue) string {
-				return "[REDACTED]"
-			}
-
+		redactTransformer, err := attributeprocessor.RedactKeys(SensitiveAttributes, config.IPAnonymization.Method)
+		if err != nil {
+			return nil, err
 		}
+		transformers = append(transformers, redactTransformer)
+	}
+	if config.SanitizeUTF8 != nil && config.SanitizeUTF8.Enabled {
+		transformers = append(transformers, attributeprocessor.SanitizeUTF8(config.SanitizeUTF8, config.Logger))
+	}
 
-		opts = append(opts, redact.Attributes(SensitiveAttributes, rFunc))
+	if len(transformers) > 0 {
+		opts = append(opts, attributeprocessor.NewAttributeProcessorOption(transformers...))
 	}
 
 	if config.Config.Enabled {
 
 		// Either memory exporter or the configured exporters are used.
 		if config.MemoryExporter != nil {
-			opts = append(opts, sdktrace.WithSyncer(config.MemoryExporter))
+			exporter := config.MemoryExporter
+			if config.Config.TestErrorHandler != nil {
+				exporter = &errorLoggingExporter{
+					wrapped: exporter,
+					handler: config.Config.TestErrorHandler,
+				}
+			}
+			opts = append(opts, sdktrace.WithSyncer(exporter))
 		} else {
 			for _, exp := range config.Config.Exporters {
 				if exp.Disabled {
 					continue
 				}
 
-				// Default to OLTP HTTP
+				// Default to OTLP HTTP
 				if exp.Exporter == "" {
-					exp.Exporter = otelconfig.ExporterOLTPHTTP
+					exp.Exporter = otelconfig.ExporterOTLPHTTP
 				}
 
 				exporter, err := createExporter(config.Logger, exp)
@@ -225,15 +226,13 @@ func NewTracerProvider(ctx context.Context, config *ProviderConfig) (*sdktrace.T
 
 	tp := sdktrace.NewTracerProvider(opts...)
 
-	// Don't set it globally when we use the router in tests.
-	// In practice, setting it globally only makes sense for module development.
+	// Don't set globals when we use the router in tests.
+	// In practice, setting them globally only makes sense for module development.
+	// In tests, the error handler is wired locally via errorLoggingExporter above.
 	if config.MemoryExporter == nil {
 		otel.SetTracerProvider(tp)
+		otel.SetErrorHandler(otel.ErrorHandlerFunc(errHandler(config)))
 	}
-
-	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
-		config.Logger.Error("otel error", zap.Error(err))
-	}))
 
 	return tp, nil
 }

@@ -2,13 +2,13 @@ all: dev-setup
 
 setup-build-tools:
 	go install github.com/bufbuild/buf/cmd/buf@v1.32.2
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-	go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.16.2
-	go install gotest.tools/gotestsum@v1.12.2
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+	go install connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.19.1
+	go install gotest.tools/gotestsum@v1.13.0
 
 setup-dev-tools: setup-build-tools
 	go install github.com/amacneil/dbmate/v2@v2.6.0
-	go install honnef.co/go/tools/cmd/staticcheck@2024.1.1
+	go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
 	go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.3
 	go install github.com/norwoodj/helm-docs/cmd/helm-docs@v1.11.3
 	go install github.com/vektra/mockery/v3@v3.3.1
@@ -52,6 +52,24 @@ infra-debug-down-v:
 infra-debug-up:
 	docker compose -f docker-compose.yml --profile debug up --remove-orphans --detach
 
+format-all:
+	pnpm -r --parallel format
+
+format:
+	@package="$(word 2,$(MAKECMDGOALS))"; \
+	if [ -z "$$package" ]; then \
+		echo "Usage: make format <package>"; \
+		exit 1; \
+	fi; \
+	pnpm --filter "./$$package" --fail-if-no-match run format
+
+ifneq ($(filter format,$(MAKECMDGOALS)),)
+FORMAT_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+.PHONY: $(FORMAT_ARGS)
+$(FORMAT_ARGS):
+	@:
+endif
+
 seed:
 	pnpm -r run --filter './controlplane' seed
 
@@ -67,18 +85,23 @@ create-demo:
 delete-demo:
 	./scripts/delete-local-demo.sh
 
+build-plugins:
+	$(MAKE) -C demo plugin-build-ci
+
 dev-setup: prerequisites
 	pnpm install
 	pnpm generate
 	make generate-go
 	make infra-up
 	pnpm -r run --filter '!studio' build
+	make build-plugins
 
 dev-setup-no-infra: prerequisites
 	pnpm install
 	pnpm generate
 	make generate-go
 	pnpm -r run --filter '!studio' build
+	make build-plugins
 
 build-pnpm:
 	pnpm install
@@ -135,6 +158,9 @@ dc-subgraphs-config:
 dc-subgraphs-demo-down:
 	docker compose -f docker-compose.full.yml --profile subgraphs down --remove-orphans
 
+dc-subgraphs-demo-rebuild:
+	OTEL_AUTH_TOKEN=$(OTEL_AUTH_TOKEN) docker compose -f docker-compose.full.yml --profile subgraphs up --build --remove-orphans --detach $(DC_FLAGS)
+
 docker-build-local:
 	docker compose --file docker-compose.cosmo.yml build --no-cache
 
@@ -159,7 +185,7 @@ docker-build-minikube: docker-build-local
 	minikube image load mk-cdn.tar
 	minikube cache reload
 
-	del mk-*.tar
+	rm -f mk-*.tar
 
 run-subgraphs-local:
 	cd demo && go run cmd/all/main.go

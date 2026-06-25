@@ -47,8 +47,13 @@
           }
         }
       ],
+      "OperationContentAttributes": false,
       "ExportGraphQLVariables": true,
-      "WithNewRoot": false
+      "WithNewRoot": false,
+      "SanitizeUTF8": {
+        "Enabled": false,
+        "LogSanitizations": false
+      }
     },
     "Metrics": {
       "Attributes": null,
@@ -60,7 +65,12 @@
         "EngineStats": {
           "Subscriptions": true
         },
+        "CostStats": {
+          "EstimatedEnabled": false,
+          "ActualEnabled": false
+        },
         "CircuitBreaker": false,
+        "Streams": false,
         "ExcludeMetrics": null,
         "ExcludeMetricLabels": null,
         "Exporters": [
@@ -72,7 +82,16 @@
             "Headers": {},
             "Temporality": ""
           }
-        ]
+        ],
+        "LogExporter": {
+          "Enabled": true,
+          "ExcludeMetrics": [
+            "process\\.",
+            "server\\.uptime"
+          ],
+          "IncludeMetrics": null
+        },
+        "ExemplarFilter": "trace_based"
       },
       "Prometheus": {
         "Enabled": true,
@@ -80,8 +99,13 @@
         "ListenAddr": "127.0.0.1:8088",
         "GraphqlCache": true,
         "ConnectionStats": true,
+        "Streams": false,
         "EngineStats": {
           "Subscriptions": true
+        },
+        "CostStats": {
+          "EstimatedEnabled": false,
+          "ActualEnabled": false
         },
         "CircuitBreaker": false,
         "ExcludeMetrics": null,
@@ -89,8 +113,15 @@
         "ExcludeScopeInfo": true,
         "SchemaFieldUsage": {
           "Enabled": true,
-          "IncludeOperationSha": false
-        }
+          "IncludeOperationSha": true,
+          "Exporter": {
+            "BatchSize": 4096,
+            "QueueSize": 12800,
+            "Interval": 2000000000,
+            "ExportTimeout": 10000000000
+          }
+        },
+        "ExemplarFilter": "trace_based"
       },
       "CardinalityLimit": 2000
     }
@@ -135,6 +166,40 @@
         "CertFile": "",
         "Required": false
       }
+    },
+    "Client": {
+      "All": {
+        "CertFile": "/path/to/client.crt",
+        "KeyFile": "/path/to/client.key",
+        "CaFile": "/path/to/ca.crt",
+        "InsecureSkipCaVerification": false
+      },
+      "Subgraphs": {
+        "products": {
+          "CertFile": "/path/to/products-client.crt",
+          "KeyFile": "/path/to/products-client.key",
+          "CaFile": "/path/to/products-ca.crt",
+          "InsecureSkipCaVerification": false
+        }
+      }
+    },
+    "ClientGRPC": {
+      "All": {
+        "CertFile": "/path/to/grpc-client.crt",
+        "KeyFile": "/path/to/grpc-client.key",
+        "CaFile": "/path/to/grpc-ca.crt",
+        "InsecureSkipCaVerification": false,
+        "Enabled": true
+      },
+      "Subgraphs": {
+        "my-grpc-subgraph": {
+          "CertFile": "/path/to/my-grpc-subgraph-client.crt",
+          "KeyFile": "/path/to/my-grpc-subgraph-client.key",
+          "CaFile": "/path/to/my-grpc-subgraph-ca.crt",
+          "InsecureSkipCaVerification": false,
+          "Enabled": true
+        }
+      }
     }
   },
   "CacheControl": {
@@ -156,11 +221,42 @@
     "Storage": {
       "ProviderID": "mcp"
     },
+    "Session": {
+      "Stateless": true
+    },
     "GraphName": "cosmo",
     "ExcludeMutations": false,
     "EnableArbitraryOperations": false,
     "ExposeSchema": false,
-    "RouterURL": "https://cosmo-router.wundergraph.com"
+    "RouterURL": "https://cosmo-router.wundergraph.com",
+    "OmitToolNamePrefix": false,
+    "OAuth": {
+      "Enabled": false,
+      "JWKS": null,
+      "AuthorizationServerURL": "",
+      "Scopes": {
+        "Initialize": null,
+        "ToolsList": null,
+        "ToolsCall": null,
+        "ExecuteGraphQL": null,
+        "GetOperationInfo": null,
+        "GetSchema": null
+      },
+      "ScopeChallengeIncludeTokenScopes": false,
+      "MaxScopeCombinations": 2048
+    },
+    "ResourceDocumentation": ""
+  },
+  "ConnectRPC": {
+    "Enabled": false,
+    "Server": {
+      "ListenAddr": "localhost:5026",
+      "BaseURL": ""
+    },
+    "Storage": {
+      "ProviderID": ""
+    },
+    "GraphQLEndpoint": ""
   },
   "DemoMode": true,
   "Modules": {
@@ -181,7 +277,8 @@
           "Name": "",
           "Value": "",
           "Expression": "",
-          "ValueFrom": null
+          "ValueFrom": null,
+          "FromFile": null
         },
         {
           "Operation": "propagate",
@@ -193,7 +290,8 @@
           "Name": "",
           "Value": "",
           "Expression": "",
-          "ValueFrom": null
+          "ValueFrom": null,
+          "FromFile": null
         },
         {
           "Operation": "propagate",
@@ -205,7 +303,8 @@
           "Name": "",
           "Value": "",
           "Expression": "",
-          "ValueFrom": null
+          "ValueFrom": null,
+          "FromFile": null
         },
         {
           "Operation": "set",
@@ -217,7 +316,8 @@
           "Name": "X-API-Key",
           "Value": "some-secret",
           "Expression": "",
-          "ValueFrom": null
+          "ValueFrom": null,
+          "FromFile": null
         },
         {
           "Operation": "set",
@@ -234,7 +334,8 @@
             "ContextField": "operation_name",
             "ResponseHeader": "",
             "Expression": ""
-          }
+          },
+          "FromFile": null
         },
         {
           "Operation": "set",
@@ -246,7 +347,24 @@
           "Name": "x-expression-header",
           "Value": "",
           "Expression": "request.header.Get('X-Operation-Name')",
-          "ValueFrom": null
+          "ValueFrom": null,
+          "FromFile": null
+        },
+        {
+          "Operation": "set",
+          "Matching": "",
+          "NegateMatch": false,
+          "Named": "",
+          "Rename": "",
+          "Default": "",
+          "Name": "x-from-file-header",
+          "Value": "",
+          "Expression": "",
+          "ValueFrom": null,
+          "FromFile": {
+            "Path": "/etc/secrets/api-key",
+            "RefreshInterval": 60000000000
+          }
         }
       ],
       "Response": [
@@ -276,7 +394,8 @@
             "Name": "",
             "Value": "",
             "Expression": "",
-            "ValueFrom": null
+            "ValueFrom": null,
+            "FromFile": null
           }
         ],
         "Response": [
@@ -297,7 +416,19 @@
     "CookieWhitelist": [
       "cookie1",
       "cookie2"
-    ]
+    ],
+    "Router": {
+      "Response": [
+        {
+          "Name": "X-Client-Version",
+          "Expression": "request.header.Get('User-Agent')"
+        },
+        {
+          "Name": "X-Request-ID",
+          "Expression": "request.header.Get('X-Request-ID') ?? 'default-request-id'"
+        }
+      ]
+    }
   },
   "TrafficShaping": {
     "All": {
@@ -306,7 +437,8 @@
         "Algorithm": "backoff_jitter",
         "MaxAttempts": 5,
         "MaxDuration": 10000000000,
-        "Interval": 3000000000
+        "Interval": 3000000000,
+        "Expression": "IsRetryableStatusCode() || IsConnectionError() || IsTimeout()"
       },
       "CircuitBreaker": {
         "Enabled": false,
@@ -334,7 +466,8 @@
     "Router": {
       "MaxRequestBodyBytes": 5000000,
       "MaxHeaderBytes": 4194304,
-      "DecompressionEnabled": false
+      "DecompressionEnabled": false,
+      "ResponseCompressionMinSize": 4096
     },
     "Subgraphs": {
       "products": {
@@ -343,7 +476,8 @@
           "Algorithm": "",
           "MaxAttempts": 0,
           "MaxDuration": 0,
-          "Interval": 0
+          "Interval": 0,
+          "Expression": ""
         },
         "CircuitBreaker": {
           "Enabled": false,
@@ -377,6 +511,8 @@
   },
   "AccessLogs": {
     "Enabled": true,
+    "Level": "info",
+    "AddStacktrace": false,
     "Buffer": {
       "Enabled": false,
       "Size": 256000,
@@ -388,7 +524,8 @@
       },
       "File": {
         "Enabled": false,
-        "Path": "access.log"
+        "Path": "access.log",
+        "Mode": 416
       }
     },
     "Router": {
@@ -413,6 +550,10 @@
             "Expression": "request.error ?? 'success'"
           }
         }
+      ],
+      "IgnoreQueryParamsList": [
+        "variables",
+        "anothervalue"
       ]
     },
     "Subgraphs": {
@@ -446,9 +587,14 @@
   },
   "PlaygroundEnabled": true,
   "IntrospectionEnabled": true,
+  "IntrospectionConfig": {
+    "Enabled": true,
+    "Secret": "AN_EXAMPLE_PLACEHOLDER_SECRET_ONLY"
+  },
   "QueryPlansEnabled": true,
   "LogLevel": "info",
   "JSONLog": true,
+  "LogServiceName": "my-custom-router",
   "ShutdownDelay": 15000000000,
   "GracePeriod": 20000000000,
   "PollInterval": 10000000000,
@@ -463,25 +609,59 @@
       "JWKS": [
         {
           "URL": "https://example.com/.well-known/jwks.json",
+          "AllowedUse": null,
           "Algorithms": [
             "RS256"
           ],
-          "RefreshInterval": 60000000000
+          "RefreshInterval": 60000000000,
+          "RefreshUnknownKID": {
+            "Enabled": false,
+            "MaxWait": 0,
+            "Interval": 0,
+            "Burst": 0
+          },
+          "Secret": "",
+          "Algorithm": "",
+          "KeyId": "",
+          "Audiences": null
         },
         {
           "URL": "https://example.com/.well-known/jwks2.json",
+          "AllowedUse": null,
           "Algorithms": [
             "RS256",
-            "HS256"
+            "ES256"
           ],
-          "RefreshInterval": 120000000000
+          "RefreshInterval": 120000000000,
+          "RefreshUnknownKID": {
+            "Enabled": true,
+            "MaxWait": 10000000000,
+            "Interval": 5000000000,
+            "Burst": 3
+          },
+          "Secret": "",
+          "Algorithm": "",
+          "KeyId": "",
+          "Audiences": null
         },
         {
           "URL": "https://example.com/.well-known/jwks3.json",
+          "AllowedUse": null,
           "Algorithms": null,
-          "RefreshInterval": 0
+          "RefreshInterval": 0,
+          "RefreshUnknownKID": {
+            "Enabled": false,
+            "MaxWait": 0,
+            "Interval": 0,
+            "Burst": 0
+          },
+          "Secret": "",
+          "Algorithm": "",
+          "KeyId": "",
+          "Audiences": null
         }
       ],
+      "ScopeClaim": "customscp",
       "HeaderName": "Authorization",
       "HeaderValuePrefix": "Bearer",
       "HeaderSources": [
@@ -499,7 +679,8 @@
           "ValuePrefixes": null
         }
       ]
-    }
+    },
+    "IgnoreIntrospection": false
   },
   "Authorization": {
     "RequireAuthentication": false,
@@ -514,7 +695,15 @@
       "Period": 60000000000,
       "RejectExceedingRequests": true,
       "RejectStatusCode": 200,
-      "HideStatsFromResponseExtension": false
+      "HideStatsFromResponseExtension": false,
+      "Overrides": [
+        {
+          "Matching": "^premium-.*",
+          "Rate": 200,
+          "Burst": 200,
+          "Period": 60000000000
+        }
+      ]
     },
     "Storage": {
       "URLs": [
@@ -543,7 +732,9 @@
         {
           "ID": "default",
           "URL": "nats://localhost:4222",
-          "Authentication": null
+          "Authentication": null,
+          "TLS": null,
+          "DeleteDurableConsumersOnShutdown": false
         },
         {
           "ID": "my-nats",
@@ -554,7 +745,9 @@
               "Username": "admin"
             },
             "Token": null
-          }
+          },
+          "TLS": null,
+          "DeleteDurableConsumersOnShutdown": false
         }
       ],
       "Kafka": [
@@ -589,16 +782,27 @@
           "ClusterEnabled": true
         }
       ]
+    },
+    "Handlers": {
+      "OnReceiveEvents": {
+        "MaxConcurrentHandlers": 100,
+        "HandlerTimeout": 5000000000
+      }
     }
   },
   "CacheWarmup": {
     "Enabled": false,
     "Source": {
-      "Filesystem": null
+      "Filesystem": null,
+      "CdnSource": {
+        "Enabled": true
+      }
     },
     "Workers": 8,
     "ItemsPerSecond": 50,
-    "Timeout": 30000000000
+    "ItemDelay": 0,
+    "Timeout": 30000000000,
+    "InMemoryFallback": true
   },
   "RouterConfigPath": "latest.json",
   "RouterRegistration": true,
@@ -630,11 +834,16 @@
       "Enabled": false,
       "Condition": ""
     },
+    "BlockPersistedOperations": {
+      "Enabled": false,
+      "Condition": ""
+    },
     "ComplexityCalculationCache": {
       "Enabled": true,
       "CacheSize": 1024
     },
     "ComplexityLimits": {
+      "Mode": "enforce",
       "Depth": {
         "Enabled": true,
         "Limit": 5,
@@ -654,9 +863,23 @@
         "Enabled": true,
         "Limit": 4,
         "IgnorePersistedOperations": true
-      }
+      },
+      "IgnoreIntrospection": false
     },
-    "DepthLimit": null
+    "CostControl": {
+      "Enabled": true,
+      "Mode": "enforce",
+      "MaxEstimatedLimit": 1000,
+      "EstimatedListSize": 10,
+      "ExposeHeaders": false,
+      "IgnoreImplementingTypeWeights": false
+    },
+    "DepthLimit": null,
+    "ParserLimits": {
+      "ApproximateDepthLimit": 200,
+      "TotalFieldsLimit": 3500
+    },
+    "OperationNameLengthLimit": 2000
   },
   "EngineExecutionConfiguration": {
     "Debug": {
@@ -674,22 +897,22 @@
       "EnableResolverDebugging": false,
       "EnablePersistedOperationsCacheResponseHeader": false,
       "EnableNormalizationCacheResponseHeader": false,
+      "EnableCacheResponseHeaders": false,
       "AlwaysIncludeQueryPlan": false,
       "AlwaysSkipLoader": false
     },
     "EnableSingleFlight": true,
+    "ForceEnableSingleFlight": false,
+    "EnableInboundRequestDeduplication": true,
+    "ForceEnableInboundRequestDeduplication": false,
     "EnableRequestTracing": true,
+    "ForceUnauthenticatedRequestTracing": false,
     "EnableExecutionPlanCacheResponseHeader": false,
     "MaxConcurrentResolvers": 32,
     "EnableNetPoll": true,
-    "WebSocketClientPollTimeout": 1000000000,
-    "WebSocketClientConnBufferSize": 128,
-    "WebSocketClientReadTimeout": 5000000000,
-    "WebSocketClientWriteTimeout": 10000000000,
-    "WebSocketClientPingInterval": 10000000000,
-    "WebSocketClientPingTimeout": 30000000000,
-    "WebSocketClientFrameTimeout": 100000000,
     "ExecutionPlanCacheSize": 1024,
+    "SlowPlanCacheSize": 300,
+    "SlowPlanCacheThreshold": 100000000,
     "MinifySubgraphOperations": true,
     "EnablePersistedOperationsCache": true,
     "EnableNormalizationCache": true,
@@ -702,7 +925,19 @@
     "ResolverMaxRecyclableParserSize": 4096,
     "EnableSubgraphFetchOperationName": true,
     "DisableVariablesRemapping": false,
-    "SubscriptionFetchTimeout": 30000000000
+    "EnableRequireFetchReasons": false,
+    "SubscriptionFetchTimeout": 30000000000,
+    "WebSocketServerReadTimeout": 5000000000,
+    "WebSocketServerWriteTimeout": 10000000000,
+    "WebSocketServerPollTimeout": 1000000000,
+    "WebSocketServerConnBufferSize": 128,
+    "WebSocketClientWriteTimeout": 10000000000,
+    "WebSocketClientReadLimit": 1000000,
+    "WebSocketClientPingInterval": 10000000000,
+    "WebSocketClientPingTimeout": 30000000000,
+    "WebSocketClientAckTimeout": 30000000000,
+    "ValidateRequiredExternalFields": false,
+    "RelaxSubgraphOperationFieldSelectionMergingNullability": false
   },
   "WebSocket": {
     "Enabled": true,
@@ -760,6 +995,14 @@
     ],
     "AllowedFields": null
   },
+  "SubgraphExtensionPropagation": {
+    "Enabled": true,
+    "AllowedExtensionFields": [
+      "rateLimit",
+      "auth"
+    ],
+    "Algorithm": "last_write"
+  },
   "StorageProviders": {
     "S3": [
       {
@@ -804,7 +1047,21 @@
       "Enabled": false,
       "ProviderID": "",
       "ObjectPath": ""
+    },
+    "Manifest": {
+      "Path": "",
+      "SkipMissingFeatureFlags": false,
+      "IgnoredFeatureFlags": null,
+      "Watch": false,
+      "WatchInterval": 1000000000
     }
+  },
+  "SplitConfigPoller": {
+    "SkipMissingFeatureFlags": true,
+    "IgnoredFeatureFlags": [
+      "experimental-checkout",
+      "ab-test-foo"
+    ]
   },
   "PersistedOperationsConfig": {
     "Disabled": false,
@@ -818,6 +1075,18 @@
     "Storage": {
       "ProviderID": "s3",
       "ObjectPrefix": "5ef73d80-cae4-4d0e-98a7-1e9fa922c1a4/92c25b45-a75b-4954-b8f6-6592a9b203eb/operations/foo"
+    },
+    "Manifest": {
+      "Enabled": true,
+      "FileName": "manifest.json",
+      "PollInterval": 30000000000,
+      "PollJitter": 10000000000,
+      "Warmup": {
+        "Enabled": true,
+        "Workers": 4,
+        "ItemsPerSecond": 50,
+        "Timeout": 30000000000
+      }
     }
   },
   "AutomaticPersistedQueries": {
@@ -872,7 +1141,11 @@
   },
   "Plugins": {
     "Enabled": true,
-    "Path": "some/path/to/plugins"
+    "Path": "some/path/to/plugins",
+    "Registry": {
+      "URL": "cosmo-registry.wundergraph.com",
+      "Insecure": false
+    }
   },
   "WatchConfig": {
     "Enabled": true,

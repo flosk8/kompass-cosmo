@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/wundergraph/cosmo/router/pkg/config"
+	rjwt "github.com/wundergraph/cosmo/router/internal/jwt"
 	"github.com/wundergraph/cosmo/router/pkg/controlplane/configpoller"
 	"github.com/wundergraph/cosmo/router/pkg/execution_config"
 	"github.com/wundergraph/cosmo/router/pkg/routerconfig"
@@ -13,9 +13,9 @@ import (
 	"go.uber.org/zap"
 )
 
-func getConfigClient(r *Router, cdnProviders map[string]config.CDNStorageProvider, s3Providers map[string]config.S3StorageProvider, providerID string, isFallbackClient bool) (client *routerconfig.Client, err error) {
+func getConfigClient(r *Router, registry *ProviderRegistry, providerID string, isFallbackClient bool) (client *routerconfig.Client, err error) {
 	// CDN Providers
-	if provider, ok := cdnProviders[providerID]; ok {
+	if provider, ok := registry.CDN(providerID); ok {
 		if r.graphApiToken == "" {
 			return nil, errors.New(
 				"graph token is required to fetch execution config from CDN. " +
@@ -50,7 +50,7 @@ func getConfigClient(r *Router, cdnProviders map[string]config.CDNStorageProvide
 	}
 
 	// S3 Providers
-	if provider, ok := s3Providers[providerID]; ok {
+	if provider, ok := registry.S3(providerID); ok {
 		clientOptions := &configs3Provider.ClientOptions{
 			AccessKeyID:     provider.AccessKey,
 			SecretAccessKey: provider.SecretKey,
@@ -88,6 +88,12 @@ func getConfigClient(r *Router, cdnProviders map[string]config.CDNStorageProvide
 	}
 
 	if r.graphApiToken == "" {
+		// If the router is running in demo mode, we don't need a graph token
+		// but the router will just never poll for execution config
+		if r.demoMode {
+			return nil, nil
+		}
+
 		return nil, errors.New(
 			"graph token is required to fetch execution config from CDN. " +
 				"Alternatively, configure a custom storage provider or specify a static execution config",
@@ -115,17 +121,34 @@ func getConfigClient(r *Router, cdnProviders map[string]config.CDNStorageProvide
 }
 
 // InitializeConfigPoller creates a poller to fetch execution config. It is only initialized when a config poller is configured and the router is not started with a static config
-func InitializeConfigPoller(r *Router, cdnProviders map[string]config.CDNStorageProvider, s3Providers map[string]config.S3StorageProvider) (*configpoller.ConfigPoller, error) {
+func InitializeConfigPoller(r *Router, registry *ProviderRegistry) (*configpoller.ConfigPoller, error) {
 	if r.staticExecutionConfig != nil || r.routerConfigPollerConfig == nil || r.configPoller != nil {
 		return nil, nil
 	}
 
-	primaryClient, err := getConfigClient(r, cdnProviders, s3Providers, r.routerConfigPollerConfig.Storage.ProviderID, false)
+	// Check whether the router JWT requests the split-config-loading strategy.
+	// Split config is only supported with the default Cosmo CDN (no custom storage provider).
+	hasSplitCfgFeature, err := hasSplitConfigFeature(r)
 	if err != nil {
 		return nil, err
 	}
 
-	if primaryClient == nil {
+	if hasSplitCfgFeature {
+		providerID := r.routerConfigPollerConfig.Storage.ProviderID
+		if providerID == "" {
+			r.logger.Debug("Use split-config poller to fetch execution config")
+			return newSplitConfigPoller(r)
+		}
+		r.logger.Info("split-config-loading feature is enabled but a custom storage provider is configured; falling back to regular config polling",
+			zap.String("provider_id", providerID))
+	}
+
+	primaryClient, err := getConfigClient(r, registry, r.routerConfigPollerConfig.Storage.ProviderID, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if primaryClient == nil && !r.demoMode {
 		return nil, nil
 	}
 
@@ -135,19 +158,65 @@ func InitializeConfigPoller(r *Router, cdnProviders map[string]config.CDNStorage
 			return nil, errors.New("cannot use the same storage as both primary and fallback provider for execution config")
 		}
 
-		fallbackClient, err = getConfigClient(r, cdnProviders, s3Providers, r.routerConfigPollerConfig.FallbackStorage.ProviderID, true)
+		fallbackClient, err = getConfigClient(r, registry, r.routerConfigPollerConfig.FallbackStorage.ProviderID, true)
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	configPoller := configpoller.New(r.graphApiToken,
+	opts := []configpoller.Option{
 		configpoller.WithLogger(r.logger),
 		configpoller.WithPolling(r.routerConfigPollerConfig.PollInterval, r.routerConfigPollerConfig.PollJitter),
-		configpoller.WithClient(*primaryClient),
 		configpoller.WithFallbackClient(fallbackClient),
 		configpoller.WithDemoMode(r.demoMode),
-	)
+	}
+	if primaryClient != nil {
+		opts = append(opts, configpoller.WithClient(*primaryClient))
+	}
+
+	configPoller := configpoller.New(r.graphApiToken, opts...)
 
 	return &configPoller, nil
+}
+
+func hasSplitConfigFeature(r *Router) (bool, error) {
+	if r.graphApiToken == "" {
+		return false, nil
+	}
+
+	claims, err := rjwt.ExtractFederatedGraphTokenClaims(r.graphApiToken)
+	if err != nil {
+		return false, fmt.Errorf("failed to parse graph API token: %w", err)
+	}
+
+	return claims.HasFeature(rjwt.FeatureSplitConfigLoading), nil
+}
+
+func newSplitConfigPoller(r *Router) (*configpoller.ConfigPoller, error) {
+	fetcher, err := configCDNProvider.NewSplitFetcher(
+		r.cdnConfig.URL,
+		r.graphApiToken,
+		&configCDNProvider.Options{
+			Logger:       r.logger,
+			SignatureKey: r.routerConfigPollerConfig.GraphSignKey,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create split config fetcher: %w", err)
+	}
+
+	ignoredFeatureFlags := make(map[string]struct{})
+	for _, featureFlag := range r.routerConfigPollerConfig.SplitConfigPoller.IgnoredFeatureFlags {
+		ignoredFeatureFlags[featureFlag] = struct{}{}
+	}
+
+	splitPoller := configpoller.NewSplitConfigPoller(
+		fetcher,
+		configpoller.WithSplitLogger(r.logger),
+		configpoller.WithSplitPolling(r.routerConfigPollerConfig.PollInterval, r.routerConfigPollerConfig.PollJitter),
+		configpoller.WithConfigRules(configpoller.ConfigRules{
+			SkipMissingFeatureFlags: r.routerConfigPollerConfig.SplitConfigPoller.SkipMissingFeatureFlags,
+			IgnoredFeatureFlags:     ignoredFeatureFlags,
+		}),
+	)
+	return &splitPoller, nil
 }

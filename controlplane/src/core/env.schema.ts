@@ -1,5 +1,28 @@
 import { z } from 'zod';
 
+export const sentryEnvVariables = z.object({
+  SENTRY_ENABLED: z
+    .string()
+    .optional()
+    .transform((val) => val === 'true')
+    .default('false'),
+  SENTRY_DSN: z.string().optional(),
+  SENTRY_SEND_DEFAULT_PII: z
+    .string()
+    .optional()
+    .transform((val) => val === 'true')
+    .default('false'),
+  SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().optional().default(1),
+  SENTRY_PROFILE_SESSION_SAMPLE_RATE: z.coerce.number().optional().default(1),
+  SENTRY_PROFILE_LIFECYCLE: z.enum(['manual', 'trace']).optional().default('manual'),
+  SENTRY_EVENT_LOOP_BLOCK_THRESHOLD_MS: z.coerce.number().optional().default(100),
+  SENTRY_ENABLE_LOGS: z
+    .string()
+    .optional()
+    .transform((val) => val === 'true')
+    .default('false'),
+});
+
 export const envVariables = z
   .object({
     /**
@@ -54,9 +77,21 @@ export const envVariables = z
      */
     OPENAI_API_KEY: z.string().optional(),
     /**
+     * Composition workers
+     */
+    COMPOSITION_MAX_THREADS: z.coerce.number().int().min(0).default(0),
+    /**
      * Auth
      */
     AUTH_JWT_SECRET: z.string().min(32).max(32),
+    AUTH_SSO_COOKIE_DOMAIN: z
+      .string()
+      .transform((val) => (val?.trim() === '' ? undefined : val))
+      .optional()
+      .refine(
+        (val) => !val || /^[\d.a-z-]+$/i.test(val),
+        'AUTH_SSO_COOKIE_DOMAIN must be a valid domain (e.g. ".example.com")',
+      ),
     AUTH_REDIRECT_URI: z.string().url(),
     /**
      * Database
@@ -85,6 +120,7 @@ export const envVariables = z
      */
     WEBHOOK_URL: z.string().optional(),
     WEBHOOK_SECRET: z.string().optional(),
+    WEBHOOK_PROXY_URL: z.string().url().optional(),
     /**
      * GitHub Integration
      */
@@ -143,6 +179,29 @@ export const envVariables = z
       .transform((val) => val === 'true')
       .default('true'),
     /**
+     * Whether to use individual deletes for S3 objects instead of bulking them.
+     */
+    S3_USE_INDIVIDUAL_DELETES: z
+      .string()
+      .transform((val) => val === 'true')
+      .optional(),
+    /**
+     * S3 Failover Storage (optional secondary bucket for resilience)
+     */
+    S3_FAILOVER_STORAGE_URL: z.string().optional(),
+    S3_FAILOVER_ENDPOINT: z.string().optional(),
+    S3_FAILOVER_REGION: z.string().default('auto'),
+    S3_FAILOVER_ACCESS_KEY_ID: z.string().optional(),
+    S3_FAILOVER_SECRET_ACCESS_KEY: z.string().optional(),
+    S3_FAILOVER_FORCE_PATH_STYLE: z
+      .string()
+      .transform((val) => val === 'true')
+      .optional(),
+    S3_FAILOVER_USE_INDIVIDUAL_DELETES: z
+      .string()
+      .transform((val) => val === 'true')
+      .optional(),
+    /**
      * Email
      */
     SMTP_ENABLED: z
@@ -172,6 +231,7 @@ export const envVariables = z
      */
     AUTH_ADMISSION_JWT_SECRET: z.string(),
   })
+  .merge(sentryEnvVariables)
   .refine((input) => {
     if (input.STRIPE_WEBHOOK_SECRET && !input.STRIPE_SECRET_KEY) {
       return false;

@@ -1,6 +1,6 @@
 {
   "name": "cdn",
-  "version": "0.14.3",
+  "version": "0.21.0",
   "private": true,
   "author": {
     "name": "WunderGraph Maintainers",
@@ -16,24 +16,24 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "del dist && tsc",
+    "build": "rm -rf dist && tsc",
     "start": "tsx src/index.ts",
     "lint": "eslint --cache && prettier -c src",
-    "format:fix": "prettier --write -c src",
+    "format": "prettier -w -c .",
     "postversion": "name=$(jq -r .name package.json); version=$(jq -r .version package.json); gh workflow run image-release.yml -F name=$name -F workingDirectory=cdn-server -F tag=$version -F dockerContext=."
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.529.1",
-    "@hono/node-server": "1.13.7",
+    "@aws-sdk/client-s3": "^3.996.0",
+    "@hono/node-server": "1.19.13",
     "@wundergraph/cosmo-cdn": "workspace:*",
-    "dotenv": "^16.4.5",
-    "hono": "4.6.12"
+    "dotenv": "catalog:",
+    "hono": "catalog:"
   },
   "devDependencies": {
-    "@types/node": "^20.9.0",
-    "eslint": "^8.57.1",
-    "eslint-config-unjs": "^0.2.1",
-    "tsx": "^4.16.0",
-    "typescript": "5.5.2"
+    "@types/node": "catalog:",
+    "eslint": "catalog:",
+    "eslint-config-unjs": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:"
   }
 }

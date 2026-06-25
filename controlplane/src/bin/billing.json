@@ -28,7 +28,13 @@
         {
           "id": "field-pruning-grace-period",
           "limit": 0
-        }
+        },
+        {
+          "id": "plugins",
+          "description": "3 Plugins",
+          "limit": 3
+        },
+        { "id": "persisted-operations", "limit": 3000 }
       ]
     },
     "launch@1": {
@@ -47,19 +53,19 @@
         },
         {
           "id": "requests",
-          "description": "Up to 100M Requests per month",
-          "limit": 100
+          "description": "Up to 250M Requests per month",
+          "limit": 250
         },
         {
           "id": "retention",
-          "description": "7 days of Data Retention",
+          "description": "14 days of Data Retention",
           "limit": 14
         },
         { "id": "support", "description": "Email Support" },
         { "id": "analytics-retention", "limit": 7 },
         { "id": "tracing-retention", "limit": 7 },
         { "id": "changelog-retention", "limit": 7 },
-        { "id": "breaking-change-retention", "limit": 7 },
+        { "id": "breaking-change-retention", "limit": 14 },
         { "id": "trace-sampling-rate", "limit": 0.2 },
         {
           "id": "feature-flags",
@@ -69,7 +75,14 @@
         {
           "id": "field-pruning-grace-period",
           "limit": 7
-        }
+        },
+        {
+          "id": "plugins",
+          "description": "10 Plugins",
+          "limit": 10
+        },
+        { "id": "persisted-operations", "limit": 3000 },
+        { "id": "proposals", "description": "Proposals" }
       ]
     },
     "scale@1": {
@@ -88,13 +101,13 @@
         },
         {
           "id": "requests",
-          "description": "Up to 250M Requests per month",
-          "limit": 250
+          "description": "Up to 1B Requests per month",
+          "limit": 1000
         },
         {
           "id": "retention",
-          "description": "14 days of Data Retention",
-          "limit": 14
+          "description": "30 days of Data Retention",
+          "limit": 30
         },
         {
           "id": "support",
@@ -103,7 +116,7 @@
         { "id": "analytics-retention", "limit": 14 },
         { "id": "tracing-retention", "limit": 14 },
         { "id": "changelog-retention", "limit": 14 },
-        { "id": "breaking-change-retention", "limit": 14 },
+        { "id": "breaking-change-retention", "limit": 30 },
         { "id": "trace-sampling-rate", "limit": 0.3 },
         { "id": "rbac", "description": "Resource-based Access Control" },
         { "id": "sso", "description": "Single Sign-On (SSO)" },
@@ -116,7 +129,14 @@
         {
           "id": "field-pruning-grace-period",
           "limit": 14
-        }
+        },
+        {
+          "id": "plugins",
+          "description": "20 Plugins",
+          "limit": 20
+        },
+        { "id": "persisted-operations", "limit": 3000 },
+        { "id": "proposals", "description": "Proposals" }
       ]
     },
     "enterprise": {
@@ -126,20 +146,20 @@
       "weight": 3,
       "features": [
         { "id": "router", "description": "Self-Hosted Enterprise Router" },
-        { "id": "users", "description": "Unlimited Users", "limit": 200 },
+        { "id": "users", "description": "Custom Number of Users", "limit": 1000 },
         {
           "id": "federated-graphs",
-          "description": "Unlimited Federated Graphs",
+          "description": "Custom Number of Federated Graphs",
           "limit": 25
         },
         {
           "id": "requests",
-          "description": "Unlimited Requests per month",
+          "description": "Custom Number of Requests per month",
           "limit": 2000
         },
         {
           "id": "retention",
-          "description": "Unlimited Days of Data Retention",
+          "description": "Custom Number of Days of Data Retention",
           "limit": 365
         },
         { "id": "rbac", "description": "Resource-based Access Control" },
@@ -153,13 +173,35 @@
         { "id": "breaking-change-retention", "limit": 30 },
         { "id": "trace-sampling-rate", "limit": 0.1 },
         { "id": "oidc" },
-        { "id": "scim", "description": "System for Cross-Domain Identity Management (SCIM)" },
-        { "id": "feature-flags", "description": "Custom Number of Feature Flags", "limit": 10 },
+        {
+          "id": "scim",
+          "description": "System for Cross-Domain Identity Management (SCIM)"
+        },
+        {
+          "id": "feature-flags",
+          "description": "Custom Number of Feature Flags",
+          "limit": 10
+        },
         {
           "id": "field-pruning-grace-period",
           "limit": 30
         },
-        { "id": "cache-warmer", "description": "Cache Warmer" }
+        { "id": "cache-warmer", "description": "Cache Warmer" },
+        {
+          "id": "plugins",
+          "description": "Custom Number of Plugins",
+          "limit": 30
+        },
+        { "id": "persisted-operations", "limit": 3000 },
+        { "id": "proposals", "description": "Proposals" },
+        {
+          "id": "subgraph-check-extensions",
+          "description": "Subgraph Check Extensions"
+        },
+        {
+          "id": "login-method-restrictions",
+          "description": "Restrict login methods per organization and namespace"
+        }
       ]
     }
   }

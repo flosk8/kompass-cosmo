@@ -1,3 +1,5 @@
+coverage_file := coverage.out
+
 ifeq ($(CI),true)
  FORMAT := github-actions
 else
@@ -11,10 +13,13 @@ compose-demo-config:
 	pushd __schemas && ./compose.sh && popd
 
 update-snapshot:
-	cd ./pkg/config && go test -update -race ./...
+	cd ./pkg/config && GOLDIE_UPDATE=1 go test -race ./...
 
 test:
 	gotestsum -f $(FORMAT) -- -race ./...
+
+test-coverage:
+	gotestsum -f $(FORMAT) -- -race -coverprofile=$(coverage_file) -coverpkg=github.com/wundergraph/cosmo/router/... ./...
 
 test-fresh: clean-testcache test
 
@@ -46,4 +51,4 @@ build-custom:
 generate-mocks:
 	mockery
 
-.PHONY: dev test build lint bump-engine update-snapshot
+.PHONY: dev test test-coverage build lint bump-engine update-snapshot

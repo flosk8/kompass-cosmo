@@ -19,6 +19,7 @@ import ApolloMigrator from '../../services/ApolloMigrator.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function migrateFromApollo(
   opts: RouterOptions,
@@ -40,6 +41,7 @@ export function migrateFromApollo(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
     const auditLogRepo = new AuditLogRepository(opts.db);
     const namespaceRepo = new NamespaceRepository(opts.db, authContext.organizationId);
@@ -64,6 +66,10 @@ export function migrateFromApollo(
       };
     }
 
+    if (!authContext.rbac.canCreateFederatedGraph(namespace)) {
+      throw new UnauthorizedError();
+    }
+
     const org = await orgRepo.byId(authContext.organizationId);
     if (!org) {
       return {
@@ -76,7 +82,6 @@ export function migrateFromApollo(
     }
 
     const user = await userRepo.byId(authContext.userId || '');
-
     const apolloMigrator = new ApolloMigrator({
       apiKey: req.apiKey,
       organizationSlug: org.slug,
@@ -98,7 +103,6 @@ export function migrateFromApollo(
     }
 
     const graphDetails = await apolloMigrator.fetchGraphDetails({ graphID: graph.id });
-
     if (!graphDetails.success) {
       return {
         response: {
@@ -132,8 +136,6 @@ export function migrateFromApollo(
     }
 
     await opts.db.transaction(async (tx) => {
-      const fedGraphRepo = new FederatedGraphRepository(logger, tx, authContext.organizationId);
-
       const federatedGraph = await apolloMigrator.migrateGraphFromApollo({
         fedGraph: {
           name: graph.name,
@@ -147,16 +149,18 @@ export function migrateFromApollo(
         namespaceId: namespace.id,
       });
 
-      await fedGraphRepo.composeAndDeployGraphs({
-        federatedGraphs: [federatedGraph],
-        actorId: authContext.userId,
-        blobStorage: opts.blobStorage,
-        admissionConfig: {
-          cdnBaseUrl: opts.cdnBaseUrl,
-          webhookJWTSecret: opts.admissionWebhookJWTSecret,
-        },
-        chClient: opts.chClient!,
-      });
+      const compositionService = new CompositionService(
+        tx,
+        authContext.organizationId,
+        logger,
+        { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+        opts.blobStorage,
+        opts.chClient,
+        opts.webhookProxyUrl,
+        true,
+      );
+
+      await compositionService.composeAndDeployFederatedGraph({ actorId: authContext.userId, federatedGraph });
     });
 
     const migratedGraph = await fedGraphRepo.byName(graph.name, req.namespace);

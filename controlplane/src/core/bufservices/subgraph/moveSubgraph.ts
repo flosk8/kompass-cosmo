@@ -11,6 +11,7 @@ import { SubgraphRepository } from '../../repositories/SubgraphRepository.js';
 import type { RouterOptions } from '../../routes.js';
 import { enrichLogger, getLogger, handleError } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
+import { CompositionService } from '../../services/CompositionService.js';
 
 export function moveSubgraph(
   opts: RouterOptions,
@@ -30,6 +31,7 @@ export function moveSubgraph(
       authContext.organizationId,
       opts.logger,
       opts.billingDefaultPlanId,
+      opts.webhookProxyUrl,
     );
 
     const subgraph = await subgraphRepo.byName(req.name, req.namespace);
@@ -101,22 +103,28 @@ export function moveSubgraph(
           throw new PublicError(EnumStatusCode.ERR_NOT_FOUND, `Could not find namespace ${req.newNamespace}`);
         }
 
-        const { compositionErrors, updatedFederatedGraphs, deploymentErrors, compositionWarnings } =
+        const compositionService = new CompositionService(
+          tx,
+          authContext.organizationId,
+          logger,
+          { cdnBaseUrl: opts.cdnBaseUrl, webhookJWTSecret: opts.admissionWebhookJWTSecret },
+          opts.blobStorage,
+          opts.chClient,
+          opts.webhookProxyUrl,
+          req.disableResolvabilityValidation,
+        );
+
+        const { deploymentErrors, compositionErrors, compositionWarnings, updatedFederatedGraphs } =
           await subgraphRepo.move(
             {
-              targetId: subgraph.targetId,
-              updatedBy: authContext.userId,
-              subgraphId: subgraph.id,
-              subgraphLabels: subgraph.labels,
               currentNamespaceId: subgraph.namespaceId,
               newNamespaceId: newNamespace.id,
+              subgraphId: subgraph.id,
+              subgraphLabels: subgraph.labels,
+              targetId: subgraph.targetId,
+              updatedBy: authContext.userId,
             },
-            opts.blobStorage,
-            {
-              cdnBaseUrl: opts.cdnBaseUrl,
-              jwtSecret: opts.admissionWebhookJWTSecret,
-            },
-            opts.chClient!,
+            compositionService,
           );
 
         await auditLogRepo.addAuditLog({
