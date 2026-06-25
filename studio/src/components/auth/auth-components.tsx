@@ -55,24 +55,20 @@ export const AuthFooter = () => {
 
   const footerLinks = [
     {
-      href: 'https://wundergraph.com/privacy-policy',
-      label: 'Privacy Policy',
+      href: 'https://studio.prod.kompass.gg',
+      label: 'ARD Kompass Studio',
     },
     {
-      href: 'https://trust.wundergraph.com/',
-      label: 'Trust Center',
+      href: 'https://kompass.guide',
+      label: 'Kompass Guide',
     },
     {
-      href: 'https://wundergraph.com/terms',
-      label: 'Website Terms of Use',
+      href: 'https://wundergraph.com',
+      label: 'Cosmo Wundergraph',
     },
     {
-      href: 'https://wundergraph.com/cosmo-managed-service-terms',
-      label: 'Cosmo Managed Service Terms',
-    },
-    {
-      href: 'https://wundergraph.com/pricing',
-      label: 'Pricing',
+      href: 'https://cosmo-docs.wundergraph.com/overview',
+      label: 'Cosmo Wundergraph Documentation',
     },
   ];
 
@@ -129,9 +125,8 @@ export const TrustedCompanies = () => {
  * Marketing Header - Title and description for the right side
  */
 export const MarketingHeader = ({ title, description }: { title?: string; description?: string }) => {
-  const defaultTitle = 'Cosmo: Open-Source\nGraphQL Federation Solution';
-  const defaultDescription =
-    'Unify distributed APIs into one federated graph. Platform teams get observability and control. Service teams ship independently.';
+  const defaultTitle = 'ARD Kompass - GraphQL Federation Solution';
+  const defaultDescription = 'One to rule them all';
 
   const displayTitle = title || defaultTitle;
   const displayDescription = description || defaultDescription;
@@ -211,26 +206,7 @@ export const ProductCosmoStack = ({
     }
   };
 
-  const loginFeatures = [
-    {
-      icon: <BoltIcon className="h-8 w-8 text-purple-400" />,
-      title: 'Real time subscriptions without new infrastructure',
-      description:
-        'Cosmo Streams turns existing event streams into GraphQL subscriptions by handling authorization, filtering, and fan out in the Cosmo Router, keeping subgraphs stateless and avoiding a separate service.',
-    },
-    {
-      icon: <CodeBracketIcon className="h-8 w-8 text-purple-400" />,
-      title: 'Extend the router with TypeScript',
-      description:
-        'With TypeScript plugin support in Cosmo Connect, you can extend the Cosmo Router using TypeScript and run custom logic directly inside the router, without deploying separate services.',
-    },
-    {
-      icon: <ShieldCheckIcon className="h-8 w-8 text-purple-400" />,
-      title: 'Enforce custom schema rules before deploy',
-      description:
-        "With Subgraph Check Extensions, you can run your own validation logic as part of Cosmo's subgraph checks, enforcing custom schema rules before changes are deployed.",
-    },
-  ];
+  const loginFeatures: { icon: ReactNode; title: string; description: string }[] = [];
 
   // Signup content always from content map (single source of truth)
   let marketingTitle: string | undefined;

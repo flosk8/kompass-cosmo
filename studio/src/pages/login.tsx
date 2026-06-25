@@ -2,7 +2,6 @@ import {
   AuthCard,
   AuthLogoHeader,
   AuthFooter,
-  TrustedCompanies,
   ProductCosmoStack,
 } from '@/components/auth/auth-components';
 import { AuthLayout } from '@/components/layout/auth-layout';
@@ -140,11 +139,6 @@ const LoginPage: NextPageWithLayout = () => {
                   </p> */}
                 </div>
               </AuthCard>
-
-              {/* Trusted companies */}
-              <div className="mt-8 lg:mt-16">
-                <TrustedCompanies />
-              </div>
             </div>
           </div>
 
