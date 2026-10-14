@@ -1,4 +1,5 @@
 import { useApplyParams } from '@/components/analytics/use-apply-params';
+import { useParams } from 'next/navigation';
 import { useDateRangeQueryState } from '@/components/analytics/useAnalyticsQueryState';
 import { getCheckBadge, getCheckIcon, isCheckSuccessful } from '@/components/check-badge-icon';
 import { DatePickerWithRange, DateRangePickerChangeHandler } from '@/components/date-picker-with-range';
@@ -27,20 +28,45 @@ import { getChecksByFederatedGraphName } from '@wundergraph/cosmo-connect/dist/p
 import { formatDistanceToNow, formatISO } from 'date-fns';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
+import { usePaginationParams } from '@/hooks/use-pagination-params';
 import { useContext } from 'react';
 import { cn } from '@/lib/utils';
 import { useFeature } from '@/hooks/use-feature';
 import { useWorkspace } from '@/hooks/use-workspace';
 
+const getCheckSubgraphDisplayName = ({
+  subgraphName,
+  checkedSubgraphs,
+  hasFeatureSubgraphCheck,
+}: {
+  subgraphName?: string;
+  checkedSubgraphs: { subgraphName: string }[];
+  hasFeatureSubgraphCheck: boolean;
+}): string => {
+  if (subgraphName) {
+    return subgraphName;
+  }
+
+  if (checkedSubgraphs.length > 1) {
+    return 'Multiple Subgraphs';
+  }
+
+  if (checkedSubgraphs.length > 0) {
+    return checkedSubgraphs[0].subgraphName;
+  }
+
+  return hasFeatureSubgraphCheck ? 'Feature Subgraph' : 'Subgraph';
+};
+
 const ChecksPage: NextPageWithLayout = () => {
   const router = useRouter();
-  const pageNumber = router.query.page ? parseInt(router.query.page as string) : 1;
+  const { pageNumber, pageSize: limit, offset } = usePaginationParams();
 
-  const limit = Number.parseInt((router.query.pageSize as string) || '10');
   const selectedSubgraphs = parseSelectedSubgraphs(router.query.subgraphs);
   const {
     namespace: { name: namespace },
   } = useWorkspace();
+  const { slug: graphName } = useParams<{ slug: string }>();
 
   const {
     dateRange: { start, end },
@@ -58,10 +84,10 @@ const ChecksPage: NextPageWithLayout = () => {
   const { data, isLoading, error, refetch } = useQuery(
     getChecksByFederatedGraphName,
     {
-      name: router.query.slug as string,
+      name: graphName,
       namespace,
-      limit: limit > 50 ? 50 : limit,
-      offset: (pageNumber - 1) * limit,
+      limit,
+      offset,
       startDate: formatISO(startDate),
       endDate: formatISO(endDate),
       filters: {
@@ -150,6 +176,7 @@ const ChecksPage: NextPageWithLayout = () => {
                   linkedChecks,
                   checkExtensionDeliveryId,
                   checkExtensionErrorMessage,
+                  hasFeatureSubgraphCheck,
                 }) => {
                   const isLinkedTrafficCheckFailed = linkedChecks.some(
                     (linkedCheck) => linkedCheck.hasClientTraffic && !linkedCheck.isForcedSuccess,
@@ -201,12 +228,7 @@ const ChecksPage: NextPageWithLayout = () => {
                       </TableCell>
                       {graphContext.graph?.supportsFederation && (
                         <TableCell>
-                          {subgraphName ||
-                            (checkedSubgraphs.length > 1
-                              ? 'Multiple Subgraphs'
-                              : checkedSubgraphs.length > 0
-                                ? checkedSubgraphs[0].subgraphName
-                                : 'Subgraph')}
+                          {getCheckSubgraphDisplayName({ subgraphName, checkedSubgraphs, hasFeatureSubgraphCheck })}
                         </TableCell>
                       )}
                       <TableCell>
@@ -296,7 +318,11 @@ const ChecksPage: NextPageWithLayout = () => {
                                   onClick={(e) => e.stopPropagation()}
                                 >
                                   <Link
-                                    href={`https://github.com/${ghDetails.ownerSlug}/${ghDetails.repositorySlug}/commit/${ghDetails.commitSha}`}
+                                    href={`https://github.com/${encodeURIComponent(
+                                      ghDetails.ownerSlug,
+                                    )}/${encodeURIComponent(ghDetails.repositorySlug)}/commit/${encodeURIComponent(
+                                      ghDetails.commitSha,
+                                    )}`}
                                     className="inline-flex items-center gap-2 text-xs"
                                     aria-label="View on GitHub"
                                     target="_blank"

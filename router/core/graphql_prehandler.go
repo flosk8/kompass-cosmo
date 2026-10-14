@@ -25,6 +25,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/wundergraph/astjson"
+
 	"github.com/wundergraph/cosmo/router/internal/expr"
 	"github.com/wundergraph/cosmo/router/internal/persistedoperation"
 	"github.com/wundergraph/cosmo/router/pkg/art"
@@ -77,6 +78,9 @@ type PreHandlerOptions struct {
 	ForceEnableInboundRequestDeduplication bool
 	HeaderPropagation                      *HeaderPropagation
 	SpanNameFormatter                      SpanNameFormatterFunc
+
+	// WaitForCacheWrites is set when Debug.SynchronousCacheWrites is enabled; it blocks until pending async operation-cache writes are applied.
+	WaitForCacheWrites func()
 }
 
 type PreHandler struct {
@@ -118,6 +122,7 @@ type PreHandler struct {
 	enableInboundRequestDeduplication      bool
 	forceEnableInboundRequestDeduplication bool
 	spanNameFormatter                      SpanNameFormatterFunc
+	waitForCacheWrites                     func()
 }
 
 type httpOperation struct {
@@ -187,6 +192,7 @@ func NewPreHandler(opts *PreHandlerOptions) *PreHandler {
 		forceEnableInboundRequestDeduplication: opts.ForceEnableInboundRequestDeduplication,
 		headerPropagation:                      opts.HeaderPropagation,
 		spanNameFormatter:                      spanNameFormatter,
+		waitForCacheWrites:                     opts.WaitForCacheWrites,
 	}
 }
 
@@ -258,6 +264,11 @@ func (h *PreHandler) Handler(next http.Handler) http.Handler {
 			requestContext.telemetry.AddCustomMetricStringSliceAttr(ContextFieldOperationServices, requestContext.dataSourceNames)
 			requestContext.telemetry.AddCustomMetricStringSliceAttr(ContextFieldGraphQLErrorCodes, requestContext.graphQLErrorCodes)
 
+			if cacheStatus, ok := requestContext.responseCacheStatus(); ok {
+				routerSpan.SetAttributes(otel.WgOperationResponseCacheStatus.String(cacheStatus.String()))
+				requestContext.expressionContext.Response.Cache.Status = cacheStatus.String()
+			}
+
 			// Read the actual status code from the wrapped response w.
 			// This captures the correct status code for all paths, including early returns.
 			statusCode := ww.Status()
@@ -292,6 +303,7 @@ func (h *PreHandler) Handler(next http.Handler) http.Handler {
 		requestContext.operation.protocol = OperationProtocolHTTP
 		requestContext.operation.executionOptions = executionOptions
 		requestContext.operation.traceOptions = traceOptions
+		requestContext.cacheControl = parseRequestCacheControl(r.Header)
 
 		if traceOptions.Enable {
 			r = r.WithContext(resolve.SetTraceStart(r.Context(), traceOptions.EnablePredictableDebugTimings))
@@ -448,6 +460,10 @@ func (h *PreHandler) Handler(next http.Handler) http.Handler {
 			return
 		}
 
+		if h.waitForCacheWrites != nil {
+			h.waitForCacheWrites()
+		}
+
 		art.SetRequestTracingStats(r.Context(), traceOptions, traceTimings)
 
 		if traceOptions.Enable {
@@ -499,8 +515,8 @@ func (h *PreHandler) shouldComputeOperationSha256(operationKit *OperationKit, re
 
 	hasPersistedHash := operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash()
 
-	// If it has a hash already AND a body, we need to compute the hash again to ensure it matches the persisted hash
-	if hasPersistedHash && operationKit.parsedOperation.Request.Query != "" {
+	// APQ requests with a body must match their supplied hash.
+	if operationKit.persistedQueryHashMustMatchQuery() {
 		return true
 	}
 
@@ -570,10 +586,11 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 		}
 	}
 
-	// Compute the operation sha256 hash as soon as possible for observability reasons
+	// Populate operation telemetry before resolving persisted operations.
 	if h.shouldComputeOperationSha256(operationKit, requestContext) {
-		if operationKit.parsedOperation.Request.Query == "" && operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash() {
-			// No query body to hash; use the client-provided persisted hash for telemetry.
+		if operationKit.hasCustomPersistedOperationID() ||
+			(operationKit.parsedOperation.Request.Query == "" && operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash()) {
+			// Preserve the supplied persisted ID in telemetry, including custom IDs.
 			requestContext.operation.sha256Hash = operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash
 			requestContext.expressionContext.Request.Operation.Sha256Hash = requestContext.operation.sha256Hash
 
@@ -604,8 +621,8 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 		}
 	}
 
-	// Ensure if request has both hash and query, that the hash matches the query
-	if operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.HasHash() && operationKit.parsedOperation.Request.Query != "" {
+	// APQ IDs must match the supplied query body.
+	if operationKit.persistedQueryHashMustMatchQuery() {
 		if operationKit.parsedOperation.Sha256Hash != operationKit.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash {
 			return &httpGraphqlError{
 				message:    "persistedQuery sha256 hash does not match query body",
@@ -617,6 +634,13 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 	requestContext.operation.extensions = operationKit.parsedOperation.Request.Extensions
 	requestContext.operation.variablesHash = operationKit.parsedOperation.VariablesHash
 	requestContext.operation.variables, err = astjson.ParseBytes(operationKit.parsedOperation.Request.Variables)
+	// Expose the variables JSON to expressions as early as possible so it is available for access logs
+	// even if a later stage fails. It is only serialized when an expression references
+	// request.operation.variables, to avoid the (potentially large) serialization cost on every request.
+	// The value can contain sensitive data, so it should be logged with care.
+	if h.exprManager.VisitorManager.IsRequestOperationVariablesUsedInExpressions() {
+		requestContext.expressionContext.Request.Operation.Variables = string(operationKit.parsedOperation.Request.Variables)
+	}
 	if err != nil {
 		return &httpGraphqlError{
 			message:    fmt.Sprintf("error parsing variables: %s", err),
@@ -650,8 +674,9 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 				// persisted operation are logged above. We only allow execution to continue
 				// when the request includes a query body (the ad-hoc query to run) and
 				// safelist is not enforced. Hash-only requests without a body have nothing
-				// to execute, so we always return the not-found error in that case.
-				if !h.operationBlocker.safelistEnabled && operationKit.parsedOperation.Request.Query != "" {
+				// to execute, so we always return the not-found error in that case. Custom
+				// IDs don't identify their body, so an unknown custom ID is always rejected.
+				if !h.operationBlocker.safelistEnabled && operationKit.parsedOperation.Request.Query != "" && !operationKit.hasCustomPersistedOperationID() {
 					err = nil
 				}
 			}
@@ -669,7 +694,8 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 
 	// If the persistent operation is already in the cache, we skip the parse step
 	// because the operation was already parsed. This is a performance optimization, and we
-	// can do it because we know that the persisted operation is immutable (identified by the hash)
+	// can do it because manifest cache entries are scoped to the captured revision.
+	// Operations outside a manifest must remain immutable within their storage scope.
 	if !skipParse {
 		parseCtx, engineParseSpan := h.tracer.Start(req.Context(), "Operation - Parse",
 			trace.WithSpanKind(trace.SpanKindInternal),
@@ -848,6 +874,13 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 	requestContext.operation.normalizationCacheHit = operationKit.parsedOperation.NormalizationCacheHit
 	requestContext.expressionContext.Request.Operation.NormalizationCacheHit = operationKit.parsedOperation.NormalizationCacheHit
 
+	// Validate the operation against the schema BEFORE variable extraction. Extraction
+	// serializes inline argument literals into JSON variables, which erases their GraphQL
+	// type (e.g. an enum literal `hello` becomes the string "hello" and would wrongly
+	// satisfy a String argument). The error is surfaced later, on the validation span, so
+	// that the normalization span reflects only normalization.
+	operationValidationCacheHit, operationValidationErr := operationKit.ValidateOperation()
+
 	/**
 	* Normalize the variables
 	 */
@@ -870,6 +903,11 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 	engineNormalizeSpan.SetAttributes(otel.WgVariablesNormalizationCacheHit.Bool(cached))
 	requestContext.operation.variablesNormalizationCacheHit = cached
 	requestContext.expressionContext.Request.Operation.VariablesNormalizationCacheHit = cached
+
+	logInlineArguments(requestContext.logger, operationKit.parsedOperation)
+	if h.operationProcessor.parseKitOptions.validateInlineArguments.ReturnInResponseExtensions {
+		requestContext.operation.inlineArguments = inlineArgumentQualifiedNames(operationKit.parsedOperation)
+	}
 
 	// Update file upload paths if they were used in the nested field of the extracted variables.
 	for mapping := range slices.Values(uploadsMapping) {
@@ -1036,11 +1074,18 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 	// This check runs if they've configured a max query depth, and it can optionally be turned off for persisted operations
 	if h.complexityLimits != nil {
 		cacheHit, complexityCalcs, queryDepthErr := operationKit.ValidateQueryComplexity()
+		requestContext.expressionContext.Request.Operation.QueryDepth = complexityCalcs.Depth
 		engineValidateSpan.SetAttributes(otel.WgQueryDepth.Int(complexityCalcs.Depth))
+		requestContext.expressionContext.Request.Operation.QueryTotalFields = complexityCalcs.TotalFields
 		engineValidateSpan.SetAttributes(otel.WgQueryTotalFields.Int(complexityCalcs.TotalFields))
+		requestContext.expressionContext.Request.Operation.QueryRootFields = complexityCalcs.RootFields
 		engineValidateSpan.SetAttributes(otel.WgQueryRootFields.Int(complexityCalcs.RootFields))
+		requestContext.expressionContext.Request.Operation.QueryRootFieldAliases = complexityCalcs.RootFieldAliases
 		engineValidateSpan.SetAttributes(otel.WgQueryRootFieldAliases.Int(complexityCalcs.RootFieldAliases))
+		requestContext.expressionContext.Request.Operation.QueryComplexityCacheHit = cacheHit
 		engineValidateSpan.SetAttributes(otel.WgQueryDepthCacheHit.Bool(cacheHit))
+		setTelemetryAttributes(validationCtx, requestContext, expr.BucketQueryComplexity)
+
 		if queryDepthErr != nil {
 			rtrace.AttachErrToSpan(engineValidateSpan, err)
 
@@ -1056,7 +1101,14 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 		}
 	}
 
-	validationCached, err := operationKit.Validate(requestContext.operation.executionOptions.SkipLoader, requestContext.operation.remapVariables, h.apolloCompatibilityFlags)
+	// Schema validation (computed before variable extraction) takes precedence over
+	// variable validation, mirroring the GraphQL spec order (ValuesOfCorrectType before
+	// coerced variable values). Its error is surfaced here so it appears on the
+	// validation span rather than the normalization span.
+	err = operationValidationErr
+	if err == nil {
+		err = operationKit.ValidateOperationVariables(requestContext.operation.executionOptions.SkipLoader, requestContext.operation.remapVariables, h.apolloCompatibilityFlags)
+	}
 	if err != nil {
 		rtrace.AttachErrToSpan(engineValidateSpan, err)
 
@@ -1074,7 +1126,7 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 		return err
 	}
 
-	engineValidateSpan.SetAttributes(otel.WgValidationCacheHit.Bool(validationCached))
+	engineValidateSpan.SetAttributes(otel.WgValidationCacheHit.Bool(operationValidationCacheHit))
 	if requestContext.operation.executionOptions.SkipLoader {
 		// In case we're skipping the loader, which means that we won't execute the operation
 		// we skip the validation of variables as we're not using them
@@ -1170,6 +1222,8 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 		switch p := requestContext.operation.preparedPlan.preparedPlan.(type) {
 		case *plan.SynchronousResponsePlan:
 			p.Response.Fetches.NormalizedQuery = operationKit.parsedOperation.NormalizedRepresentation
+		case *plan.DeferResponsePlan:
+			// TODO: handle ART
 		}
 
 		if h.queryPlansLoggingEnabled {
@@ -1179,12 +1233,41 @@ func (h *PreHandler) handleOperation(req *http.Request, httpOperation *httpOpera
 				printedPlan = p.Response.Fetches.QueryPlan().PrettyPrint()
 			case *plan.SubscriptionResponsePlan:
 				printedPlan = p.Response.Response.Fetches.QueryPlan().PrettyPrint()
+			case *plan.DeferResponsePlan:
+				// TODO: handle
 			}
 			if h.developmentMode {
 				h.log.Sugar().Debugf("Query Plan:\n%s", printedPlan)
 			} else {
 				h.log.Debug("Query Plan", zap.String("query_plan", printedPlan))
 			}
+		}
+	}
+
+	// A DeferResponsePlan is only produced when the operation contains @defer
+	// (and @defer support is enabled). Such operations stream incremental
+	// payloads as multipart/mixed, so reject the request early if the client
+	// does not accept that content type, or asks for a format the router does
+	// not produce and would otherwise lose the deferred data silently.
+	if _, ok := requestContext.operation.preparedPlan.preparedPlan.(*plan.DeferResponsePlan); ok {
+		switch verdict, spec := deferAccept(req); verdict {
+		case deferAcceptNoMultipart:
+			return NewHttpGraphqlError(
+				"the router received a query with the @defer directive but the client does not accept "+
+					"multipart/mixed HTTP responses. To enable @defer support, add the HTTP header "+
+					"'Accept: multipart/mixed'",
+				ExtCodeErrDeferMultipartNotAccepted,
+				http.StatusOK,
+			)
+		case deferAcceptUnsupportedSpec:
+			return NewHttpGraphqlError(
+				fmt.Sprintf("the router received a query with the @defer directive but the client requested the "+
+					"incremental delivery format '%s', while the router implements 'incrementalSpec=%s'. "+
+					"Use a client that supports this format, for example Apollo Client with GraphQL17Alpha9Handler",
+					spec, deferIncrementalSpec),
+				ExtCodeErrDeferSpecNotSupported,
+				http.StatusOK,
+			)
 		}
 	}
 
@@ -1244,21 +1327,18 @@ func (h *PreHandler) flushMetrics(ctx context.Context, requestLogger *zap.Logger
 	now := time.Now()
 
 	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+
+	wg.Go(func() {
 		if err := h.metrics.MetricStore().Flush(ctx); err != nil {
 			requestLogger.Error("Failed to flush OTEL metrics", zap.Error(err))
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := h.tracerProvider.ForceFlush(ctx); err != nil {
 			requestLogger.Error("Failed to flush OTEL tracer", zap.Error(err))
 		}
-	}()
+	})
 
 	wg.Wait()
 
@@ -1320,7 +1400,7 @@ func (h *PreHandler) internalParseRequestOptions(r *http.Request, clientInfo *Cl
 		}
 		// If the client has a valid request token, and we have a public key from the controlplane
 		if clientInfo.WGRequestToken != "" && h.routerPublicKey != nil {
-			_, err := jwt.Parse(clientInfo.WGRequestToken, func(token *jwt.Token) (interface{}, error) {
+			_, err := jwt.Parse(clientInfo.WGRequestToken, func(token *jwt.Token) (any, error) {
 				return h.routerPublicKey, nil
 			}, jwt.WithValidMethods([]string{jwt.SigningMethodES256.Name}))
 			if err != nil {
@@ -1375,4 +1455,36 @@ func setExpressionContextClient(requestContext *requestContext) {
 		requestContext.expressionContext.Request.Client.Name = clientName
 		requestContext.expressionContext.Request.Client.Version = clientVersion
 	}
+}
+
+// logInlineArguments emits a warning listing every inline argument value found in
+// the operation (non-enforcing mode of ValidateInlineArguments). It is a no-op
+// when there are no findings, so both the HTTP prehandler and the WebSocket
+// handler can call it unconditionally after a successful normalization.
+func logInlineArguments(logger *zap.Logger, operation *ParsedOperation) {
+	argumentNames := inlineArgumentQualifiedNames(operation)
+	if len(argumentNames) == 0 {
+		return
+	}
+	logger.Warn("Inline argument values found in operation; use variables instead",
+		zap.Int("count", len(argumentNames)),
+		zap.Strings("arguments", argumentNames),
+		zap.String("operation_name", operation.Request.OperationName),
+		zap.Uint64("operation_hash", operation.ID),
+	)
+}
+
+// inlineArgumentQualifiedNames returns the qualified names (e.g. "user.id",
+// "@skip.if") of every inline argument found in the operation, or nil when there
+// are none. Shared by the warning log and the response-extension reporting.
+func inlineArgumentQualifiedNames(operation *ParsedOperation) []string {
+	inlineArguments := operation.InlineArguments
+	if len(inlineArguments) == 0 {
+		return nil
+	}
+	argumentNames := make([]string, len(inlineArguments))
+	for i, arg := range inlineArguments {
+		argumentNames[i] = arg.QualifiedName()
+	}
+	return argumentNames
 }

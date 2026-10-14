@@ -40,7 +40,14 @@
         "Enabled": true,
         "RouterRuntime": true,
         "GraphqlCache": false,
+        "ResponseCache": false,
         "ConnectionStats": false,
+        "Network": {
+          "Enabled": false
+        },
+        "Resolver": {
+          "Enabled": false
+        },
         "EngineStats": {
           "Subscriptions": false
         },
@@ -65,7 +72,14 @@
         "Path": "/metrics",
         "ListenAddr": "127.0.0.1:8088",
         "GraphqlCache": false,
+        "ResponseCache": false,
         "ConnectionStats": false,
+        "Network": {
+          "Enabled": false
+        },
+        "Resolver": {
+          "Enabled": false
+        },
         "Streams": false,
         "EngineStats": {
           "Subscriptions": false
@@ -93,6 +107,22 @@
       "CardinalityLimit": 2000
     }
   },
+  "Pyroscope": {
+    "Enabled": false,
+    "ServerAddress": "",
+    "ApplicationName": "wundergraph.cosmo.router",
+    "BasicAuth": {
+      "Username": "",
+      "Password": ""
+    },
+    "Headers": null,
+    "Tags": null,
+    "UploadRate": 15000000000,
+    "ProfileTypes": null,
+    "DisableGCRuns": false,
+    "MutexProfileFraction": 5,
+    "BlockProfileRate": 5
+  },
   "GraphqlMetrics": {
     "Enabled": true,
     "CollectorEndpoint": "https://cosmo-metrics.wundergraph.com"
@@ -102,6 +132,7 @@
     "AllowOrigins": [
       "*"
     ],
+    "MatchOrigins": null,
     "AllowMethods": [
       "HEAD",
       "GET",
@@ -163,7 +194,13 @@
     "Enabled": false,
     "Server": {
       "ListenAddr": "localhost:5025",
-      "BaseURL": ""
+      "BaseURL": "",
+      "Version": "",
+      "Title": "",
+      "Description": "",
+      "Discover": {
+        "Instructions": ""
+      }
     },
     "Storage": {
       "ProviderID": ""
@@ -177,22 +214,28 @@
     "ExposeSchema": false,
     "RouterURL": "",
     "OmitToolNamePrefix": false,
+    "OmitToolTitlePrefix": false,
     "OAuth": {
       "Enabled": false,
       "JWKS": null,
       "AuthorizationServerURL": "",
+      "AuthorizationServerURLs": null,
       "Scopes": {
         "Initialize": null,
         "ToolsList": null,
         "ToolsCall": null,
         "ExecuteGraphQL": null,
         "GetOperationInfo": null,
-        "GetSchema": null
+        "GetSchema": null,
+        "GenerateQuery": null
       },
       "ScopeChallengeIncludeTokenScopes": false,
       "MaxScopeCombinations": 2048
     },
-    "ResourceDocumentation": ""
+    "ResourceDocumentation": "",
+    "OutputSchema": {
+      "Enabled": false
+    }
   },
   "ConnectRPC": {
     "Enabled": false,
@@ -329,13 +372,15 @@
       "ScopeClaim": "scope",
       "HeaderName": "Authorization",
       "HeaderValuePrefix": "Bearer",
-      "HeaderSources": null
+      "HeaderSources": null,
+      "OnError": "reject"
     },
     "IgnoreIntrospection": false
   },
   "Authorization": {
     "RequireAuthentication": false,
-    "RejectOperationIfUnauthorized": false
+    "RejectOperationIfUnauthorized": false,
+    "EnablePreFetchFieldAuthorization": false
   },
   "RateLimit": {
     "Enabled": false,
@@ -359,7 +404,8 @@
     "ErrorExtensionCode": {
       "Enabled": true,
       "Code": "RATE_LIMIT_EXCEEDED"
-    }
+    },
+    "ExcludeSubscriptions": false
   },
   "LocalhostFallbackInsideDocker": true,
   "CDN": {
@@ -373,9 +419,13 @@
       "Kafka": null,
       "Redis": null
     },
+    "SkipUnavailableProviders": true,
     "Handlers": {
       "OnReceiveEvents": {
         "MaxConcurrentHandlers": 100,
+        "HandlerTimeout": 5000000000
+      },
+      "BeforeEventsDispatch": {
         "HandlerTimeout": 5000000000
       }
     }
@@ -393,6 +443,38 @@
     "ItemDelay": 0,
     "Timeout": 30000000000,
     "InMemoryFallback": true
+  },
+  "ResponseCache": {
+    "Enabled": false,
+    "KeyPrefix": "cosmo_response_cache:",
+    "Storage": {
+      "Provider": "redis",
+      "ProviderID": "",
+      "MaxEntries": 10000
+    },
+    "Invalidation": {
+      "CacheTag": true,
+      "Subgraph": true,
+      "Type": true,
+      "Endpoint": {
+        "Enabled": false,
+        "ListenAddr": "localhost:5027",
+        "Path": "/invalidation",
+        "SharedKey": ""
+      }
+    },
+    "TagHeader": {
+      "Enabled": false,
+      "Name": "Cache-Tag",
+      "Delimiter": ",",
+      "MaxBytes": 16384
+    },
+    "All": {
+      "Enabled": true,
+      "FallbackTTL": 30000000000,
+      "PrivateID": ""
+    },
+    "Subgraphs": null
   },
   "RouterConfigPath": "",
   "RouterRegistration": true,
@@ -447,7 +529,8 @@
       "EnableNormalizationCacheResponseHeader": false,
       "EnableCacheResponseHeaders": false,
       "AlwaysIncludeQueryPlan": false,
-      "AlwaysSkipLoader": false
+      "AlwaysSkipLoader": false,
+      "SynchronousCacheWrites": false
     },
     "EnableSingleFlight": true,
     "ForceEnableSingleFlight": false,
@@ -475,6 +558,11 @@
     "DisableVariablesRemapping": false,
     "EnableRequireFetchReasons": false,
     "SubscriptionFetchTimeout": 30000000000,
+    "SSEServerWriteTimeout": 10000000000,
+    "EnableDefer": false,
+    "EnableMultiFetch": true,
+    "EnableScheduleFetches": true,
+    "EnableGRPCWireEncoding": true,
     "WebSocketServerReadTimeout": 5000000000,
     "WebSocketServerWriteTimeout": 10000000000,
     "WebSocketServerPollTimeout": 1000000000,
@@ -485,7 +573,16 @@
     "WebSocketClientPingTimeout": 30000000000,
     "WebSocketClientAckTimeout": 30000000000,
     "ValidateRequiredExternalFields": false,
-    "RelaxSubgraphOperationFieldSelectionMergingNullability": false
+    "RelaxSubgraphOperationFieldSelectionMergingNullability": false,
+    "AllowStringLiteralsForEnums": false,
+    "ValidateInlineArguments": {
+      "Mode": "off",
+      "EnforceHTTPStatusCode": 400,
+      "ErrorCode": "INLINE_ARGUMENT_VALUES_NOT_ALLOWED",
+      "ErrorMessage": "Inline argument values are not allowed. Use variables instead.",
+      "IncludePersistedOperations": false,
+      "ReturnInResponseExtensions": false
+    }
   },
   "WebSocket": {
     "Enabled": true,
@@ -493,6 +590,7 @@
       "Enabled": true,
       "HandlerPath": "/absinthe/socket"
     },
+    "DefaultSubprotocol": "",
     "ForwardUpgradeHeaders": {
       "Enabled": true,
       "AllowList": [
@@ -649,6 +747,9 @@
       "Enabled": false
     },
     "SubrequestHTTPError": {
+      "Enabled": false
+    },
+    "SkipNullVariablesError": {
       "Enabled": false
     }
   },

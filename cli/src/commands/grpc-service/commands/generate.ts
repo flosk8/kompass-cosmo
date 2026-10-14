@@ -1,11 +1,13 @@
 import { access, constants, lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { toJsonString } from '@bufbuild/protobuf';
+import { GRPCMappingSchema } from '@wundergraph/cosmo-connect/dist/node/v1/node_pb';
 import {
   compileGraphQLToMapping,
   compileGraphQLToProto,
   compileOperationsToProto,
-  ProtoLock,
-  ProtoOption,
-  ProtoOptions,
+  type ProtoLock,
+  type ProtoOption,
+  type ProtoOptions,
   validateGraphQLSDL,
   rootToProtoText,
   protobuf,
@@ -456,7 +458,7 @@ async function generateFromSDL(
   });
 
   return {
-    mapping: JSON.stringify(mapping, null, 2),
+    mapping: toJsonString(GRPCMappingSchema, mapping, { prettySpaces: 2 }),
     proto: proto.proto,
     lockData: proto.lockData,
     isOperationsMode: false,

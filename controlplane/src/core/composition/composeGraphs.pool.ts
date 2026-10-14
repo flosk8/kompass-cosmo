@@ -9,8 +9,9 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { availableParallelism } from 'node:os';
+import { fromJson, type JsonValue } from '@bufbuild/protobuf';
 import { Warning } from '@wundergraph/composition';
-import { RouterConfig } from '@wundergraph/cosmo-connect/dist/node/v1/node_pb';
+import { RouterConfigSchema } from '@wundergraph/cosmo-connect/dist/node/v1/node_pb';
 import WorkerPool, { Options } from 'tinypool';
 import * as Sentry from '@sentry/node';
 import { FederatedGraphDTO } from '../../types/index.js';
@@ -25,10 +26,12 @@ import {
 
 let composeGraphsPool: WorkerPool | undefined;
 const composeGraphsPoolConfig = {
+  minThreads: 0,
   maxThreads: 0,
 };
 
 export interface ConfigureComposeGraphsPoolOptions {
+  minThreads: number;
   maxThreads: number;
 }
 
@@ -45,6 +48,14 @@ function getWorkerFilename() {
   };
 }
 
+function getMinThreads() {
+  if (composeGraphsPoolConfig.minThreads > 0) {
+    return composeGraphsPoolConfig.minThreads;
+  }
+
+  return 1;
+}
+
 function getMaxThreads() {
   if (composeGraphsPoolConfig.maxThreads > 0) {
     return composeGraphsPoolConfig.maxThreads;
@@ -59,10 +70,10 @@ function getComposeGraphsPool() {
   }
 
   const options = {
-    minThreads: 1,
+    minThreads: getMinThreads(),
     maxThreads: getMaxThreads(),
     runtime: 'child_process',
-    concurrentTasksPerWorker: 2,
+    concurrentTasksPerWorker: 1,
     serialization: 'advanced',
   };
 
@@ -100,11 +111,19 @@ function deserializeWarning(message: string, subgraphName?: string) {
 
 export type DeserializedComposedGraph = Omit<ComposedFederatedGraph, 'subgraphs'> & {
   subgraphs: CompositionSubgraphRecord[];
+  isFeatureFlagComposition?: boolean;
+  featureFlagId?: string;
+  featureFlagName?: string;
 };
 
 export function deserializeComposedGraphArtifact(
   federatedGraph: Pick<FederatedGraphDTO, 'id' | 'targetId' | 'name' | 'namespace' | 'namespaceId'>,
   artifact: SerializedComposedGraphArtifact,
+  featureFlagMeta?: {
+    isFeatureFlagComposition: boolean;
+    featureFlagId: string;
+    featureFlagName: string;
+  },
 ): DeserializedComposedGraph {
   return Sentry.startSpan({ name: 'ComposeGraphsPool.deserializeComposedGraphArtifact' }, () => ({
     id: federatedGraph.id,
@@ -119,16 +138,19 @@ export function deserializeComposedGraphArtifact(
     fieldConfigurations: artifact.fieldConfigurations,
     subgraphs: artifact.subgraphs,
     warnings: artifact.warnings.map((warning) => deserializeWarning(warning.message, warning.subgraphName)),
+    isFeatureFlagComposition: featureFlagMeta?.isFeatureFlagComposition,
+    featureFlagId: featureFlagMeta?.featureFlagId,
+    featureFlagName: featureFlagMeta?.featureFlagName,
   }));
 }
 
-export function deserializeRouterExecutionConfig(routerExecutionConfigJson?: ReturnType<RouterConfig['toJson']>) {
+export function deserializeRouterExecutionConfig(routerExecutionConfigJson?: JsonValue) {
   if (!routerExecutionConfigJson) {
     return;
   }
 
   return Sentry.startSpan({ name: 'ComposeGraphsPool.deserializeRouterExecutionConfig' }, () =>
-    RouterConfig.fromJson(routerExecutionConfigJson),
+    fromJson(RouterConfigSchema, routerExecutionConfigJson),
   );
 }
 

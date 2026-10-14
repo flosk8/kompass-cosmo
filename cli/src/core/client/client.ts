@@ -1,7 +1,7 @@
 import { compressionBrotli, compressionGzip, createConnectTransport } from '@connectrpc/connect-node';
-import { createPromiseClient, PromiseClient } from '@connectrpc/connect';
-import { PlatformService } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_connect';
-import { NodeService } from '@wundergraph/cosmo-connect/dist/node/v1/node_connect';
+import { createClient, Client as ConnectClient } from '@connectrpc/connect';
+import { PlatformService } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import { NodeService } from '@wundergraph/cosmo-connect/dist/node/v1/node_pb';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
 export interface ClientOptions {
@@ -11,8 +11,8 @@ export interface ClientOptions {
 }
 
 export interface Client {
-  platform: PromiseClient<typeof PlatformService>;
-  node?: PromiseClient<typeof NodeService>;
+  platform: ConnectClient<typeof PlatformService>;
+  node?: ConnectClient<typeof NodeService>;
 }
 
 export const CreateClient = (opts: ClientOptions): Client => {
@@ -37,11 +37,11 @@ export const CreateClient = (opts: ClientOptions): Client => {
 
     // Interceptors apply to all calls running through this transport.
     interceptors: [],
-    defaultTimeoutMs: 75_000,
+    defaultTimeoutMs: 120_000,
   });
 
   return {
-    platform: createPromiseClient(PlatformService, transport),
-    node: createPromiseClient(NodeService, transport),
+    platform: createClient(PlatformService, transport),
+    node: createClient(NodeService, transport),
   };
 };

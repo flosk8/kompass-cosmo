@@ -53,7 +53,7 @@ const LoginPage: NextPageWithLayout = () => {
   useEffect(() => {
     if (!router.isReady || sso) return;
     if (cosmoIdpHintCookieValue) {
-      router.replace(`/login?sso=${cosmoIdpHintCookieValue}`);
+      router.replace(`/login?sso=${encodeURIComponent(cosmoIdpHintCookieValue)}`);
     }
   }, [cosmoIdpHintCookieValue, sso, router]);
 

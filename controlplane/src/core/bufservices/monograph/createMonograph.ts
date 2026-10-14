@@ -1,4 +1,3 @@
-import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import {
@@ -23,6 +22,7 @@ import {
   isValidGraphName,
 } from '../../util.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import type { PlainMessage } from '../../../types/index.js';
 
 export function createMonograph(
   opts: RouterOptions,
@@ -133,22 +133,24 @@ export function createMonograph(
 
       const labelMatchers = [joinLabel(label)];
 
-      const subgraph = await subgraphRepo.create({
-        name: req.name,
-        namespace: req.namespace,
-        namespaceId: namespace.id,
-        createdBy: authContext.userId,
-        labels: [label],
-        routingUrl: req.graphUrl,
-        isEventDrivenGraph: false,
-        readme: req.readme,
-        subscriptionUrl: req.subscriptionUrl,
-        subscriptionProtocol:
-          req.subscriptionProtocol === undefined ? undefined : formatSubscriptionProtocol(req.subscriptionProtocol),
-        websocketSubprotocol:
-          req.websocketSubprotocol === undefined ? undefined : formatWebsocketSubprotocol(req.websocketSubprotocol),
-        type: 'standard',
-      });
+      const [subgraph] = await subgraphRepo.create([
+        {
+          name: req.name,
+          namespace: req.namespace,
+          namespaceId: namespace.id,
+          createdBy: authContext.userId,
+          labels: [label],
+          routingUrl: req.graphUrl,
+          isEventDrivenGraph: false,
+          readme: req.readme,
+          subscriptionUrl: req.subscriptionUrl,
+          subscriptionProtocol:
+            req.subscriptionProtocol === undefined ? undefined : formatSubscriptionProtocol(req.subscriptionProtocol),
+          websocketSubprotocol:
+            req.websocketSubprotocol === undefined ? undefined : formatWebsocketSubprotocol(req.websocketSubprotocol),
+          type: 'standard',
+        },
+      ]);
 
       if (!subgraph) {
         return {

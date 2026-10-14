@@ -7,18 +7,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	rErrors "github.com/wundergraph/cosmo/router/internal/errors"
 	"github.com/wundergraph/cosmo/router/pkg/config"
+	rmetric "github.com/wundergraph/cosmo/router/pkg/metric"
 	rotel "github.com/wundergraph/cosmo/router/pkg/otel"
 	"github.com/wundergraph/cosmo/router/pkg/statistics"
 
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/caching"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/graphql_datasource/subscriptionclient/transport"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
@@ -71,6 +77,7 @@ type HandlerOptions struct {
 	Executor       *Executor
 	Log            *zap.Logger
 	EngineStats    statistics.EngineStatistics
+	MetricStore    rmetric.Store
 	TracerProvider trace.TracerProvider
 	Authorizer     *CosmoAuthorizer
 	RateLimiter    *CosmoRateLimiter
@@ -84,7 +91,14 @@ type HandlerOptions struct {
 	EnableCostResponseHeaders       bool
 
 	ApolloSubscriptionMultipartPrintBoundary bool
+	SSEServerWriteTimeout                    time.Duration
 	HeaderPropagation                        *HeaderPropagation
+
+	ResponseCache             caching.Cache
+	ResponseCacheMetrics      rmetric.ResponseCacheMetricStore
+	ResponseCacheInvalidation config.ResponseCacheInvalidationConfig
+	ResponseCacheTagHeader    config.ResponseCacheTagHeaderConfig
+	ResponseCacheSettings     *ResponseCacheSettings
 }
 
 func NewGraphQLHandler(opts HandlerOptions) *GraphQLHandler {
@@ -98,6 +112,7 @@ func NewGraphQLHandler(opts HandlerOptions) *GraphQLHandler {
 		enableResponseHeaderPropagation:          opts.EnableResponseHeaderPropagation,
 		enableCostResponseHeaders:                opts.EnableCostResponseHeaders,
 		engineStats:                              opts.EngineStats,
+		metricStore:                              opts.MetricStore,
 		tracer:                                   tracer,
 		authorizer:                               opts.Authorizer,
 		rateLimiter:                              opts.RateLimiter,
@@ -105,9 +120,60 @@ func NewGraphQLHandler(opts HandlerOptions) *GraphQLHandler {
 		subgraphErrorPropagation:                 opts.SubgraphErrorPropagation,
 		engineLoaderHooks:                        opts.EngineLoaderHooks,
 		apolloSubscriptionMultipartPrintBoundary: opts.ApolloSubscriptionMultipartPrintBoundary,
+		sseServerWriteTimeout:                    opts.SSEServerWriteTimeout,
 		headerPropagation:                        opts.HeaderPropagation,
+		responseCacheStore:                       opts.ResponseCache,
+		responseCacheInvalidation:                opts.ResponseCacheInvalidation,
+		responseCacheTagHeader:                   opts.ResponseCacheTagHeader,
+		responseCacheSettings:                    opts.ResponseCacheSettings,
+		responseCacheErrorHandler:                newResponseCacheErrorHandler(opts.Log, opts.ResponseCacheMetrics),
 	}
 	return graphQLHandler
+}
+
+// newResponseCacheErrorHandler builds what the engine calls when it has swallowed
+// a cache failure in order to keep a request alive. The request was served
+// either way; this only decides whether anyone finds out that the cache is no
+// longer doing anything.
+
+func newResponseCacheErrorHandler(log *zap.Logger, metrics rmetric.ResponseCacheMetricStore) func(error) {
+	if log == nil && metrics == nil {
+		return nil
+	}
+
+	sampled := zap.NewNop()
+	if log != nil {
+		sampled = log.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+			return zapcore.NewSamplerWithOptions(core, time.Second, 1, 0)
+		}))
+	}
+
+	return func(err error) {
+		if metrics != nil {
+			measureResponseCacheEngineError(metrics, err)
+		}
+		sampled.Warn("Response cache degraded, serving from the subgraph instead", zap.Error(err))
+	}
+}
+
+// measureResponseCacheEngineError counts a failure of the engine around the store.
+// A failure of the store itself was counted where it happened.
+func measureResponseCacheEngineError(metrics rmetric.ResponseCacheMetricStore, err error) {
+	var cacheErr *resolve.ResponseCacheError
+	if !errors.As(err, &cacheErr) {
+		metrics.MeasureEngineError(context.Background(), "", rmetric.ResponseCacheErrorOther)
+		return
+	}
+
+	switch cacheErr.Operation {
+	case resolve.ResponseCacheOperationLookup, resolve.ResponseCacheOperationWrite:
+	case resolve.ResponseCacheOperationRead:
+		metrics.MeasureEngineError(context.Background(), cacheErr.Subgraph, rmetric.ResponseCacheErrorInvalidEntry)
+	case resolve.ResponseCacheOperationCollect:
+		metrics.MeasureEngineError(context.Background(), cacheErr.Subgraph, rmetric.ResponseCacheErrorInvalidResponse)
+	default:
+		metrics.MeasureEngineError(context.Background(), cacheErr.Subgraph, rmetric.ResponseCacheErrorOther)
+	}
 }
 
 // Error and Status Code handling
@@ -124,20 +190,27 @@ type GraphQLHandler struct {
 	log         *zap.Logger
 	executor    *Executor
 	engineStats statistics.EngineStatistics
+	metricStore rmetric.Store
 	tracer      trace.Tracer
 	authorizer  *CosmoAuthorizer
 	rateLimiter *CosmoRateLimiter
 
-	rateLimitConfig          *config.RateLimitConfiguration
-	subgraphErrorPropagation config.SubgraphErrorPropagationConfiguration
-	engineLoaderHooks        resolve.LoaderHooks
-	headerPropagation        *HeaderPropagation
+	rateLimitConfig           *config.RateLimitConfiguration
+	subgraphErrorPropagation  config.SubgraphErrorPropagationConfiguration
+	engineLoaderHooks         resolve.LoaderHooks
+	headerPropagation         *HeaderPropagation
+	responseCacheStore        caching.Cache
+	responseCacheErrorHandler func(error)
+	responseCacheInvalidation config.ResponseCacheInvalidationConfig
+	responseCacheTagHeader    config.ResponseCacheTagHeaderConfig
+	responseCacheSettings     *ResponseCacheSettings
 
 	enableCacheResponseHeaders      bool
 	enableResponseHeaderPropagation bool
 	enableCostResponseHeaders       bool
 
 	apolloSubscriptionMultipartPrintBoundary bool
+	sseServerWriteTimeout                    time.Duration
 }
 
 func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -148,6 +221,11 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		trace.WithAttributes(reqCtx.telemetry.traceAttrs...),
 	)
 	defer graphqlExecutionSpan.End()
+	defer func() {
+		if cacheStatus, ok := reqCtx.responseCacheStatus(); ok {
+			graphqlExecutionSpan.SetAttributes(rotel.WgOperationResponseCacheStatus.String(cacheStatus.String()))
+		}
+	}()
 
 	resolveCtx := resolve.NewContext(executionContext)
 	resolveCtx.Variables = reqCtx.operation.variables
@@ -162,6 +240,7 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resolveCtx.TracingOptions = reqCtx.operation.traceOptions
 	resolveCtx.InitialPayload = reqCtx.operation.initialPayload
 	resolveCtx.Extensions = reqCtx.operation.extensions
+	resolveCtx.InlineArguments = reqCtx.operation.inlineArguments
 	resolveCtx.ExecutionOptions = reqCtx.operation.executionOptions
 
 	if h.headerPropagation != nil {
@@ -174,11 +253,35 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.authorizer != nil {
 		resolveCtx = WithAuthorizationExtension(resolveCtx)
 		resolveCtx.SetAuthorizer(h.authorizer)
+		if h.authorizer.IsPreFetchFieldAuthorizationEnabled() {
+			resolveCtx.SetPreFetchFieldAuthorizer(h.authorizer)
+		}
 	}
 	if h.engineLoaderHooks != nil {
 		resolveCtx.SetEngineLoaderHooks(h.engineLoaderHooks)
 	}
-	resolveCtx = h.configureRateLimiting(resolveCtx)
+	resolveCtx = h.configureRateLimiting(resolveCtx, reqCtx.operation.opType)
+
+	if h.responseCacheStore != nil && h.responseCacheSettings != nil {
+		store := selectCacheStore(h.responseCacheStore, reqCtx.cacheControl)
+		if store != nil {
+			cacheOpts := h.responseCacheSettings.options(reqCtx.expressionContext, h.responseCacheErrorHandler)
+			cacheOpts.Store = store
+			cacheOpts.OnError = h.responseCacheErrorHandler
+			cacheOpts.Invalidation = resolve.ResponseCacheTagIndexOptions{
+				CacheTag: h.responseCacheInvalidation.CacheTag,
+				Subgraph: h.responseCacheInvalidation.Subgraph,
+				Type:     h.responseCacheInvalidation.Type,
+			}
+			resolveCtx.SetResponseCache(cacheOpts)
+		}
+	}
+	if h.responseCacheStore != nil && reqCtx.cacheControl != nil && reqCtx.cacheControl.NoCache {
+		// The leader of a shared flight may answer from the cache,
+		// so a no-cache request resolves on its own.
+		resolveCtx.ExecutionOptions.DisableInboundRequestDeduplication = true
+	}
+
 	if reqCtx.customFieldValueRenderer != nil {
 		resolveCtx.SetFieldValueRenderer(reqCtx.customFieldValueRenderer)
 	}
@@ -207,9 +310,7 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 					propagation.m.Lock()
 					defer propagation.m.Unlock()
-					for k, v := range headers {
-						propagation.header[k] = v
-					}
+					maps.Copy(propagation.header, headers)
 				},
 			)
 		}
@@ -241,6 +342,9 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
+			if h.responseCacheStore != nil && h.responseCacheTagHeader.Enabled {
+				pw.cacheTagHeader = &h.responseCacheTagHeader
+			}
 		}
 
 		info, err := h.executor.Resolver.ArenaResolveGraphQLResponse(resolveCtx, p.Response, hpw)
@@ -262,26 +366,35 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		graphqlExecutionSpan.SetAttributes(rotel.WgAcquireResolverWaitTimeMs.Int64(info.ResolveAcquireWaitTime.Milliseconds()))
 		graphqlExecutionSpan.SetAttributes(rotel.WgResolverDeduplicatedRequest.Bool(info.ResolveDeduplicated))
+
+		reqCtx.expressionContext.Request.Operation.ResolverAcquireDuration = info.ResolveAcquireWaitTime
+
+		if h.metricStore != nil {
+			h.metricStore.MeasureResolverAcquireDuration(
+				resolveCtx.Context(),
+				info.ResolveAcquireWaitTime,
+				reqCtx.telemetry.metricSliceAttrs,
+				otelmetric.WithAttributes(reqCtx.telemetry.metricAttrs...),
+			)
+		}
 	case *plan.SubscriptionResponsePlan:
-		var (
-			writer resolve.SubscriptionResponseWriter
-			ok     bool
-		)
 		h.setDebugCacheHeaders(w, reqCtx.operation)
 
 		defer propagateSubgraphErrors(resolveCtx)
-		resolveCtx, writer, ok = GetSubscriptionResponseWriter(resolveCtx, r, w, h.apolloSubscriptionMultipartPrintBoundary)
-		if !ok {
-			reqCtx.logger.Error("unable to get subscription response writer", zap.Error(errCouldNotFlushResponse))
-			trackFinalResponseError(r.Context(), errCouldNotFlushResponse)
-			writeRequestErrors(writeRequestErrorsParams{
-				request:           r,
-				writer:            w,
-				statusCode:        http.StatusInternalServerError,
-				requestErrors:     graphqlerrors.RequestErrorsFromError(errCouldNotFlushResponse),
-				logger:            reqCtx.logger,
-				headerPropagation: h.headerPropagation,
-			})
+		resolveCtx, writer, writerErr := GetSubscriptionResponseWriter(resolveCtx, r, w, h.apolloSubscriptionMultipartPrintBoundary, h.sseServerWriteTimeout)
+		if writerErr != nil {
+			reqCtx.logger.Error("unable to get subscription response writer", zap.Error(writerErr))
+			trackFinalResponseError(r.Context(), writerErr)
+			if errors.Is(writerErr, errCouldNotFlushResponse) {
+				writeRequestErrors(writeRequestErrorsParams{
+					request:           r,
+					writer:            w,
+					statusCode:        http.StatusInternalServerError,
+					requestErrors:     graphqlerrors.RequestErrorsFromError(errCouldNotFlushResponse),
+					logger:            reqCtx.logger,
+					headerPropagation: h.headerPropagation,
+				})
+			}
 			return
 		}
 
@@ -323,6 +436,67 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	case *plan.DeferResponsePlan:
+		var (
+			writer resolve.DeferResponseWriter
+			ok     bool
+		)
+		h.setDebugCacheHeaders(w, reqCtx.operation)
+
+		defer propagateSubgraphErrors(resolveCtx)
+		resolveCtx, writer, ok = GetDeferResponseWriter(resolveCtx, r, w)
+		if !ok {
+			reqCtx.logger.Error("unable to get defer response writer", zap.Error(errCouldNotFlushResponse))
+			trackFinalResponseError(r.Context(), errCouldNotFlushResponse)
+			writeRequestErrors(writeRequestErrorsParams{
+				request:           r,
+				writer:            w,
+				statusCode:        http.StatusInternalServerError,
+				requestErrors:     graphqlerrors.RequestErrorsFromError(errCouldNotFlushResponse),
+				logger:            reqCtx.logger,
+				headerPropagation: h.headerPropagation,
+			})
+			return
+		}
+
+		if !resolveCtx.ExecutionOptions.SkipLoader {
+			h.engineStats.ConnectionsInc()
+			defer h.engineStats.ConnectionsDec()
+		}
+
+		_, err := h.executor.Resolver.ResolveGraphQLDeferResponse(resolveCtx, p.Response, writer)
+		reqCtx.dataSourceNames = getSubgraphNames(p.Response.Response.DataSources)
+
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				reqCtx.logger.Debug("context canceled: unable to resolve defer response", zap.Error(err))
+				trackFinalResponseError(r.Context(), err)
+				return
+			} else if errors.Is(err, ErrUnauthorized) {
+				trackFinalResponseError(resolveCtx.Context(), err)
+				writeRequestErrors(writeRequestErrorsParams{
+					request:           r,
+					writer:            w,
+					statusCode:        http.StatusUnauthorized,
+					requestErrors:     graphqlerrors.RequestErrorsFromError(err),
+					logger:            reqCtx.logger,
+					headerPropagation: h.headerPropagation,
+				})
+				return
+			}
+
+			reqCtx.logger.Error("unable to resolve defer response", zap.Error(err))
+			trackFinalResponseError(resolveCtx.Context(), err)
+			writeRequestErrors(writeRequestErrorsParams{
+				request:           r,
+				writer:            w,
+				statusCode:        http.StatusInternalServerError,
+				requestErrors:     graphqlerrors.RequestErrorsFromError(errCouldNotResolveResponse),
+				logger:            reqCtx.logger,
+				headerPropagation: h.headerPropagation,
+			})
+			return
+		}
 	default:
 		reqCtx.logger.Error("unsupported plan kind")
 		trackFinalResponseError(resolveCtx.Context(), errOperationPlanUnsupported)
@@ -337,7 +511,7 @@ func (h *GraphQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *GraphQLHandler) configureRateLimiting(ctx *resolve.Context) *resolve.Context {
+func (h *GraphQLHandler) configureRateLimiting(ctx *resolve.Context, opType OperationType) *resolve.Context {
 	if h.rateLimiter == nil {
 		return ctx
 	}
@@ -348,6 +522,9 @@ func (h *GraphQLHandler) configureRateLimiting(ctx *resolve.Context) *resolve.Co
 		return ctx
 	}
 	if h.rateLimitConfig.Strategy != "simple" {
+		return ctx
+	}
+	if h.rateLimitConfig.ExcludeSubscriptions && opType == OperationTypeSubscription {
 		return ctx
 	}
 	ctx.SetRateLimiter(h.rateLimiter)
@@ -469,19 +646,19 @@ func (h *GraphQLHandler) writeError(ctx *resolve.Context, err error, res *resolv
 		if isHttpResponseWriter {
 			httpWriter.WriteHeader(http.StatusInternalServerError)
 		}
-	case errorTypeUpgradeFailed:
-		var upgradeErr transport.ErrFailedUpgrade
-		if h.subgraphErrorPropagation.PropagateStatusCodes && errors.As(err, &upgradeErr) && upgradeErr.StatusCode != 0 {
+	case errorTypeSubscriptionConnectionFailed:
+		var connectionErr transport.ErrFailedSubscriptionConnection
+		if h.subgraphErrorPropagation.PropagateStatusCodes && errors.As(err, &connectionErr) && connectionErr.StatusCode != 0 {
 			response.Errors[0].Extensions = &Extensions{
-				StatusCode: upgradeErr.StatusCode,
+				StatusCode: connectionErr.StatusCode,
 			}
-			if subgraph := reqContext.subgraphResolver.BySubgraphURL(upgradeErr.URL); subgraph != nil {
-				response.Errors[0].Message = fmt.Sprintf("Subscription Upgrade request failed for Subgraph '%s'.", subgraph.Name)
+			if subgraph := reqContext.subgraphResolver.BySubgraphURL(connectionErr.URL); subgraph != nil {
+				response.Errors[0].Message = fmt.Sprintf("Subscription connection request failed for Subgraph '%s'.", subgraph.Name)
 			} else {
-				response.Errors[0].Message = "Subscription Upgrade request failed"
+				response.Errors[0].Message = "Subscription connection request failed"
 			}
 		} else {
-			response.Errors[0].Message = "Subscription Upgrade request failed"
+			response.Errors[0].Message = "Subscription connection request failed"
 		}
 		if isHttpResponseWriter {
 			httpWriter.WriteHeader(http.StatusOK)

@@ -4,6 +4,75 @@ Binaries are attached to the github release otherwise all images can be found [h
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [0.159.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.158.0...@wundergraph/cosmo-connect@0.159.0) (2026-10-06)
+
+### Features
+
+* implement ptq rpc and index schemas ([#3138](https://github.com/wundergraph/cosmo/issues/3138)) ([0cfafef](https://github.com/wundergraph/cosmo/commit/0cfafef170f9c8d45a8a66afbb10cb4d72fc5971)) (@wilsonrivera)
+
+# [0.158.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.157.2...@wundergraph/cosmo-connect@0.158.0) (2026-09-14)
+
+### Features
+
+* add an option to set default headers ([#3208](https://github.com/wundergraph/cosmo/issues/3208)) ([fd12221](https://github.com/wundergraph/cosmo/commit/fd12221ef769fea0920941b47acf151655d82223)) (@JivusAyrus)
+
+## [0.157.2](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.157.1...@wundergraph/cosmo-connect@0.157.2) (2026-09-08)
+
+**Note:** Version bump only for package @wundergraph/cosmo-connect
+
+## [0.157.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.157.0...@wundergraph/cosmo-connect@0.157.1) (2026-08-26)
+
+### Bug Fixes
+
+* show feature flags for a federated graph under split config ([#3129](https://github.com/wundergraph/cosmo/issues/3129)) ([6a8da18](https://github.com/wundergraph/cosmo/commit/6a8da18dffcb02d012ae9491c017293e78efda39)) (@JivusAyrus)
+
+# [0.157.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.156.0...@wundergraph/cosmo-connect@0.157.0) (2026-08-11)
+
+### Features
+
+* **controlplane:** add CreateFederatedSubgraphs batch rpc ([#3152](https://github.com/wundergraph/cosmo/issues/3152)) ([9543225](https://github.com/wundergraph/cosmo/commit/95432255e3391369c617712e7c04e1762d122a39)) (@thisisnithin)
+
+# [0.156.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.155.3...@wundergraph/cosmo-connect@0.156.0) (2026-08-10)
+
+### Features
+
+* resolve feature subgraphs in federated graph field usage ([#3144](https://github.com/wundergraph/cosmo/issues/3144)) ([e81b5fa](https://github.com/wundergraph/cosmo/commit/e81b5fa984e8496aab8042f351372b239358099a)) (@JivusAyrus)
+
+## [0.155.3](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.155.2...@wundergraph/cosmo-connect@0.155.3) (2026-07-31)
+
+**Note:** Version bump only for package @wundergraph/cosmo-connect
+
+## [0.155.2](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.155.1...@wundergraph/cosmo-connect@0.155.2) (2026-07-17)
+
+### Bug Fixes
+
+* orphan subgraphs not shown as active on the header ([#3086](https://github.com/wundergraph/cosmo/issues/3086)) ([417c9e8](https://github.com/wundergraph/cosmo/commit/417c9e8df987296d47ef2cb28f1eeaef1ff4d7cf)) (@wilsonrivera)
+
+## [0.155.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.155.0...@wundergraph/cosmo-connect@0.155.1) (2026-07-14)
+
+### Bug Fixes
+
+* active subgraph not shown on the subgraph details page ([#3063](https://github.com/wundergraph/cosmo/issues/3063)) ([96663cc](https://github.com/wundergraph/cosmo/commit/96663ccf9ec6ed817e3c7f80d0a3cae01f9b9592)) (@wilsonrivera)
+
+# [0.155.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.154.0...@wundergraph/cosmo-connect@0.155.0) (2026-07-08)
+
+### Features
+
+* add support for feature subgraph checks ([#3029](https://github.com/wundergraph/cosmo/issues/3029)) ([8aadbf0](https://github.com/wundergraph/cosmo/commit/8aadbf0995725f7ef27f93e118679d12571354d9)) (@JivusAyrus)
+
+# [0.154.0](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.153.3...@wundergraph/cosmo-connect@0.154.0) (2026-07-06)
+
+### Features
+
+* decouple feature flag composition when split config is enabled ([#3034](https://github.com/wundergraph/cosmo/issues/3034)) ([f704e34](https://github.com/wundergraph/cosmo/commit/f704e34224f3843d4900d1719070d702802dd6ef)) (@wilsonrivera)
+* upgrade connect v1 to v2 ([#2705](https://github.com/wundergraph/cosmo/issues/2705)) ([c7203f4](https://github.com/wundergraph/cosmo/commit/c7203f47529f75675ca04e6ac4018efe55d4e498)) (@JivusAyrus)
+
+## [0.153.3](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.153.1...@wundergraph/cosmo-connect@0.153.3) (2026-06-26)
+
+### Bug Fixes
+
+* patch bump published npm packages ([#3021](https://github.com/wundergraph/cosmo/issues/3021)) ([f144989](https://github.com/wundergraph/cosmo/commit/f144989f69d58983fea7f74077c1a393395b1a4c)) (@gmas)
+
 ## [0.153.1](https://github.com/wundergraph/cosmo/compare/@wundergraph/cosmo-connect@0.153.0...@wundergraph/cosmo-connect@0.153.1) (2026-06-23)
 
 ### Bug Fixes

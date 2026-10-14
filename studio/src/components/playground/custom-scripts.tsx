@@ -198,8 +198,12 @@ const ScriptEditor = ({ script, close }: { script: PlaygroundScript; close: () =
   const { mutate: updateScript } = useMutation(updatePlaygroundScript, {
     onSuccess: (data) => {
       if (data.response?.code === EnumStatusCode.OK) {
-        const key = createConnectQueryKey(getPlaygroundScripts, {
-          type: script.type,
+        const key = createConnectQueryKey({
+          schema: getPlaygroundScripts,
+          input: {
+            type: script.type,
+          },
+          cardinality: 'finite',
         });
         client.invalidateQueries({
           queryKey: key,
@@ -991,16 +995,9 @@ export const CustomScripts = () => {
 
   return (
     <div className="flex h-full flex-1 flex-col gap-2 pl-1.5">
+      <ScriptSetting type="pre-flight" />
       <ScriptSetting type="pre-operation" />
       <ScriptSetting type="post-operation" />
-    </div>
-  );
-};
-
-export const PreFlightScript = () => {
-  return (
-    <div className="border-t py-4 pl-6 pr-4">
-      <ScriptSetting type="pre-flight" />
     </div>
   );
 };

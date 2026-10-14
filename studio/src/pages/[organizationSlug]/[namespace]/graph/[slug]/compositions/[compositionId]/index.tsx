@@ -1,4 +1,6 @@
 import { getCheckIcon } from '@/components/check-badge-icon';
+import { useParams } from 'next/navigation';
+import { useQueryState } from 'nuqs';
 import { EmptyState } from '@/components/empty-state';
 import { GraphContext, GraphPageLayout, getGraphLayout } from '@/components/layout/graph-layout';
 import { SDLViewerActions } from '@/components/schema/sdl-viewer';
@@ -49,6 +51,7 @@ import { PiGitBranch } from 'react-icons/pi';
 import { RxComponentInstance } from 'react-icons/rx';
 import { useWorkspace } from '@/hooks/use-workspace';
 import { useCurrentOrganization } from '@/hooks/use-current-organization';
+import { buildUrl } from '@/lib/build-url';
 
 export const FeatureFlagCompositionsTable = ({ ffCompositions }: { ffCompositions: FeatureFlagComposition[] }) => {
   const router = useRouter();
@@ -204,10 +207,11 @@ export const CompositionDetails = ({
   const {
     namespace: { name: namespace },
   } = useWorkspace();
-  const slug = router.query.slug as string;
-  const id = router.query.compositionId as string;
-  const tab = router.query.tab as string;
-  const subgraph = router.query.subgraph as string;
+  const { slug, compositionId: id } = useParams<{ slug: string; compositionId: string }>();
+  const [subgraph] = useQueryState('subgraph');
+
+  let tab = router.query.tab as string;
+  tab = isFeatureFlagComposition && tab === 'ffCompostions' ? 'output' : tab;
 
   const graphData = useContext(GraphContext);
   const [schemaType, setSchemaType] = useState<'router' | 'client'>('client');
@@ -311,7 +315,12 @@ export const CompositionDetails = ({
                 ) : (
                   <Link
                     key={id}
-                    href={`/${organizationSlug}/${namespace}/graph/${slug}/changelog/${schemaVersionId}`}
+                    href={buildUrl('/:organizationSlug/:namespace/graph/:slug/changelog/:schemaVersionId', {
+                      organizationSlug,
+                      namespace,
+                      slug,
+                      schemaVersionId,
+                    })}
                     className="text-primary"
                   >
                     <div className="flex items-center gap-x-1">
@@ -427,7 +436,7 @@ export const CompositionDetails = ({
                 <TabsTrigger value="warnings" asChild>
                   <Link href={{ query: { ...router.query, tab: 'warnings' } }}>Composition Warnings</Link>
                 </TabsTrigger>
-                {featureFlagCompositions && (
+                {featureFlagCompositions && !isFeatureFlagComposition && (
                   <TabsTrigger value="ffCompostions" asChild className="flex items-center gap-x-2">
                     <Link
                       href={{
@@ -589,14 +598,11 @@ export const CompositionDetails = ({
 };
 
 const CompositionDetailsPage: NextPageWithLayout = () => {
-  const router = useRouter();
-
   const organizationSlug = useCurrentOrganization()?.slug;
   const {
     namespace: { name: namespace },
   } = useWorkspace();
-  const slug = router.query.slug as string;
-  const id = router.query.compositionId as string;
+  const { slug, compositionId: id } = useParams<{ slug: string; compositionId: string }>();
 
   const { data, isLoading, error, refetch } = useQuery(getCompositionDetails, {
     compositionId: id,
@@ -611,7 +617,14 @@ const CompositionDetailsPage: NextPageWithLayout = () => {
         title={id}
         subtitle="A quick glance of the details for this composition"
         breadcrumbs={[
-          <Link key={0} href={`/${organizationSlug}/${namespace}/graph/${slug}/compositions`}>
+          <Link
+            key={0}
+            href={buildUrl('/:organizationSlug/:namespace/graph/:slug/compositions', {
+              organizationSlug,
+              namespace,
+              slug,
+            })}
+          >
             Compositions
           </Link>,
         ]}
@@ -627,13 +640,21 @@ const CompositionDetailsPage: NextPageWithLayout = () => {
     );
 
   const { composition, changeCounts, compositionSubgraphs, featureFlagCompositions } = data;
+  const isFeatureFlagComposition = composition.isFeatureFlagComposition;
 
   return (
     <GraphPageLayout
       title={id}
       subtitle="A quick glance of the details for this composition"
       breadcrumbs={[
-        <Link key={0} href={`/${organizationSlug}/${namespace}/graph/${slug}/compositions`}>
+        <Link
+          key={0}
+          href={buildUrl('/:organizationSlug/:namespace/graph/:slug/compositions', {
+            organizationSlug,
+            namespace,
+            slug,
+          })}
+        >
           Compositions
         </Link>,
       ]}
@@ -643,8 +664,8 @@ const CompositionDetailsPage: NextPageWithLayout = () => {
         composition={composition}
         changeCounts={changeCounts}
         compositionSubgraphs={compositionSubgraphs}
-        featureFlagCompositions={featureFlagCompositions}
-        isFeatureFlagComposition={false}
+        featureFlagCompositions={isFeatureFlagComposition ? undefined : featureFlagCompositions}
+        isFeatureFlagComposition={isFeatureFlagComposition}
       />
     </GraphPageLayout>
   );

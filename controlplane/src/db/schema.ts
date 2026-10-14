@@ -17,12 +17,12 @@ import {
   real,
 } from 'drizzle-orm/pg-core';
 import { AxiosHeaderValue } from 'axios';
-import type { PlainMessage } from '@bufbuild/protobuf';
 import type {
   CompositionError,
   CompositionWarning,
   DeploymentError,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
+import type { PlainMessage } from '../types/index.js';
 import { FeatureIds } from '../types/index.js';
 import { AuditableType, AuditActorType, AuditLogAction, AuditLogFullAction } from './models.js';
 
@@ -389,11 +389,9 @@ export const federatedGraphsToFeatureFlagSchemaVersions = pgTable(
       .references(() => federatedGraphs.id, {
         onDelete: 'cascade',
       }),
-    baseCompositionSchemaVersionId: uuid('base_composition_schema_version_id')
-      .notNull()
-      .references(() => schemaVersion.id, {
-        onDelete: 'cascade',
-      }),
+    baseCompositionSchemaVersionId: uuid('base_composition_schema_version_id').references(() => schemaVersion.id, {
+      onDelete: 'cascade',
+    }),
     composedSchemaVersionId: uuid('composed_schema_version_id')
       .notNull()
       .references(() => schemaVersion.id, {
@@ -405,7 +403,12 @@ export const federatedGraphsToFeatureFlagSchemaVersions = pgTable(
   },
   (t) => {
     return {
-      pk: primaryKey({ columns: [t.federatedGraphId, t.baseCompositionSchemaVersionId, t.composedSchemaVersionId] }),
+      pk: primaryKey({ columns: [t.federatedGraphId, t.composedSchemaVersionId] }),
+      compositeIdx: index('fgffsv_composite_idx').on(
+        t.federatedGraphId,
+        t.baseCompositionSchemaVersionId,
+        t.composedSchemaVersionId,
+      ),
       federatedGraphIdIndex: index('fgffsv_federated_graph_id_idx').on(t.federatedGraphId),
       baseCompositionSchemaVersionIdIndex: index('fgffsv_base_composition_schema_version_id_idx').on(
         t.baseCompositionSchemaVersionId,
@@ -885,6 +888,7 @@ export const schemaCheckSubgraphs = pgTable(
       onDelete: 'cascade',
     }),
     labels: text('labels').array(),
+    isFeatureSubgraph: boolean('is_feature_subgraph').notNull().default(false),
   },
   (t) => {
     return {
@@ -995,6 +999,7 @@ export const schemaCheckFederatedGraphChanges = pgTable(
       .references(() => schemaCheckChangeAction.id, {
         onDelete: 'cascade',
       }),
+    featureFlagId: uuid('feature_flag_id').references(() => featureFlags.id, { onDelete: 'cascade' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => {
@@ -1003,10 +1008,10 @@ export const schemaCheckFederatedGraphChanges = pgTable(
         t.schemaCheckFederatedGraphId,
       ),
       schemaCheckChangeActionIdIndex: index('scfgsc_schema_check_change_action_id_idx').on(t.schemaCheckChangeActionId),
-      uniqueFedGraphChange: uniqueIndex('scfgc_fed_graph_change_action_unique').on(
-        t.schemaCheckFederatedGraphId,
-        t.schemaCheckChangeActionId,
-      ),
+      featureFlagIdIndex: index('scfgc_feature_flag_id_idx').on(t.featureFlagId),
+      uniqueFedGraphChange: unique('scfgc_fed_graph_change_action_unique')
+        .on(t.schemaCheckFederatedGraphId, t.schemaCheckChangeActionId, t.featureFlagId)
+        .nullsNotDistinct(),
     };
   },
 );
@@ -1171,6 +1176,7 @@ export const schemaCheckComposition = pgTable(
       .references(() => targets.id, {
         onDelete: 'cascade',
       }),
+    featureFlagId: uuid('feature_flag_id').references(() => featureFlags.id, { onDelete: 'cascade' }),
     compositionErrors: text('composition_errors'),
     compositionWarnings: text('composition_warnings'),
     composedSchemaSDL: text('composed_schema_sdl'),
@@ -1181,6 +1187,10 @@ export const schemaCheckComposition = pgTable(
     return {
       schemaCheckIdIndex: index('scc_schema_check_id_idx').on(t.schemaCheckId),
       federatedTargetIdIndex: index('scc_target_id_idx').on(t.federatedTargetId),
+      featureFlagIdIndex: index('scc_feature_flag_id_idx').on(t.featureFlagId),
+      uniqueScc: unique('scc_check_target_flag_unique')
+        .on(t.schemaCheckId, t.federatedTargetId, t.featureFlagId)
+        .nullsNotDistinct(),
     };
   },
 );
@@ -1652,6 +1662,27 @@ export const organizationFeatures = pgTable(
   },
 );
 
+export const organizationFeatureTermsAcceptance = pgTable(
+  'organization_feature_terms_acceptance',
+  {
+    id: uuid('id').notNull().primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, {
+        onDelete: 'cascade',
+      }),
+    feature: text('feature').notNull(),
+    lastAcceptedBy: uuid('last_accepted_by_id').references(() => users.id, { onDelete: 'set null' }),
+    lastAcceptedAt: timestamp('last_accepted_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => {
+    return {
+      nameIndex: uniqueIndex('organization_fta_idx').on(t.organizationId, t.feature),
+      organizationIdIndex: index('org_fta_organization_id_idx').on(t.organizationId),
+    };
+  },
+);
+
 export const organizationInvitations = pgTable(
   'organization_invitations', // orginv
   {
@@ -1926,6 +1957,29 @@ export const slackSchemaUpdateEventConfigs = pgTable(
   },
 );
 
+export const slackProposalStateUpdate = pgTable(
+  'slack_proposal_state_update', // slackpsu
+  {
+    slackIntegrationConfigId: uuid('slack_integration_config_id')
+      .notNull()
+      .references(() => slackIntegrationConfigs.id, {
+        onDelete: 'cascade',
+      }),
+    federatedGraphId: uuid('federated_graph_id')
+      .notNull()
+      .references(() => federatedGraphs.id, {
+        onDelete: 'cascade',
+      }),
+  },
+  (t) => {
+    return {
+      pk: primaryKey({ columns: [t.slackIntegrationConfigId, t.federatedGraphId] }),
+      slackIntegrationConfigIdIndex: index('slackpsu_slack_integration_config_id_idx').on(t.slackIntegrationConfigId),
+      federatedGraphIdIndex: index('slackpsu_federated_graph_id_idx').on(t.federatedGraphId),
+    };
+  },
+);
+
 export const organizationIntegrationRelations = relations(organizationIntegrations, ({ one }) => ({
   organization: one(organizations),
   slackIntegrationConfigs: one(slackIntegrationConfigs),
@@ -1933,6 +1987,7 @@ export const organizationIntegrationRelations = relations(organizationIntegratio
 
 export const slackIntegrationConfigsRelations = relations(slackIntegrationConfigs, ({ many }) => ({
   slackSchemaUpdateEventConfigs: many(slackSchemaUpdateEventConfigs),
+  slackProposalStateUpdate: many(slackProposalStateUpdate),
 }));
 
 export const slackSchemaUpdateEventConfigRelations = relations(slackSchemaUpdateEventConfigs, ({ one }) => ({
@@ -1942,6 +1997,17 @@ export const slackSchemaUpdateEventConfigRelations = relations(slackSchemaUpdate
   }),
   federatedGraph: one(federatedGraphs, {
     fields: [slackSchemaUpdateEventConfigs.federatedGraphId],
+    references: [federatedGraphs.id],
+  }),
+}));
+
+export const slackProposalStateUpdateEventConfigRelations = relations(slackProposalStateUpdate, ({ one }) => ({
+  slackIntegrationEventConfig: one(slackIntegrationConfigs, {
+    fields: [slackProposalStateUpdate.slackIntegrationConfigId],
+    references: [slackIntegrationConfigs.id],
+  }),
+  federatedGraph: one(federatedGraphs, {
+    fields: [slackProposalStateUpdate.federatedGraphId],
     references: [federatedGraphs.id],
   }),
 }));
@@ -2496,6 +2562,48 @@ export const playgroundScripts = pgTable(
     return {
       organizationIdIndex: index('ps_organization_id_idx').on(t.organizationId),
       createdByIdIndex: index('ps_created_by_id_idx').on(t.createdById),
+    };
+  },
+);
+
+export interface PlaygroundHeaderEntry {
+  key: string;
+  value: string;
+}
+
+export const playgroundDefaultHeaders = pgTable(
+  'playground_default_headers', // pdh
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    organizationId: uuid('organization_id')
+      .notNull()
+      .references(() => organizations.id, {
+        onDelete: 'cascade',
+      }),
+    federatedGraphId: uuid('federated_graph_id')
+      .notNull()
+      .references(() => federatedGraphs.id, {
+        onDelete: 'cascade',
+      }),
+    // NULL = the graph-level (organization-shared) row. Set = that user's personal row.
+    userId: uuid('user_id').references(() => users.id, {
+      onDelete: 'cascade',
+    }),
+    headers: json('headers').$type<PlaygroundHeaderEntry[]>().notNull().default([]),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }),
+  },
+  (t) => {
+    return {
+      federatedGraphIdIndex: index('pdh_federated_graph_id_idx').on(t.federatedGraphId),
+      // Postgres treats NULLs as distinct in a unique constraint, so the two
+      // levels need two partial unique indexes rather than one composite unique.
+      uniqueGraphLevel: uniqueIndex('pdh_unique_graph_level')
+        .on(t.federatedGraphId)
+        .where(sql`${t.userId} IS NULL`),
+      uniquePersonalLevel: uniqueIndex('pdh_unique_personal_level')
+        .on(t.federatedGraphId, t.userId)
+        .where(sql`${t.userId} IS NOT NULL`),
     };
   },
 );

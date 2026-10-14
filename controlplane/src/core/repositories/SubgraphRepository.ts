@@ -1,4 +1,3 @@
-import { PlainMessage } from '@bufbuild/protobuf';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import {
   CheckSubgraphSchemaResponse,
@@ -14,7 +13,7 @@ import { and, arrayOverlaps, asc, count, desc, eq, gt, inArray, like, lt, notInA
 import { validate as isValidUuid } from 'uuid';
 import { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import { FastifyBaseLogger } from 'fastify';
-import { GraphQLSchema } from 'graphql';
+import { GraphQLSchema, parse } from 'graphql';
 import { CompositionOptions } from '@wundergraph/composition';
 import { DBSubgraphType, SchemaCheckChangeAction, WebsocketSubprotocol } from '../../db/models.js';
 import * as schema from '../../db/schema.js';
@@ -48,6 +47,7 @@ import {
   SubgraphDTO,
   SubgraphListFilterOptions,
   SubgraphMemberDTO,
+  PlainMessage,
   ComposeAndDeployResult,
   Feature,
 } from '../../types/index.js';
@@ -73,7 +73,11 @@ import { OrganizationWebhookService } from '../webhooks/OrganizationWebhookServi
 import { traced } from '../tracing.js';
 import type { CompositionService } from '../services/CompositionService.js';
 import { ContractRepository } from './ContractRepository.js';
-import { FeatureFlagCollectCaches, FeatureFlagRepository } from './FeatureFlagRepository.js';
+import {
+  FeatureFlagRepository,
+  FeatureFlagWithFeatureSubgraphs,
+  FeatureFlagCollectCaches,
+} from './FeatureFlagRepository.js';
 import { FederatedGraphRepository } from './FederatedGraphRepository.js';
 import { GraphCompositionRepository } from './GraphCompositionRepository.js';
 import { OperationsRepository } from './OperationsRepository.js';
@@ -85,6 +89,10 @@ import { TargetRepository } from './TargetRepository.js';
 import { OrganizationRepository } from './OrganizationRepository.js';
 
 type SubscriptionProtocol = 'ws' | 'sse' | 'sse_post';
+
+// Orders composition entries so base-supergraph ones (no feature flag) come before flag-attributed ones.
+const baseCompositionFirst = (a: { featureFlag: string }, b: { featureFlag: string }) =>
+  Number(Boolean(a.featureFlag)) - Number(Boolean(b.featureFlag));
 
 export type UpdateSubgraphSchemaData = {
   targetId: string;
@@ -131,65 +139,85 @@ export class SubgraphRepository {
     return graphs.length === 1;
   }
 
-  public create(data: {
-    name: string;
-    namespace: string;
-    routingUrl: string;
-    createdBy: string;
-    labels: Label[];
-    namespaceId: string;
-    isEventDrivenGraph: boolean;
-    subscriptionUrl?: string;
-    subscriptionProtocol?: SubscriptionProtocol;
-    websocketSubprotocol?: WebsocketSubprotocol;
-    readme?: string;
-    featureSubgraphOptions?: {
-      isFeatureSubgraph: boolean;
-      baseSubgraphID: string;
-    };
-    type: DBSubgraphType;
-  }): Promise<SubgraphDTO | undefined> {
-    const uniqueLabels = normalizeLabels(data.labels);
-    const routingUrl = normalizeURL(data.routingUrl);
-    let subscriptionUrl = data.subscriptionUrl ? normalizeURL(data.subscriptionUrl) : undefined;
-    if (subscriptionUrl === routingUrl) {
-      subscriptionUrl = undefined;
+  /**
+   * Creates every provided subgraph, one statement per table rather than one per
+   * subgraph, in a single transaction. Returns the created subgraphs in the order
+   * they were provided.
+   */
+  public create(
+    newSubgraphs: {
+      name: string;
+      namespace: string;
+      routingUrl: string;
+      createdBy: string;
+      labels: Label[];
+      namespaceId: string;
+      isEventDrivenGraph: boolean;
+      subscriptionUrl?: string;
+      subscriptionProtocol?: SubscriptionProtocol;
+      websocketSubprotocol?: WebsocketSubprotocol;
+      readme?: string;
+      featureSubgraphOptions?: {
+        isFeatureSubgraph: boolean;
+        baseSubgraphID: string;
+      };
+      type: DBSubgraphType;
+    }[],
+  ): Promise<SubgraphDTO[]> {
+    if (newSubgraphs.length === 0) {
+      return Promise.resolve([]);
     }
+
+    const subgraphsToCreate = newSubgraphs.map((newSubgraph) => {
+      const routingUrl = normalizeURL(newSubgraph.routingUrl);
+      const subscriptionUrl = newSubgraph.subscriptionUrl ? normalizeURL(newSubgraph.subscriptionUrl) : undefined;
+
+      return {
+        ...newSubgraph,
+        labels: normalizeLabels(newSubgraph.labels),
+        routingUrl,
+        subscriptionUrl: subscriptionUrl === routingUrl ? undefined : subscriptionUrl,
+      };
+    });
 
     return this.db.transaction(async (tx) => {
       /**
-       * 1. Create a new target of type subgraph.
+       * 1. Create a new target of type subgraph for each subgraph.
        * The name is the name of the subgraph.
        */
-      const insertedTarget = await tx
+      const insertedTargets = await tx
         .insert(targets)
-        .values({
-          name: data.name,
-          namespaceId: data.namespaceId,
-          createdBy: data.createdBy,
-          type: 'subgraph',
-          organizationId: this.organizationId,
-          labels: uniqueLabels.map((ul) => joinLabel(ul)),
-          readme: sanitizeReadme(data.readme),
-        })
+        .values(
+          subgraphsToCreate.map((subgraph) => ({
+            name: subgraph.name,
+            namespaceId: subgraph.namespaceId,
+            createdBy: subgraph.createdBy,
+            type: 'subgraph' as const,
+            organizationId: this.organizationId,
+            labels: subgraph.labels.map((label) => joinLabel(label)),
+            readme: sanitizeReadme(subgraph.readme),
+          })),
+        )
         .returning()
         .execute();
 
       /**
-       * 2. Create the subgraph with the initial metadata without a schema version.
+       * 2. Create the subgraphs with the initial metadata without a schema version.
        */
-      const insertedSubgraph = await tx
+      const insertedSubgraphs = await tx
         .insert(subgraphs)
-        .values({
-          targetId: insertedTarget[0].id,
-          routingUrl,
-          subscriptionUrl,
-          isEventDrivenGraph: data.isEventDrivenGraph,
-          subscriptionProtocol: data.subscriptionProtocol ?? 'ws',
-          websocketSubprotocol: data.websocketSubprotocol || 'auto',
-          isFeatureSubgraph: data.featureSubgraphOptions?.isFeatureSubgraph || false,
-          type: data.type,
-        })
+        .values(
+          subgraphsToCreate.map((subgraph, index) => ({
+            targetId: insertedTargets[index].id,
+            routingUrl: subgraph.routingUrl,
+            subscriptionUrl: subgraph.subscriptionUrl,
+            isEventDrivenGraph: subgraph.isEventDrivenGraph,
+            subscriptionProtocol: subgraph.subscriptionProtocol ?? ('ws' as const),
+            websocketSubprotocol: subgraph.websocketSubprotocol || ('auto' as const),
+            isFeatureSubgraph: subgraph.featureSubgraphOptions?.isFeatureSubgraph || false,
+            type: subgraph.type,
+          })),
+        )
         .returning()
         .execute();
 
@@ -197,56 +225,70 @@ export class SubgraphRepository {
        * 3. Insert into federatedSubgraphs by matching labels
        */
       const fedGraphRepo = new FederatedGraphRepository(this.logger, tx, this.organizationId);
-      const federatedGraphs = await fedGraphRepo.bySubgraphLabels({
-        labels: uniqueLabels,
-        namespaceId: data.namespaceId,
-      });
+      const federatedGraphsPerSubgraph = await Promise.all(
+        subgraphsToCreate.map((subgraph) =>
+          fedGraphRepo.bySubgraphLabels({
+            labels: subgraph.labels,
+            namespaceId: subgraph.namespaceId,
+          }),
+        ),
+      );
 
-      if (federatedGraphs.length > 0 && !data.featureSubgraphOptions?.isFeatureSubgraph) {
-        await tx
-          .insert(subgraphsToFederatedGraph)
-          .values(
-            federatedGraphs.map((federatedGraph) => ({
+      // Feature subgraphs are composed through their feature flag, not by label.
+      const subgraphsToFederatedGraphRows = subgraphsToCreate.flatMap((subgraph, index) =>
+        subgraph.featureSubgraphOptions?.isFeatureSubgraph
+          ? []
+          : federatedGraphsPerSubgraph[index].map((federatedGraph) => ({
               federatedGraphId: federatedGraph.id,
-              subgraphId: insertedSubgraph[0].id,
+              subgraphId: insertedSubgraphs[index].id,
             })),
-          )
-          .execute();
+      );
+
+      if (subgraphsToFederatedGraphRows.length > 0) {
+        await tx.insert(subgraphsToFederatedGraph).values(subgraphsToFederatedGraphRows).execute();
       }
 
       /**
-       * 4. Insert into featureFlagsToSubgraph to map the feature flag to the base subgraph
+       * 4. Insert into featureFlagsToSubgraph to map the feature flags to their base subgraphs
        */
+      const featureSubgraphRows = subgraphsToCreate.flatMap((subgraph, index) => {
+        const { featureSubgraphOptions } = subgraph;
 
-      if (data.featureSubgraphOptions) {
-        await tx
-          .insert(featureSubgraphsToBaseSubgraphs)
-          .values({
-            baseSubgraphId: data.featureSubgraphOptions.baseSubgraphID,
-            featureSubgraphId: insertedSubgraph[0].id,
-          })
-          .execute();
+        return featureSubgraphOptions?.isFeatureSubgraph
+          ? {
+              baseSubgraphId: featureSubgraphOptions.baseSubgraphID,
+              featureSubgraphId: insertedSubgraphs[index].id,
+            }
+          : [];
+      });
+
+      if (featureSubgraphRows.length > 0) {
+        await tx.insert(featureSubgraphsToBaseSubgraphs).values(featureSubgraphRows).execute();
       }
 
-      return {
-        id: insertedSubgraph[0].id,
-        name: data.name,
-        targetId: insertedTarget[0].id,
-        labels: uniqueLabels,
-        routingUrl,
-        // Populated when first schema is pushed
-        schemaSDL: '',
-        schemaVersionId: '',
-        lastUpdatedAt: '',
-        namespace: data.namespace,
-        namespaceId: data.namespaceId,
-        isFeatureSubgraph: insertedSubgraph[0].isFeatureSubgraph,
-        isEventDrivenGraph: data.isEventDrivenGraph,
-        type: data.type,
-        subscriptionUrl: subscriptionUrl ?? '',
-        subscriptionProtocol: data.subscriptionProtocol ?? 'ws',
-        websocketSubprotocol: data.websocketSubprotocol ?? 'auto',
-      } satisfies SubgraphDTO;
+      return subgraphsToCreate.map((subgraph, index) => {
+        const insertedSubgraph = insertedSubgraphs[index];
+
+        return {
+          id: insertedSubgraph.id,
+          name: subgraph.name,
+          targetId: insertedSubgraph.targetId,
+          labels: subgraph.labels,
+          routingUrl: subgraph.routingUrl,
+          // Populated when first schema is pushed
+          schemaSDL: '',
+          schemaVersionId: '',
+          lastUpdatedAt: '',
+          namespace: subgraph.namespace,
+          namespaceId: subgraph.namespaceId,
+          isFeatureSubgraph: insertedSubgraph.isFeatureSubgraph,
+          isEventDrivenGraph: subgraph.isEventDrivenGraph,
+          type: subgraph.type,
+          subscriptionUrl: subgraph.subscriptionUrl ?? '',
+          subscriptionProtocol: subgraph.subscriptionProtocol ?? 'ws',
+          websocketSubprotocol: subgraph.websocketSubprotocol ?? 'auto',
+        } satisfies SubgraphDTO;
+      });
     });
   }
 
@@ -266,60 +308,61 @@ export class SubgraphRepository {
     let subgraphChanged = false;
     let labelChanged = false;
 
-    await this.db.transaction(async (tx) => {
-      const fedGraphRepo = new FederatedGraphRepository(this.logger, tx, this.organizationId);
-
-      // The collection of federated graphs that will be potentially re-composed
+    /**
+     * Phase 1: mirror what `batchWriteAndCollect` does, which is to write the schema version and collect
+     * what it affects in a short transaction so we don't block the database on composition and uploading the
+     * router configs
+     */
+    const { subgraph, affectedFederatedGraphById, affectedFeatureFlags } = await this.db.transaction(async (tx) => {
       const collected = await this.writeSchemaAndCollectAffected(tx, data);
-      const { subgraph, affectedFederatedGraphById, affectedFeatureFlagIds } = collected;
       subgraphChanged = collected.subgraphChanged;
       labelChanged = collected.labelChanged;
 
-      if (!subgraph) {
-        return {
-          compositionErrors,
-          compositionWarnings,
-          updatedFederatedGraphs,
-          deploymentErrors,
-          subgraphChanged: subgraphChanged || labelChanged || data.unsetLabels,
-        };
-      }
-
-      // Resolve the affected feature flag DTOs.
-      const affectedFeatureFlags = await this.resolveFeatureFlags(this.db, data.namespaceId, affectedFeatureFlagIds);
-      if (affectedFederatedGraphById.size === 0 && affectedFeatureFlags.length === 0) {
-        return {
-          compositionErrors,
-          compositionWarnings,
-          updatedFederatedGraphs,
-          deploymentErrors,
-          subgraphChanged: subgraphChanged || labelChanged || data.unsetLabels,
-        };
-      }
-
-      updatedFederatedGraphs.push(...affectedFederatedGraphById.values());
-      const result = await compositionService.recomposeAndDeployAffected({
-        actorId: data.updatedBy,
-        affectedFederatedGraphs: [...affectedFederatedGraphById.values()],
-        affectedFeatureFlags,
-        isFeatureSubgraph: subgraph.isFeatureSubgraph,
-      });
-
-      deploymentErrors.push(...result.deploymentErrors);
-      compositionErrors.push(...result.compositionErrors);
-      compositionWarnings.push(...result.compositionWarnings);
-
-      // Re-fetch the federated graphs to get the updated composedSchemaVersionId
-      const refreshedGraphs = await Promise.all(
-        [...affectedFederatedGraphById.keys()].map((id) => fedGraphRepo.byId(id)),
-      );
-      for (let i = 0; i < updatedFederatedGraphs.length; i++) {
-        const refreshedGraph = refreshedGraphs[i];
-        if (refreshedGraph) {
-          updatedFederatedGraphs[i] = refreshedGraph;
-        }
-      }
+      return {
+        subgraph: collected.subgraph,
+        affectedFederatedGraphById: collected.affectedFederatedGraphById,
+        // Resolve the affected feature flag DTOs.
+        affectedFeatureFlags: collected.subgraph
+          ? await this.resolveFeatureFlags(tx, data.namespaceId, collected.affectedFeatureFlagIds)
+          : [],
+      };
     });
+
+    if (!subgraph || (affectedFederatedGraphById.size === 0 && affectedFeatureFlags.length === 0)) {
+      return {
+        compositionErrors,
+        compositionWarnings,
+        updatedFederatedGraphs,
+        deploymentErrors,
+        subgraphChanged: subgraphChanged || labelChanged || data.unsetLabels,
+      };
+    }
+
+    updatedFederatedGraphs.push(...affectedFederatedGraphById.values());
+
+    // Compose the affected graphs in parallel outside the database transaction to avoid blocking it
+    const result = await compositionService.recomposeAndDeployAffectedBatch({
+      actorId: data.updatedBy,
+      affectedFederatedGraphs: [...affectedFederatedGraphById.values()],
+      affectedFeatureFlags,
+      isFeatureSubgraph: subgraph.isFeatureSubgraph,
+    });
+
+    deploymentErrors.push(...result.deploymentErrors);
+    compositionErrors.push(...result.compositionErrors);
+    compositionWarnings.push(...result.compositionWarnings);
+
+    // Re-fetch the federated graphs to get the updated composedSchemaVersionId
+    const fedGraphRepo = new FederatedGraphRepository(this.logger, this.db, this.organizationId);
+    const refreshedGraphs = await Promise.all(
+      [...affectedFederatedGraphById.keys()].map((id) => fedGraphRepo.byId(id)),
+    );
+    for (let i = 0; i < updatedFederatedGraphs.length; i++) {
+      const refreshedGraph = refreshedGraphs[i];
+      if (refreshedGraph) {
+        updatedFederatedGraphs[i] = refreshedGraph;
+      }
+    }
 
     return {
       compositionErrors,
@@ -413,11 +456,14 @@ export class SubgraphRepository {
     }
 
     // TODO: avoid downloading the schema use hash instead
-    if (data.schemaSDL && (subgraph.type === 'grpc_plugin' || data.schemaSDL !== subgraph.schemaSDL.trimEnd())) {
+    if (
+      data.schemaSDL &&
+      (subgraph.type === 'grpc_plugin' || data.schemaSDL.trimEnd() !== subgraph.schemaSDL.trimEnd())
+    ) {
       subgraphChanged = true;
       const updatedSubgraph = await subgraphRepo.addSchemaVersion({
         targetId: subgraph.targetId,
-        subgraphSchema: data.schemaSDL,
+        subgraphSchema: data.schemaSDL.trimEnd(),
         isV2Graph: data.isV2Graph,
         proto: data.proto,
       });
@@ -571,6 +617,7 @@ export class SubgraphRepository {
         const federatedGraphDTOs = await fedGraphRepo.bySubgraphLabels({
           labels: baseSubgraph[0].labels?.map?.((l) => splitLabel(l)) ?? [],
           namespaceId: data.namespaceId,
+          excludeContracts: true,
         });
 
         for (const federatedGraphDTO of federatedGraphDTOs) {
@@ -595,13 +642,22 @@ export class SubgraphRepository {
             caches: featureFlagCaches,
           });
 
-          // If an enabled feature flag includes the feature graph that has just been published, push it to the array
-          if (enabledFeatureFlags.length > 0 && !splitConfigFeature?.enabled) {
-            affectedFederatedGraphById.set(federatedGraphDTO.id, federatedGraphDTO);
+          /**
+           * When split config is not enabled, the federated graph and all enabled feature flags will be considered
+           * as affected as we need to compose everything; however, if the feature is enabled for the organization,
+           * we need to verify whether the feature subgraph is part of the feature flag, if so, we can consider it
+           * as affected.
+           */
+          const isLegacyComposition = !splitConfigFeature?.enabled;
+          for (const featureFlag of enabledFeatureFlags) {
+            if (isLegacyComposition || featureFlag.featureSubgraphs.some((fsg) => fsg.id === subgraph.id)) {
+              affectedFeatureFlagIds.add(featureFlag.id);
+            }
           }
 
-          for (const featureFlag of enabledFeatureFlags) {
-            affectedFeatureFlagIds.add(featureFlag.id);
+          if (isLegacyComposition && enabledFeatureFlags.length > 0) {
+            // It looks like the federated graph is affected
+            affectedFederatedGraphById.set(federatedGraphDTO.id, federatedGraphDTO);
           }
         }
       }
@@ -613,13 +669,10 @@ export class SubgraphRepository {
       const affectedGraphs = await fedGraphRepo.bySubgraphLabels({
         labels: subgraph.labels,
         namespaceId: data.namespaceId,
+        excludeContracts: true,
       });
 
       for (const graph of affectedGraphs) {
-        if (graph.contract) {
-          continue;
-        }
-
         // If the subgraph has changed, always trigger composition
         if (affectedFederatedGraphById.has(graph.id) && !subgraphChanged) {
           /** If the federated graph matches the old labels AND the new labels,
@@ -1106,7 +1159,13 @@ export class SubgraphRepository {
     published?: boolean;
     includeSubgraphs?: string[];
     rbac?: RBACEvaluator;
+    promiseCache?: Map<string, Promise<SubgraphDTO[]>>;
   }): Promise<SubgraphDTO[]> {
+    const cachedPromise = data.promiseCache?.get(data.federatedGraphTargetId);
+    if (cachedPromise) {
+      return cachedPromise;
+    }
+
     const target = await this.db.query.targets.findFirst({
       where: and(
         eq(schema.targets.id, data.federatedGraphTargetId),
@@ -1136,12 +1195,18 @@ export class SubgraphRepository {
       return [];
     }
 
-    return this.getSubgraphsMatching({
+    const matchingSubgraphs = this.getSubgraphsMatching({
       conditions,
       published: data.published,
       enforceFederatedGraph: true,
       includeSubgraphs: data.includeSubgraphs,
     });
+
+    if (data.promiseCache) {
+      data.promiseCache.set(data.federatedGraphTargetId, matchingSubgraphs);
+    }
+
+    return matchingSubgraphs;
   }
 
   public async getSubgraphsByNames(names: string[], namespaceId: string): Promise<SubgraphDTO[]> {
@@ -1287,6 +1352,8 @@ export class SubgraphRepository {
       .where(and(...conditions))
       .execute();
 
+    const alreadySeenTargetIds = new Set<string>();
+
     // Transform the selected subgraphs into SubgraphDTO objects
     return (
       subgraphs
@@ -1294,8 +1361,17 @@ export class SubgraphRepository {
          * Because a subgraph can be part of multiple federated graphs in the same namespace, we need to filter out
          * duplicates. This have not been an issue so far because the method was called for a specific federated graph
          * or with specific target ids.
+         *
+         * Deduplicated through a Set rather than `findIndex`.
          */
-        .filter((sg, index, self) => self.findIndex((x) => x.targetId === sg.targetId) === index)
+        .filter((sg) => {
+          if (alreadySeenTargetIds.has(sg.targetId)) {
+            return false;
+          }
+
+          alreadySeenTargetIds.add(sg.targetId);
+          return true;
+        })
         .map((sg) => {
           let proto: ProtoSubgraph | undefined;
           if (sg.type === 'grpc_plugin' || sg.type === 'grpc_service') {
@@ -1634,6 +1710,7 @@ export class SubgraphRepository {
           linkedChecks,
           checkExtensionDeliveryId: c.checkExtensionDeliveryId || undefined,
           checkExtensionErrorMessage: c.checkExtensionErrorMessage || undefined,
+          hasFeatureSubgraphCheck: checkedSubgraphs.some((cs) => cs.isFeatureSubgraph),
         } satisfies SchemaCheckDTO;
       }),
     );
@@ -1719,6 +1796,7 @@ export class SubgraphRepository {
       linkedChecks,
       checkExtensionDeliveryId: check.checkExtensionDeliveryId || undefined,
       checkExtensionErrorMessage: check.checkExtensionErrorMessage || undefined,
+      hasFeatureSubgraphCheck: checkedSubgraphs.some((cs) => cs.isFeatureSubgraph),
     };
   }
 
@@ -1754,30 +1832,46 @@ export class SubgraphRepository {
       },
     });
 
-    const errorList = await this.db.query.schemaCheckComposition.findMany({
-      columns: {
-        compositionErrors: true,
-        compositionWarnings: true,
-      },
-      where: and(
-        eq(schema.schemaCheckComposition.schemaCheckId, id),
-        eq(schema.schemaCheckComposition.federatedTargetId, federatedTargetID),
-      ),
-    });
+    const errorList = await this.db
+      .select({
+        compositionErrors: schema.schemaCheckComposition.compositionErrors,
+        compositionWarnings: schema.schemaCheckComposition.compositionWarnings,
+        featureFlagName: schema.featureFlags.name,
+        federatedGraphName: schema.targets.name,
+        namespaceName: schema.namespaces.name,
+      })
+      .from(schema.schemaCheckComposition)
+      .leftJoin(schema.featureFlags, eq(schema.featureFlags.id, schema.schemaCheckComposition.featureFlagId))
+      .leftJoin(schema.targets, eq(schema.targets.id, schema.schemaCheckComposition.federatedTargetId))
+      .leftJoin(schema.namespaces, eq(schema.namespaces.id, schema.targets.namespaceId))
+      .where(
+        and(
+          eq(schema.schemaCheckComposition.schemaCheckId, id),
+          eq(schema.schemaCheckComposition.federatedTargetId, federatedTargetID),
+        ),
+      );
 
-    const compositionErrors = errorList
-      .filter((ce) => ce.compositionErrors != null)
-      .map((ce) => ce.compositionErrors)
-      .join('\n')
-      .split('\n')
-      .filter((m) => !!m);
+    const compositionErrors: PlainMessage<CompositionError>[] = [];
+    const compositionWarnings: PlainMessage<CompositionWarning>[] = [];
 
-    const compositionWarnings = errorList
-      .filter((ce) => ce.compositionWarnings != null)
-      .map((ce) => ce.compositionWarnings)
-      .join('\n')
-      .split('\n')
-      .filter((m) => !!m);
+    for (const row of errorList) {
+      const featureFlag = row.featureFlagName ?? '';
+      const federatedGraphName = row.federatedGraphName ?? '';
+      const namespace = row.namespaceName ?? '';
+      // One entry per (federated graph, feature flag) composition — the stored text holds all of that
+      // composition's errors/warnings (newline-separated). We deliberately do NOT split on '\n', since
+      // an individual error message can itself span multiple lines; the UI groups by fed graph + flag.
+      if (row.compositionErrors) {
+        compositionErrors.push({ message: row.compositionErrors, featureFlag, federatedGraphName, namespace });
+      }
+      if (row.compositionWarnings) {
+        compositionWarnings.push({ message: row.compositionWarnings, featureFlag, federatedGraphName, namespace });
+      }
+    }
+
+    // List base-supergraph entries (no feature flag) first, then flag-attributed ones.
+    compositionErrors.sort(baseCompositionFirst);
+    compositionWarnings.sort(baseCompositionFirst);
 
     // Fetch federated graph schema breaking changes if options provided
     let composedSchemaBreakingChanges: SchemaCheckDetailsDTO['composedSchemaBreakingChanges'] = [];
@@ -1796,6 +1890,7 @@ export class SubgraphRepository {
           path: change.path ?? undefined,
           isBreaking: change.isBreaking,
           federatedGraphName: options.federatedGraphName,
+          featureFlag: change.featureFlagName ?? '',
         }));
     }
 
@@ -2301,7 +2396,31 @@ export class SubgraphRepository {
     const schemaGraphPruningRepo = new SchemaGraphPruningRepository(this.db);
     const contractRepo = new ContractRepository(this.logger, this.db, this.organizationId);
     const graphCompostionRepo = new GraphCompositionRepository(this.logger, this.db);
-    const operationsRepo = new OperationsRepository(this.db, this.organizationId);
+    const featureFlagRepo = new FeatureFlagRepository(this.logger, this.db, this.organizationId);
+
+    // For feature subgraph checks, resolve the federated graphs to check via the feature-flag-aware
+    // lookup instead of the label-matcher set the caller precomputed. Also stash the per-fed-graph
+    // flags so we can build the composition plan later.
+    const isFeatureSubgraphCheck = !!subgraph && subgraph.isFeatureSubgraph;
+    const flagsByFedGraphId = new Map<string, FeatureFlagWithFeatureSubgraphs[]>();
+    let fsAdditionalInfoMessage: string | undefined;
+
+    if (isFeatureSubgraphCheck && subgraph) {
+      const fsScope = await featureFlagRepo.getFederatedGraphsToCheckForFeatureSubgraph({
+        featureSubgraphId: subgraph.id,
+        namespaceId: namespace.id,
+      });
+      const resolvedGraphs: FederatedGraphDTO[] = [];
+      for (const entry of fsScope) {
+        resolvedGraphs.push(entry.federatedGraph);
+        flagsByFedGraphId.set(entry.federatedGraph.id, entry.flags);
+      }
+      federatedGraphs = resolvedGraphs;
+      if (resolvedGraphs.length === 0) {
+        fsAdditionalInfoMessage =
+          'Feature subgraph is not assigned to any enabled feature flag; no composition check performed.';
+      }
+    }
 
     const routerCompatibilityVersion = getFederatedGraphRouterCompatibilityVersion(federatedGraphs);
 
@@ -2323,6 +2442,7 @@ export class SubgraphRepository {
         isNew: !subgraph,
         namespaceId: namespace.id,
         labels: subgraph ? undefined : labels,
+        isFeatureSubgraph: isFeatureSubgraphCheck,
       },
     });
 
@@ -2453,6 +2573,7 @@ export class SubgraphRepository {
       subgraphRepo,
       contractRepo,
       graphCompostionRepo,
+      featureFlagRepo,
       chClient,
       webhookProxyUrl,
     );
@@ -2470,10 +2591,113 @@ export class SubgraphRepository {
       labels: subgraph ? undefined : labels,
     });
 
+    // Build the per-federated-graph composition plan.
+    // - Feature subgraph checks: one entry per matching enabled flag (FS SDL substituted in).
+    // - Base subgraph checks: base entry plus any flags whose compositions this subgraph participates in.
+    // - New subgraph checks: build a synthetic base composition for fed graphs whose labels match.
+    const subgraphsToComposeByFedGraphId = new Map<
+      string,
+      Array<{
+        subgraphs: SubgraphDTO[];
+        isFeatureFlagComposition: boolean;
+        featureFlagName: string;
+        featureFlagId: string;
+        checkSubgraphIds: string[];
+      }>
+    >();
+
+    for (const graph of federatedGraphs) {
+      if (graph.contract) {
+        continue;
+      }
+
+      if (isFeatureSubgraphCheck && subgraph) {
+        const flagsForGraph = flagsByFedGraphId.get(graph.id) ?? [];
+        if (flagsForGraph.length === 0) {
+          continue;
+        }
+        const plan = await featureFlagRepo.getSubgraphsToComposeForFeatureSubgraphCheck({
+          featureSubgraphId: subgraph.id,
+          proposedSchemaSDL: newSchemaSDL,
+          flags: flagsForGraph,
+          federatedGraphTargetId: graph.targetId,
+        });
+        subgraphsToComposeByFedGraphId.set(
+          graph.id,
+          plan.map((entry) => ({ ...entry, checkSubgraphIds: [schemaCheckSubgraphId] })),
+        );
+      } else {
+        // Base subgraph check OR new-subgraph check: resolve all subgraphs of the federated graph
+        // (including unpublished ones, which have an empty schema), substitute the proposed SDL for
+        // the subgraph being checked, and append a synthetic DTO for a brand-new subgraph that does
+        // not exist yet. Any subgraph that still has no schema (unpublished and not the one being
+        // checked) is dropped below before composing.
+        const baseSubgraphsForGraph = await subgraphRepo.listByFederatedGraph({
+          federatedGraphTargetId: graph.targetId,
+        });
+
+        const baseSubgraphsWithProposedSDL: SubgraphDTO[] = subgraph
+          ? baseSubgraphsForGraph.map((s) => (s.id === subgraph.id ? { ...s, schemaSDL: newSchemaSDL } : s))
+          : [...baseSubgraphsForGraph];
+
+        if (!subgraph) {
+          // For a brand-new subgraph: check label match, then append a synthetic DTO.
+          const fedGraphsMatching = await fedGraphRepo.bySubgraphLabels({
+            labels: labels || [],
+            namespaceId: graph.namespaceId,
+            excludeContracts: true,
+          });
+          if (!fedGraphsMatching.some((fg) => fg.id === graph.id)) {
+            continue;
+          }
+          baseSubgraphsWithProposedSDL.push({
+            id: '',
+            name: subgraphName,
+            targetId: '',
+            routingUrl: '',
+            schemaSDL: newSchemaSDL,
+            schemaVersionId: '',
+            isFeatureSubgraph: false,
+            subscriptionUrl: '',
+            subscriptionProtocol: 'ws',
+            namespace: graph.namespace,
+            namespaceId: graph.namespaceId,
+            type: 'standard',
+            labels: labels || [],
+            lastUpdatedAt: '',
+            isEventDrivenGraph: false,
+          } as SubgraphDTO);
+        }
+
+        // Drop subgraphs that still have no schema (unpublished and not the subgraph being checked).
+        const composableBaseSubgraphs = baseSubgraphsWithProposedSDL.filter((s) => s.schemaSDL !== '');
+
+        const baseCompositionSubgraphs = composableBaseSubgraphs.map((s) => ({
+          name: s.name,
+          url: s.routingUrl,
+          definitions: parse(s.schemaSDL),
+        }));
+
+        const plan = await featureFlagRepo.getSubgraphsToCompose({
+          baseSubgraphs: composableBaseSubgraphs,
+          fedGraphLabelMatchers: graph.labelMatchers,
+          baseCompositionSubgraphs,
+          // Base subgraph check: skip feature flags that override the checked subgraph — their
+          // compositions can't be affected by the proposed change, so recomposing is redundant.
+          checkedSubgraphName: subgraphName,
+        });
+
+        subgraphsToComposeByFedGraphId.set(
+          graph.id,
+          plan.map((entry) => ({ ...entry, checkSubgraphIds: [schemaCheckSubgraphId] })),
+        );
+      }
+    }
+
     const { composedGraphs } = await composer.composeWithProposedSchemas({
       compositionOptions,
       graphs: federatedGraphs.filter((g) => !g.contract),
-      inputSubgraphs: checkSubgraphs,
+      subgraphsToComposeByFedGraphId,
     });
 
     await schemaCheckRepo.createSchemaCheckCompositions({
@@ -2517,15 +2741,16 @@ export class SubgraphRepository {
       subgraphBreakingChangeKeys.add(key);
     }
 
-    const composedSchemaBreakingChanges: Array<SchemaDiff & { federatedGraphName: string }> = [];
+    const composedSchemaBreakingChanges: Array<SchemaDiff & { federatedGraphName: string; featureFlag: string }> = [];
 
     for (const composedGraph of composedGraphs) {
+      const featureFlagName = composedGraph.featureFlagName ?? '';
       for (const error of composedGraph.errors) {
         compositionErrors.push({
           message: error.message,
           federatedGraphName: composedGraph.name,
           namespace: composedGraph.namespace,
-          featureFlag: '',
+          featureFlag: featureFlagName,
         });
       }
 
@@ -2534,7 +2759,7 @@ export class SubgraphRepository {
           message: warning.message,
           federatedGraphName: composedGraph.name,
           namespace: composedGraph.namespace,
-          featureFlag: '',
+          featureFlag: featureFlagName,
         });
       }
 
@@ -2543,15 +2768,31 @@ export class SubgraphRepository {
       let storedFedGraphBreakingChanges: SchemaCheckChangeAction[] = [];
 
       if (hasFieldChanges && composedGraph.errors.length === 0 && composedGraph.federatedClientSchema) {
-        // Get the old client schema for this federated graph
-        const oldSchemaVersion = await fedGraphRepo.getLatestValidSchemaVersion({
-          targetId: composedGraph.targetID,
-        });
+        // Get the old client schema for this federated graph / flag composition.
+        // For the base composition, diff against the latest valid federated schema version.
+        // For a flag composition, diff against the latest valid flag-composed schema version (or skip if none).
+        let oldClientSchema: string | undefined;
+        if (composedGraph.isFeatureFlagComposition && composedGraph.featureFlagId) {
+          const prior = await featureFlagRepo.getLatestValidFlagCompositionClientSchema({
+            federatedGraphId: composedGraph.id,
+            featureFlagId: composedGraph.featureFlagId,
+          });
+          if (prior?.clientSchema) {
+            oldClientSchema = prior.clientSchema;
+          }
+        } else {
+          const oldSchemaVersion = await fedGraphRepo.getLatestValidSchemaVersion({
+            targetId: composedGraph.targetID,
+          });
+          if (oldSchemaVersion?.clientSchema) {
+            oldClientSchema = oldSchemaVersion.clientSchema;
+          }
+        }
 
-        if (oldSchemaVersion?.clientSchema) {
+        if (oldClientSchema) {
           // Diff the old vs new federated client schemas
           const federatedSchemaDiff = await getDiffBetweenGraphs(
-            oldSchemaVersion.clientSchema,
+            oldClientSchema,
             composedGraph.federatedClientSchema,
             routerCompatibilityVersion,
           );
@@ -2572,6 +2813,7 @@ export class SubgraphRepository {
                   schemaCheckId: schemaCheckID,
                   schemaCheckFederatedGraphId,
                   changes: uniqueFedGraphBreakingChanges,
+                  featureFlagId: composedGraph.featureFlagId || null,
                 });
 
                 // Convert federated graph changes to inspector changes
@@ -2586,6 +2828,7 @@ export class SubgraphRepository {
                 composedSchemaBreakingChanges.push({
                   ...change,
                   federatedGraphName: composedGraph.name,
+                  featureFlag: featureFlagName,
                 });
               }
             }
@@ -2746,6 +2989,10 @@ export class SubgraphRepository {
       checkExtensionErrorMessage: sceResult?.deliveryInfo?.errorMessage ?? undefined,
     });
 
+    // List base-supergraph composition errors/warnings (no feature flag) first, then flag-attributed ones.
+    compositionErrors.sort(baseCompositionFirst);
+    compositionWarnings.sort(baseCompositionFirst);
+
     return {
       response: {
         code: EnumStatusCode.OK,
@@ -2768,6 +3015,7 @@ export class SubgraphRepository {
       graphPruneErrors: graphPruningIssues.errors,
       compositionWarnings,
       proposalMatchMessage,
+      featureSubgraphCheckMessage: fsAdditionalInfoMessage,
       hasClientTraffic,
       isCheckExtensionSkipped: !sceResult?.deliveryInfo?.id,
       checkExtensionErrorMessage: sceResult?.deliveryInfo?.errorMessage ?? undefined,

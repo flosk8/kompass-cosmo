@@ -1,4 +1,5 @@
 import { FieldUsageSheet } from '@/components/analytics/field-usage';
+import { useQueryStates } from 'nuqs';
 import { createFilterState } from '@/components/analytics/constructAnalyticsTableQueryState';
 import { ErrorMetricsCard, LatencyMetricsCard, RequestMetricsCard } from '@/components/analytics/metrics';
 import { RefreshInterval } from '@/components/analytics/refresh-interval';
@@ -23,10 +24,9 @@ import { Spacer } from '@/components/ui/spacer';
 import { Toolbar } from '@/components/ui/toolbar';
 import { useCurrentOrganization } from '@/hooks/use-current-organization';
 import { useFeatureLimit } from '@/hooks/use-feature-limit';
-import { useOperationsFilters } from '@/hooks/use-operations-filters';
+import { operationsFilterParams, useOperationsFilters } from '@/hooks/use-operations-filters';
 import { useWorkspace } from '@/hooks/use-workspace';
 import { NextPageWithLayout } from '@/lib/page';
-import { PlainMessage } from '@bufbuild/protobuf';
 import { createConnectQueryKey, useQuery } from '@connectrpc/connect-query';
 import { ChartBarIcon, ExclamationTriangleIcon, MagnifyingGlassIcon } from '@heroicons/react/24/outline';
 import { UpdateIcon } from '@radix-ui/react-icons';
@@ -36,8 +36,10 @@ import {
   getGraphMetrics,
   getOperations,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform-PlatformService_connectquery';
+import { create } from '@bufbuild/protobuf';
 import {
   AnalyticsFilter,
+  AnalyticsFilterSchema,
   AnalyticsViewFilterOperator,
   GetOperationsResponse,
   GetOperationsResponse_OperationType,
@@ -47,6 +49,7 @@ import {
 import { formatISO } from 'date-fns';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
+import { pageParam, usePaginationParams } from '@/hooks/use-pagination-params';
 import { useContext, useEffect, useMemo, useState } from 'react';
 import { useDebounce } from 'use-debounce';
 
@@ -101,16 +104,20 @@ const OperationsToolbar = () => {
           isLoading={!!isFetching}
           onClick={() => {
             client.invalidateQueries({
-              queryKey: createConnectQueryKey(getGraphMetrics, {
-                namespace: graphContext?.graph?.namespace,
-                federatedGraphName: graphContext?.graph?.name,
-                range,
-                dateRange: range
-                  ? undefined
-                  : {
-                      start: formatISO(dateRange.start),
-                      end: formatISO(dateRange.end),
-                    },
+              queryKey: createConnectQueryKey({
+                schema: getGraphMetrics,
+                input: {
+                  namespace: graphContext?.graph?.namespace,
+                  federatedGraphName: graphContext?.graph?.name,
+                  range,
+                  dateRange: range
+                    ? undefined
+                    : {
+                        start: formatISO(dateRange.start),
+                        end: formatISO(dateRange.end),
+                      },
+                },
+                cardinality: 'finite',
               }),
             });
           }}
@@ -144,7 +151,7 @@ const OperationsLeftPanel = ({
       }
     | undefined;
   onOperationSelect: (operationHash: string, operationName: string) => void;
-  operations: PlainMessage<GetOperationsResponse>['operations'];
+  operations: GetOperationsResponse['operations'];
   isLoading: boolean;
   localSearchQuery: string;
   onSearchQueryChange: (query: string) => void;
@@ -283,7 +290,7 @@ const OperationsRightPanel = ({
         name: string;
       }
     | undefined;
-  operations: PlainMessage<GetOperationsResponse>['operations'];
+  operations: GetOperationsResponse['operations'];
 }) => {
   const router = useRouter();
   const graphContext = useContext(GraphContext);
@@ -319,7 +326,7 @@ const OperationsRightPanel = ({
     const operationFilters = [];
     if (selectedOperation) {
       operationFilters.push(
-        new AnalyticsFilter({
+        create(AnalyticsFilterSchema, {
           field: 'operationHash',
           value: selectedOperation.hash,
           operator: AnalyticsViewFilterOperator.EQUALS,
@@ -328,7 +335,7 @@ const OperationsRightPanel = ({
       // Only add operationName filter if operation has a name (not unnamed)
       if (selectedOperation.name) {
         operationFilters.push(
-          new AnalyticsFilter({
+          create(AnalyticsFilterSchema, {
             field: 'operationName',
             value: selectedOperation.name,
             operator: AnalyticsViewFilterOperator.EQUALS,
@@ -399,7 +406,6 @@ const OperationsRightPanel = ({
         // Selected Operation State
         <>
           {/* Operation Header */}
-
           <div className="flex flex-col gap-4 px-1 md:flex-row md:items-center md:justify-between md:gap-0">
             <div>
               <h3 className="text-lg font-semibold">{operationName || 'Unnamed Operation'}</h3>
@@ -440,19 +446,13 @@ const OperationsRightPanel = ({
               </Button>
             </div>
           </div>
-
           <Separator className="my-4" />
-
           {/* Client Usage Table - Always at the top */}
           <ClientUsageTable operationHash={selectedOperation.hash} operationName={operationName} />
-
           <Separator className="my-4" />
-
           {/* Deprecated Fields Table - Below Client Usage */}
           <DeprecatedFieldsTable operationHash={selectedOperation.hash} operationName={operationName} />
-
           <Separator className="my-4" />
-
           {/* Operation-specific Charts */}
           <div className="flex flex-col gap-4">
             <RequestMetricsCard data={data?.requests} syncId={syncId} showTopList={false} chartClassName="h-36" />
@@ -481,8 +481,6 @@ const OperationsRightPanel = ({
 };
 
 const OperationsPage: NextPageWithLayout = () => {
-  const router = useRouter();
-  const applyParams = useApplyParams();
   const graphContext = useContext(GraphContext);
   const { range, dateRange } = useAnalyticsQueryState();
   const {
@@ -498,6 +496,8 @@ const OperationsPage: NextPageWithLayout = () => {
   const [debouncedSearchQuery] = useDebounce(localSearchQuery, 500);
 
   // Sync localSearchQuery with URL when URL changes externally (e.g., browser back/forward)
+  const [, setSearchQuery] = useQueryStates({ searchQuery: operationsFilterParams.searchQuery, page: pageParam });
+
   useEffect(() => {
     setLocalSearchQuery(urlSearchQuery);
   }, [urlSearchQuery]);
@@ -506,13 +506,11 @@ const OperationsPage: NextPageWithLayout = () => {
   // Reset to page 1 when search changes
   useEffect(() => {
     if (debouncedSearchQuery !== urlSearchQuery) {
-      applyParams({ searchQuery: debouncedSearchQuery || null, page: '1' });
+      setSearchQuery({ searchQuery: debouncedSearchQuery || null, page: null });
     }
-  }, [debouncedSearchQuery, urlSearchQuery, applyParams]);
+  }, [debouncedSearchQuery, urlSearchQuery, setSearchQuery]);
 
-  const pageNumber = router.query.page ? parseInt(router.query.page as string, 10) : 1;
-  const pageSize = Number.parseInt((router.query.pageSize as string) || '10');
-  const offset = (pageNumber - 1) * pageSize;
+  const { pageNumber, pageSize, offset } = usePaginationParams();
 
   const {
     data: operationsData,
@@ -566,10 +564,12 @@ const OperationsPage: NextPageWithLayout = () => {
   const noOfPages = Math.ceil((operationsData?.totalCount ?? 0) / pageSize);
 
   // Use URL params as single source of truth for selected operation
-  const selectedOperation = useMemo(() => {
-    const operationHash = router.query.operationHash as string | undefined;
-    const operationName = router.query.operationName as string | undefined;
+  const [{ operationHash, operationName }, setOperation] = useQueryStates({
+    operationHash: operationsFilterParams.operationHash,
+    operationName: operationsFilterParams.operationName,
+  });
 
+  const selectedOperation = useMemo(() => {
     // If operationHash exists but operationName doesn't, it's an unnamed operation (fallback to '')
     if (!operationHash) {
       return undefined;
@@ -579,25 +579,13 @@ const OperationsPage: NextPageWithLayout = () => {
       hash: operationHash,
       name: operationName ?? '',
     };
-  }, [router.query.operationHash, router.query.operationName]);
+  }, [operationHash, operationName]);
 
   // Update URL params when operation is selected
   const handleOperationSelect = (operationHash: string, operationName: string) => {
     // For unnamed operations, only set operationHash (don't include operationName in URL)
     const normalizedOperationName = operationName || '';
-    const params: Record<string, string | null> = {
-      operationHash: operationHash || null,
-    };
-
-    // Only include operationName if it's not empty (named operations)
-    if (normalizedOperationName) {
-      params.operationName = normalizedOperationName;
-    } else {
-      // Remove operationName from URL for unnamed operations
-      params.operationName = null;
-    }
-
-    applyParams(params);
+    setOperation({ operationHash: operationHash || null, operationName: normalizedOperationName || null });
   };
 
   // Check and clear operation selection when operations data changes (after filters change or refetch)
@@ -619,10 +607,7 @@ const OperationsPage: NextPageWithLayout = () => {
 
     // If operation doesn't exist in the filtered list, clear it from URL params
     if (!operationExists) {
-      applyParams({
-        operationHash: null,
-        operationName: null,
-      });
+      setOperation({ operationHash: null, operationName: null });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [operationsData?.operations]);

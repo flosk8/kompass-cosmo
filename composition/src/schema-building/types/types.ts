@@ -121,6 +121,7 @@ export type InputObjectDefinitionData = {
 
 export type InputValueData = {
   configureDescriptionDataBySubgraphName: Map<SubgraphName, ConfigureDescriptionData>;
+  fromContextSubgraphNames: Set<SubgraphName>;
   directivesByName: Map<DirectiveName, Array<ConstDirectiveNode>>;
   federatedCoords: string;
   includeDefaultValue: boolean;
@@ -229,6 +230,8 @@ export type ParentDefinitionData =
 export type ChildData = EnumValueData | FieldData | InputValueData;
 
 export type CompositeOutputData = InterfaceDefinitionData | ObjectDefinitionData;
+
+export type ValidProvidesParentData = CompositeOutputData | UnionDefinitionData;
 
 export type DefinitionData =
   | DirectiveArgumentData

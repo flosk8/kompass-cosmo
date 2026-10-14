@@ -1,4 +1,3 @@
-import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import { OrganizationEventName } from '@wundergraph/cosmo-connect/dist/notifications/events_pb';
@@ -21,6 +20,7 @@ import {
 } from '../../util.js';
 import { OrganizationWebhookService } from '../../webhooks/OrganizationWebhookService.js';
 import { UnauthorizedError } from '../../errors/errors.js';
+import type { PlainMessage } from '../../../types/index.js';
 import { CompositionService } from '../../services/CompositionService.js';
 
 export function updateMonograph(
@@ -145,6 +145,8 @@ export function updateMonograph(
         opts.chClient!,
         opts.webhookProxyUrl,
         false,
+        opts.promptToQueryClient,
+        opts.billingDefaultPlanId,
       );
 
       // Update the federated graph

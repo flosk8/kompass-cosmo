@@ -13,10 +13,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/sebdah/goldie/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/metric"
@@ -38,6 +40,15 @@ var (
 	_ core.EnginePreOriginHandler = (*MyBrokenPipeModule)(nil)
 	_ core.Module                 = (*MyBrokenPipeModule)(nil)
 )
+
+func indentedJSON(data string) []byte {
+	var prettyJSON bytes.Buffer
+	err := json.Indent(&prettyJSON, []byte(data), "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	return prettyJSON.Bytes()
+}
 
 type MyPanicModule2 struct{}
 
@@ -260,7 +271,7 @@ func TestAccessLogsFileOutput(t *testing.T) {
 			data, err := os.ReadFile(fp)
 			require.NoError(t, err)
 
-			var logEntry map[string]interface{}
+			var logEntry map[string]any
 			require.NoError(t, json.Unmarshal(data, &logEntry))
 
 			require.Equal(t, logEntry["level"], "info")
@@ -364,10 +375,10 @@ func TestAccessLogsFileOutput(t *testing.T) {
 				require.NoError(t, err)
 
 				lines := bytes.Split(data, []byte("\n"))
-				var logEntry map[string]interface{}
+				var logEntry map[string]any
 				require.NoError(t, json.Unmarshal(lines[0], &logEntry))
 
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"level":         "info",
 					"msg":           "/graphql",
 					"log_type":      "client/subgraph",
@@ -409,7 +420,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type": "request",
 				"status":   int64(200),
 				"method":   "POST",
@@ -445,7 +456,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type": "request",
 				"status":   int64(200),
 				"method":   "POST",
@@ -543,7 +554,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":         "request",
 				"status":           int64(200),
 				"method":           "POST",
@@ -604,7 +615,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":         "request",
 				"status":           int64(200),
 				"method":           "POST",
@@ -649,7 +660,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type": "request",
 				"status":   int64(200),
 				"method":   "POST",
@@ -764,7 +775,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":      "request",
 				"status":        int64(200),
 				"method":        "POST",
@@ -883,7 +894,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":       "request",
 				"status":         int64(200),
 				"method":         "POST",
@@ -1016,7 +1027,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("[Recovery from panic]")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":       "request",
 				"status":         int64(500),
 				"method":         "POST",
@@ -1153,7 +1164,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("[Recovery from panic]")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":       "request",
 				"status":         int64(500),
 				"method":         "POST",
@@ -1242,7 +1253,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			requestLog := xEnv.Observer().FilterMessage("/graphql")
 			require.Equal(t, requestLog.Len(), 1)
 			requestContext := requestLog.All()[0].ContextMap()
-			expectedValues := map[string]interface{}{
+			expectedValues := map[string]any{
 				"log_type":      "request",
 				"status":        int64(200),
 				"method":        "POST",
@@ -1250,8 +1261,8 @@ func TestFlakyAccessLogs(t *testing.T) {
 				"query":         "", // http query is empty
 				"ip":            "[REDACTED]",
 				"user_agent":    "Go-http-client/1.1",
-				"error_codes":   []interface{}{"UNAUTHORIZED"},
-				"service_names": []interface{}{"products"},
+				"error_codes":   []any{"UNAUTHORIZED"},
+				"service_names": []any{"products"},
 				"request_error": true,
 			}
 			additionalExpectedKeys := []string{
@@ -1288,7 +1299,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				require.Equal(t, requestLog.Len(), 2)
 
 				requestContext := requestLog.All()[0].ContextMap()
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":      "client/subgraph",
 					"subgraph_name": "employees",
 					"subgraph_id":   "0",
@@ -1304,7 +1315,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, requestContext, expectedValues, append(additionalExpectedKeys, "trace_id", "url"))
 
 				requestContext1 := requestLog.All()[1].ContextMap()
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"log_type": "request",
 					"status":   int64(200),
 					"method":   "POST",
@@ -1338,7 +1349,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLog := xEnv.Observer().FilterMessage("/graphql")
 				require.Equal(t, requestLog.Len(), 2)
 				requestContext := requestLog.All()[0].ContextMap()
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":      "client/subgraph",
 					"subgraph_name": "employees",
 					"subgraph_id":   "0",
@@ -1354,7 +1365,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, requestContext, expectedValues, append(additionalExpectedKeys, "url"))
 
 				requestContext1 := requestLog.All()[1].ContextMap()
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"log_type": "request",
 					"status":   int64(200),
 					"method":   "POST",
@@ -1443,7 +1454,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLog := xEnv.Observer().FilterMessage("/graphql")
 				require.Equal(t, requestLog.Len(), 2)
 				requestContext := requestLog.All()[0].ContextMap()
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":      "client/subgraph",
 					"subgraph_name": "employees",
 					"subgraph_id":   "0",
@@ -1459,7 +1470,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, requestContext, expectedValues, additionalExpectedKeys)
 
 				requestContext1 := requestLog.All()[1].ContextMap()
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"log_type":         "request",
 					"status":           int64(200),
 					"method":           "POST",
@@ -1530,7 +1541,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLog := xEnv.Observer().FilterMessage("/graphql")
 				require.Equal(t, requestLog.Len(), 2)
 				requestContext := requestLog.All()[0].ContextMap()
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":         "client/subgraph",
 					"subgraph_name":    "employees",
 					"subgraph_id":      "0",
@@ -1552,7 +1563,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, requestContext, expectedValues, additionalExpectedKeys)
 
 				requestContext1 := requestLog.All()[1].ContextMap()
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"log_type": "request",
 					"status":   int64(200),
 					"method":   "POST",
@@ -1626,7 +1637,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				require.Equal(t, requestLog.Len(), 3)
 
 				employeeContext := requestLog.All()[0].ContextMap()
-				employeeSubgraphVals := map[string]interface{}{
+				employeeSubgraphVals := map[string]any{
 					"log_type":         "client/subgraph",
 					"subgraph_name":    "employees",
 					"subgraph_id":      "0",
@@ -1647,7 +1658,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, employeeContext, employeeSubgraphVals, additionalExpectedKeys)
 
 				productContext := requestLog.All()[1].ContextMap()
-				productSubgraphVals := map[string]interface{}{
+				productSubgraphVals := map[string]any{
 					"log_type":               "client/subgraph",
 					"subgraph_name":          "products",
 					"subgraph_id":            "3",
@@ -1667,7 +1678,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, productContext, productSubgraphVals, additionalExpectedKeys)
 
 				graphContext := requestLog.All()[2].ContextMap()
-				graphVals := map[string]interface{}{
+				graphVals := map[string]any{
 					"log_type":      "request",
 					"status":        int64(200),
 					"method":        "POST",
@@ -1798,7 +1809,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 			}, func(t *testing.T, xEnv *testenv.Environment) {
 				res, err := xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{
 					OperationName: []byte(`"Employees"`),
-					Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f"}}`),
+					Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937"}}`),
 					Header:        map[string][]string{"service-name": {"service-name"}, "graphql-client-name": {"my-client"}},
 				})
 				require.NoError(t, err)
@@ -1808,7 +1819,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLog := xEnv.Observer().FilterMessage("/graphql")
 				require.Equal(t, requestLog.Len(), 2)
 				requestContext := requestLog.All()[0].ContextMap()
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":                 "client/subgraph",
 					"subgraph_name":            "employees",
 					"subgraph_id":              "0",
@@ -1818,9 +1829,9 @@ func TestFlakyAccessLogs(t *testing.T) {
 					"query":                    "", // http query is empty
 					"ip":                       "[REDACTED]",
 					"service_name":             "service-name",                                                     // From request header
-					"operation_persisted_hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f", // From context
+					"operation_persisted_hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937", // From context
 					"operation_hash":           "1163600561566987607",                                              // From context
-					"operation_sha256":         "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f", // From context
+					"operation_sha256":         "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937", // From context
 					"operation_name":           "Employees",                                                        // From context
 					"operation_type":           "query",                                                            // From context
 				}
@@ -1830,7 +1841,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, requestContext, expectedValues, additionalExpectedKeys)
 
 				requestContext1 := requestLog.All()[1].ContextMap()
-				expectedValues1 := map[string]interface{}{
+				expectedValues1 := map[string]any{
 					"log_type": "request",
 					"status":   int64(200),
 					"method":   "POST",
@@ -1902,7 +1913,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				require.Equal(t, requestLog.Len(), 3)
 
 				employeeContext := requestLog.All()[0].ContextMap()
-				employeeSubgraphVals := map[string]interface{}{
+				employeeSubgraphVals := map[string]any{
 					"log_type":         "client/subgraph",
 					"subgraph_name":    "employees",
 					"subgraph_id":      "0",
@@ -1923,7 +1934,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, employeeContext, employeeSubgraphVals, additionalExpectedKeys)
 
 				productContext := requestLog.All()[1].ContextMap()
-				productSubgraphVals := map[string]interface{}{
+				productSubgraphVals := map[string]any{
 					"log_type":         "client/subgraph",
 					"subgraph_name":    "products",
 					"subgraph_id":      "3",
@@ -1942,7 +1953,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				checkValues(t, productContext, productSubgraphVals, append(additionalExpectedKeys, "response_error_message"))
 
 				graphContext := requestLog.All()[2].ContextMap()
-				graphVals := map[string]interface{}{
+				graphVals := map[string]any{
 					"log_type":      "request",
 					"status":        int64(200),
 					"method":        "POST",
@@ -2007,7 +2018,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":              "request",
 						"status":                int64(200),
 						"method":                "POST",
@@ -2052,7 +2063,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				func(t *testing.T, xEnv *testenv.Environment) {
 					res, err := xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{
 						OperationName: []byte(`"Employees"`),
-						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f"}}`),
+						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937"}}`),
 						Header:        map[string][]string{"graphql-client-name": {"my-client"}},
 					})
 					require.NoError(t, err)
@@ -2064,7 +2075,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 
 					val, ok := requestContext["operation_sha256_expression"].(string)
 					require.True(t, ok)
-					require.Equal(t, "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f", val)
+					require.Equal(t, "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937", val)
 				},
 			)
 		})
@@ -2126,7 +2137,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				func(t *testing.T, xEnv *testenv.Environment) {
 					res, err := xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{
 						OperationName: []byte(`"Employees"`),
-						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f"}}`),
+						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937"}}`),
 						Header:        map[string][]string{"graphql-client-name": {"my-client"}},
 					})
 					require.NoError(t, err)
@@ -2138,7 +2149,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 
 					val, ok := requestContext["persisted_id_expression"].(string)
 					require.True(t, ok)
-					require.Equal(t, "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f", val)
+					require.Equal(t, "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937", val)
 				},
 			)
 
@@ -2290,7 +2301,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":              "request",
 						"status":                int64(200),
 						"method":                "POST",
@@ -2354,7 +2365,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":           "request",
 						"status":             int64(200),
 						"method":             "POST",
@@ -2492,7 +2503,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLog := xEnv.Observer().FilterMessage("/graphql")
 				requestContext := requestLog.All()[0].ContextMap()
 
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":              "request",
 					"status":                int64(200),
 					"method":                "POST",
@@ -2557,7 +2568,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":        "request",
 						"status":          int64(200),
 						"method":          "POST",
@@ -2623,7 +2634,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				requestLogAll := requestLog.All()
 				requestContext := requestLogAll[0].ContextMap()
 
-				expectedValues := map[string]interface{}{
+				expectedValues := map[string]any{
 					"log_type":        "request",
 					"status":          int64(200),
 					"method":          "POST",
@@ -2685,7 +2696,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":        "request",
 						"status":          int64(200),
 						"method":          "POST",
@@ -2749,7 +2760,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					expectedValues := map[string]interface{}{
+					expectedValues := map[string]any{
 						"log_type":        "request",
 						"status":          int64(200),
 						"method":          "POST",
@@ -2952,7 +2963,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					actual, ok := requestContext["error_codes"].([]interface{})
+					actual, ok := requestContext["error_codes"].([]any)
 					if !ok {
 						require.Fail(t, "error_codes error when casting")
 					}
@@ -2989,15 +3000,19 @@ func TestFlakyAccessLogs(t *testing.T) {
 					},
 				},
 				func(t *testing.T, xEnv *testenv.Environment) {
+					// Use a variable (not an inline literal) to exercise variable validation, which is
+					// what produces the input-type error codes below. Inline literals are validated at
+					// operation-validation time before extraction and would not carry these codes.
 					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
-						Query: `query employee { employee(id: "7") { id } }`,
+						Query:     `query employee($id: Int!) { employee(id: $id) { id } }`,
+						Variables: json.RawMessage(`{"id":"7"}`),
 					})
 
 					requestLog := xEnv.Observer().FilterMessage("/graphql")
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					actual, ok := requestContext["error_codes"].([]interface{})
+					actual, ok := requestContext["error_codes"].([]any)
 					if !ok {
 						require.Fail(t, "error_codes error when casting")
 					}
@@ -3034,15 +3049,19 @@ func TestFlakyAccessLogs(t *testing.T) {
 					},
 				},
 				func(t *testing.T, xEnv *testenv.Environment) {
+					// Use a variable (not an inline literal) to exercise variable validation, which is
+					// what produces the input-type error codes below. Inline literals are validated at
+					// operation-validation time before extraction and would not carry these codes.
 					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
-						Query: `query employee { employee(id: "7") { id } }`,
+						Query:     `query employee($id: Int!) { employee(id: $id) { id } }`,
+						Variables: json.RawMessage(`{"id":"7"}`),
 					})
 
 					requestLog := xEnv.Observer().FilterMessage("/graphql")
 					requestLogAll := requestLog.All()
 					requestContext := requestLogAll[0].ContextMap()
 
-					actual, ok := requestContext["error_codes"].([]interface{})
+					actual, ok := requestContext["error_codes"].([]any)
 					if !ok {
 						require.Fail(t, "error_codes error when casting")
 					}
@@ -3091,7 +3110,7 @@ func TestFlakyAccessLogs(t *testing.T) {
 				require.Len(t, requestLogAll, len(queries))
 
 				batchedIds := make([]string, 0)
-				for i := 0; i < len(queries); i++ {
+				for i := range queries {
 					if actual, ok := requestLogAll[i].ContextMap()["batched_request_operation_id"].(string); ok {
 						batchedIds = append(batchedIds, actual)
 					}
@@ -3248,6 +3267,328 @@ func TestFlakyAccessLogs(t *testing.T) {
 			})
 		})
 
+		t.Run("verify subgraph response header is attached", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "gw_duration",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.response.header.Get('X-Duration')",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Duration", "1500")
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				gwDuration, ok := requestContextMap["gw_duration"].(string)
+				require.True(t, ok)
+				require.Equal(t, "1500", gwDuration)
+			})
+		})
+
+		t.Run("verify subgraph response header missing is ignored", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "gw_duration",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.response.header.Get('X-Duration')",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Duration2", "1500")
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				_, ok := requestContextMap["gw_duration"]
+				require.False(t, ok)
+			})
+		})
+
+		t.Run("verify subgraph response header missing fallback is used", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "gw_duration",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.response.header.Get('X-Duration') == '' ? 'default' : subgraph.response.header.Get('X-Duration')",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Duration2", "1500")
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				gwHeader, ok := requestContextMap["gw_duration"].(string)
+				require.True(t, ok)
+				require.Equal(t, "default", gwHeader)
+			})
+		})
+
+		t.Run("verify subgraph response header is usable in arithmetic", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "gw_duration_clean",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "float(subgraph.response.header.Get('X-Duration')) / 1000",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Duration", "1500")
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				gwDuration, ok := requestContextMap["gw_duration_clean"].(float64)
+				require.True(t, ok)
+				require.Equal(t, 1.5, gwDuration)
+			})
+		})
+
+		t.Run("verify if subgraph response header is not usable in arithmetic nothing breaks", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "gw_duration_clean",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "float(subgraph.response.header.Get('X-Duration')) / 1000",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Duration", "fifty")
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				_, ok := requestContextMap["gw_duration_clean"]
+				require.False(t, ok)
+			})
+		})
+
+		t.Run("verify subgraph request startTime is attached", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "subgraph_start_time",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.request.startTime",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				before := time.Now().UnixMilli()
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				after := time.Now().UnixMilli()
+
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				startTime, ok := requestContextMap["subgraph_start_time"].(int64)
+				require.True(t, ok)
+				require.GreaterOrEqual(t, startTime, before)
+				require.LessOrEqual(t, startTime, after)
+			})
+		})
+
+		t.Run("verify date combined with subgraph startTime", func(t *testing.T) {
+			t.Parallel()
+
+			serverStart := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "server_start_epoch",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "date(subgraph.response.header.Get('X-Server-Start')).UnixMilli()",
+						},
+					},
+					{
+						Key: "subgraph_start_latency",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "(date(subgraph.response.header.Get('X-Server-Start')).UnixMilli() - subgraph.request.startTime) / 1000",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+				Subgraphs: testenv.SubgraphsConfig{
+					Employees: testenv.SubgraphConfig{
+						Middleware: func(next http.Handler) http.Handler {
+							return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+								w.Header().Set("X-Server-Start", serverStart.Format(time.RFC3339))
+								next.ServeHTTP(w, r)
+							})
+						},
+					},
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				epoch, ok := requestContextMap["server_start_epoch"].(int64)
+				require.True(t, ok)
+				require.Equal(t, serverStart.UnixMilli(), epoch)
+
+				// The header timestamp is far in the future, so the difference is large and positive.
+				startLatency, ok := requestContextMap["subgraph_start_latency"].(float64)
+				require.True(t, ok)
+				require.Greater(t, startLatency, 0.0)
+			})
+		})
+
+		t.Run("verify expression with missing header falls back to default without error log", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key:     "server_start_epoch",
+						Default: "n/a",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "date(subgraph.response.header.Get('X-Absent-Header')).Unix()",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestContextMap := requestLog.All()[0].ContextMap()
+
+				// The header is absent, so the expression fails to resolve and the field
+				// falls back to its configured default instead of being dropped.
+				epoch, ok := requestContextMap["server_start_epoch"].(string)
+				require.True(t, ok)
+				require.Equal(t, "n/a", epoch)
+
+				// The data-driven resolution failure must not be logged at info/error level.
+				errLogs := xEnv.Observer().FilterMessage("unable to process expression for access logs")
+				require.Equal(t, 0, errLogs.Len())
+			})
+		})
+
 		t.Run("verify connAcquireDuration value is attached", func(t *testing.T) {
 			t.Parallel()
 
@@ -3277,6 +3618,102 @@ func TestFlakyAccessLogs(t *testing.T) {
 				require.True(t, ok)
 
 				require.Greater(t, int(connAcquireDuration), 0)
+			})
+		})
+
+		t.Run("verify timeToFirstRequestByte value is attached", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "time_to_first_request_byte",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.request.clientTrace.timeToFirstRequestByte",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestLogAll := requestLog.All()
+				requestContextMap := requestLogAll[0].ContextMap()
+
+				timeToFirstRequestByte, ok := requestContextMap["time_to_first_request_byte"].(time.Duration)
+				require.True(t, ok)
+
+				require.Greater(t, int(timeToFirstRequestByte), 0)
+			})
+		})
+
+		t.Run("verify timeToLastRequestByte value is attached", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "time_to_last_request_byte",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.request.clientTrace.timeToLastRequestByte",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestLogAll := requestLog.All()
+				requestContextMap := requestLogAll[0].ContextMap()
+
+				timeToLastRequestByte, ok := requestContextMap["time_to_last_request_byte"].(time.Duration)
+				require.True(t, ok)
+
+				require.Greater(t, int(timeToLastRequestByte), 0)
+			})
+		})
+
+		t.Run("verify timeToLastByte value is attached", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t, &testenv.Config{
+				SubgraphAccessLogsEnabled: true,
+				SubgraphAccessLogFields: []config.CustomAttribute{
+					{
+						Key: "time_to_last_byte",
+						ValueFrom: &config.CustomDynamicAttribute{
+							Expression: "subgraph.request.clientTrace.timeToLastByte",
+						},
+					},
+				},
+				LogObservation: testenv.LogObservationConfig{
+					Enabled:  true,
+					LogLevel: zapcore.InfoLevel,
+				},
+			}, func(t *testing.T, xEnv *testenv.Environment) {
+				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+					Query: `query myQuery { employees { id } }`,
+				})
+				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				requestLogAll := requestLog.All()
+				requestContextMap := requestLogAll[0].ContextMap()
+
+				timeToLastByte, ok := requestContextMap["time_to_last_byte"].(time.Duration)
+				require.True(t, ok)
+
+				require.Greater(t, int(timeToLastByte), 0)
 			})
 		})
 
@@ -3408,6 +3845,13 @@ func TestFlakyAccessLogs(t *testing.T) {
 		t.Run("verify subgraph response body printed", func(t *testing.T) {
 			t.Parallel()
 
+			g := goldie.New(
+				t,
+				goldie.WithFixtureDir("testdata/fixtures/structured_logging"),
+				goldie.WithNameSuffix(".json"),
+				goldie.WithDiffEngine(goldie.ClassicDiff),
+			)
+
 			testenv.Run(t, &testenv.Config{
 				SubgraphAccessLogsEnabled: true,
 				SubgraphAccessLogFields: []config.CustomAttribute{
@@ -3426,35 +3870,30 @@ func TestFlakyAccessLogs(t *testing.T) {
 				xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
 					Query: `query myQuery { employees { isAvailable products hobbies { employees { id tag } } }  }`,
 				})
-				requestLog := xEnv.Observer().FilterMessage("/graphql")
+				// Only subgraph access logs carry the response_body field; the
+				// router's own request log for /graphql does not.
+				var bodies []string
+				for _, entry := range xEnv.Observer().FilterMessage("/graphql").All() {
+					if body, ok := entry.ContextMap()["response_body"].(string); ok {
+						bodies = append(bodies, body)
+					}
+				}
+				require.Len(t, bodies, 5)
 
-				actual1 := requestLog.All()[0].ContextMap()["response_body"].(string)
-				require.Equal(t,
-					`{"data":{"employees":[{"__typename":"Employee","id":1},{"__typename":"Employee","id":2},{"__typename":"Employee","id":3},{"__typename":"Employee","id":4},{"__typename":"Employee","id":5},{"__typename":"Employee","id":7},{"__typename":"Employee","id":8},{"__typename":"Employee","id":10},{"__typename":"Employee","id":11},{"__typename":"Employee","id":12}]}}`,
-					actual1)
+				g.Assert(t, "subgraph_response_body_employees", indentedJSON(bodies[0]))
 
-				actual2 := requestLog.All()[1].ContextMap()["response_body"].(string)
-				require.Equal(t,
-					`{"data":{"_entities":[{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false},{"__typename":"Employee","isAvailable":false}]}}`,
-					actual2)
+				// The availability, hobbies and products entity fetches run in
+				// parallel, so their log order is non-deterministic; sort the
+				// bodies to get a stable order before asserting.
+				parallel := bodies[1:4]
+				slices.Sort(parallel)
+				g.Assert(t, "subgraph_response_body_hobbies", indentedJSON(parallel[0]))
+				g.Assert(t, "subgraph_response_body_availability", indentedJSON(parallel[1]))
+				g.Assert(t, "subgraph_response_body_products", indentedJSON(parallel[2]))
 
-				actual3 := requestLog.All()[2].ContextMap()["response_body"].(string)
-				require.Equal(t,
-					`{"data":{"_entities":[{"__typename":"Employee","products":["CONSULTANCY","COSMO","ENGINE","MARKETING","SDK"]},{"__typename":"Employee","products":["COSMO","SDK"]},{"__typename":"Employee","products":["CONSULTANCY","MARKETING"]},{"__typename":"Employee","products":["FINANCE","HUMAN_RESOURCES","MARKETING"]},{"__typename":"Employee","products":["ENGINE","SDK"]},{"__typename":"Employee","products":["COSMO","SDK"]},{"__typename":"Employee","products":["COSMO","SDK"]},{"__typename":"Employee","products":["CONSULTANCY","COSMO","SDK"]},{"__typename":"Employee","products":["FINANCE"]},{"__typename":"Employee","products":["CONSULTANCY","COSMO","ENGINE","SDK"]}]}}`,
-					actual3)
-
-				actual4 := requestLog.All()[3].ContextMap()["response_body"].(string)
-				require.Equal(t,
-					`{"data":{"_entities":[{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":4,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":5,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":11,"__typename":"Employee"}]}]},{"__typename":"Employee","hobbies":[{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":2,"__typename":"Employee"},{"id":7,"__typename":"Employee"},{"id":8,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]},{"employees":[{"id":1,"__typename":"Employee"},{"id":3,"__typename":"Employee"},{"id":4,"__typename":"Employee"},{"id":10,"__typename":"Employee"},{"id":12,"__typename":"Employee"}]}]}]}}`,
-					actual4)
-
-				actual5 := requestLog.All()[4].ContextMap()["response_body"].(string)
-				require.Equal(t,
-					`{"data":{"_entities":[{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""},{"__typename":"Employee","tag":""}]}}`,
-					actual5)
+				g.Assert(t, "subgraph_response_body_tags", indentedJSON(bodies[4]))
 			})
 		})
-
 	})
 
 	t.Run("verify ignore list", func(t *testing.T) {
@@ -3983,6 +4422,104 @@ func TestAccessLogs(t *testing.T) {
 	t.Run("expression field logging", func(t *testing.T) {
 		t.Parallel()
 
+		t.Run("validate query complexity expressions for successful, rejected, and cached operations", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t,
+				&testenv.Config{
+					AccessLogFields: []config.CustomAttribute{
+						{
+							Key: "query_depth",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.queryDepth",
+							},
+						},
+						{
+							Key: "query_total_fields",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.queryTotalFields",
+							},
+						},
+						{
+							Key: "query_root_fields",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.queryRootFields",
+							},
+						},
+						{
+							Key: "query_root_field_aliases",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.queryRootFieldAliases",
+							},
+						},
+						{
+							Key: "query_complexity_cache_hit",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.queryComplexityCacheHit",
+							},
+						},
+					},
+					LogObservation: testenv.LogObservationConfig{
+						Enabled:  true,
+						LogLevel: zapcore.InfoLevel,
+					},
+					ModifySecurityConfiguration: func(securityConfiguration *config.SecurityConfiguration) {
+						securityConfiguration.ComplexityLimits = &config.ComplexityLimits{
+							Mode: config.ComplexityLimitsModeEnforce,
+							Depth: &config.ComplexityLimit{
+								Enabled: true,
+								Limit:   3,
+							},
+						}
+						securityConfiguration.ComplexityCalculationCache = &config.ComplexityCalculationCache{
+							Enabled:   true,
+							CacheSize: 1024,
+						}
+					},
+					ModifyEngineExecutionConfiguration: func(engineExecutionConfiguration *config.EngineExecutionConfiguration) {
+						engineExecutionConfiguration.Debug.SynchronousCacheWrites = true
+					},
+				},
+				func(t *testing.T, xEnv *testenv.Environment) {
+					successfulQuery := `query {
+						first: employee(id: 1) { id details { forename surname } }
+						employee(id: 2) { id details { forename } }
+						employees { id }
+					}`
+					rejectedQuery := `query {
+						employee(id: 1) { details { pets { name } } }
+					}`
+
+					makeRequest := func(query string, expectedStatus int) {
+						t.Helper()
+						res, err := xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{Query: query})
+						require.NoError(t, err)
+						require.Equal(t, expectedStatus, res.Response.StatusCode)
+					}
+
+					makeRequest(successfulQuery, http.StatusOK)
+					makeRequest(successfulQuery, http.StatusOK)
+					makeRequest(rejectedQuery, http.StatusBadRequest)
+
+					requestLogs := xEnv.Observer().FilterMessage("/graphql").All()
+					require.Len(t, requestLogs, 3)
+
+					assertComplexityFields := func(logContext map[string]any, depth, totalFields, rootFields, rootFieldAliases int64, cacheHit bool) {
+						t.Helper()
+						require.Equal(t, depth, logContext["query_depth"])
+						require.Equal(t, totalFields, logContext["query_total_fields"])
+						require.Equal(t, rootFields, logContext["query_root_fields"])
+						require.Equal(t, rootFieldAliases, logContext["query_root_field_aliases"])
+						require.Equal(t, cacheHit, logContext["query_complexity_cache_hit"])
+					}
+
+					assertComplexityFields(requestLogs[0].ContextMap(), 3, 11, 2, 1, false)
+					assertComplexityFields(requestLogs[1].ContextMap(), 3, 11, 2, 1, true)
+					assertComplexityFields(requestLogs[2].ContextMap(), 4, 4, 1, 0, false)
+				},
+			)
+		})
+
 		t.Run("validate request.operation.normalizationCacheHit expression", func(t *testing.T) {
 			t.Parallel()
 
@@ -4109,6 +4646,116 @@ func TestAccessLogs(t *testing.T) {
 			)
 		})
 
+		t.Run("validate request.operation.variables expression", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t,
+				&testenv.Config{
+					AccessLogFields: []config.CustomAttribute{
+						{
+							Key: "operation_variables",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.variables",
+							},
+						},
+					},
+					LogObservation: testenv.LogObservationConfig{
+						Enabled:  true,
+						LogLevel: zapcore.InfoLevel,
+					},
+				},
+				func(t *testing.T, xEnv *testenv.Environment) {
+					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+						OperationName: []byte(`"Employee"`),
+						Query:         `query Employee($id: Int!) { employee(id: $id) { id } }`,
+						Variables:     []byte(`{"id": 4}`),
+					})
+					requestLog := xEnv.Observer().FilterMessage("/graphql")
+					requestContext := requestLog.All()[0].ContextMap()
+					val, ok := requestContext["operation_variables"].(string)
+					require.True(t, ok)
+					require.JSONEq(t, `{"id":4}`, val)
+				},
+			)
+		})
+
+		t.Run("validate request.operation.variables expression without variables", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t,
+				&testenv.Config{
+					AccessLogFields: []config.CustomAttribute{
+						{
+							Key: "operation_variables",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: "request.operation.variables",
+							},
+						},
+					},
+					LogObservation: testenv.LogObservationConfig{
+						Enabled:  true,
+						LogLevel: zapcore.InfoLevel,
+					},
+				},
+				func(t *testing.T, xEnv *testenv.Environment) {
+					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+						Query: `query employees { employees { id } }`,
+					})
+					requestLog := xEnv.Observer().FilterMessage("/graphql")
+					requestContext := requestLog.All()[0].ContextMap()
+					val, ok := requestContext["operation_variables"].(string)
+					require.True(t, ok)
+					require.JSONEq(t, `{}`, val)
+				},
+			)
+		})
+
+		t.Run("validate request.operation.variables logged only on variablesRemappingCacheHit miss", func(t *testing.T) {
+			t.Parallel()
+
+			testenv.Run(t,
+				&testenv.Config{
+					AccessLogFields: []config.CustomAttribute{
+						{
+							Key: "variables_on_remap_miss",
+							ValueFrom: &config.CustomDynamicAttribute{
+								Expression: `request.operation.variablesRemappingCacheHit ? "" : request.operation.variables`,
+							},
+						},
+					},
+					LogObservation: testenv.LogObservationConfig{
+						Enabled:  true,
+						LogLevel: zapcore.InfoLevel,
+					},
+				},
+				func(t *testing.T, xEnv *testenv.Environment) {
+					// First request: remapping cache miss, so the variables are logged.
+					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+						OperationName: []byte(`"Employee"`),
+						Query:         `query Employee($id: Int!) { employee(id: $id) { id } }`,
+						Variables:     []byte(`{"id": 4}`),
+					})
+					requestLog := xEnv.Observer().FilterMessage("/graphql")
+					requestContext := requestLog.All()[0].ContextMap()
+					val, ok := requestContext["variables_on_remap_miss"].(string)
+					require.True(t, ok)
+					require.JSONEq(t, `{"id":4}`, val)
+
+					// Second identical request: remapping cache hit, so the expression evaluates to an
+					// empty string and the field is skipped entirely.
+					xEnv.MakeGraphQLRequestOK(testenv.GraphQLRequest{
+						OperationName: []byte(`"Employee"`),
+						Query:         `query Employee($id: Int!) { employee(id: $id) { id } }`,
+						Variables:     []byte(`{"id": 4}`),
+					})
+					requestLog = xEnv.Observer().FilterMessage("/graphql")
+					requestContext = requestLog.All()[1].ContextMap()
+					_, ok = requestContext["variables_on_remap_miss"]
+					require.False(t, ok, "variables should not be logged on a remapping cache hit")
+				},
+			)
+		})
+
 		t.Run("validate request.operation.persistedOperationCacheHit expression", func(t *testing.T) {
 			t.Parallel()
 
@@ -4131,7 +4778,7 @@ func TestAccessLogs(t *testing.T) {
 					// First request with persisted operation: cache miss
 					res, err := xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{
 						OperationName: []byte(`"Employees"`),
-						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f"}}`),
+						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937"}}`),
 						Header:        map[string][]string{"graphql-client-name": {"my-client"}},
 					})
 					require.NoError(t, err)
@@ -4145,7 +4792,7 @@ func TestAccessLogs(t *testing.T) {
 					// Second request: cache hit
 					res, err = xEnv.MakeGraphQLRequest(testenv.GraphQLRequest{
 						OperationName: []byte(`"Employees"`),
-						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "dc67510fb4289672bea757e862d6b00e83db5d3cbbcfb15260601b6f29bb2b8f"}}`),
+						Extensions:    []byte(`{"persistedQuery": {"version": 1, "sha256Hash": "9015ddfadd802bb378a14e48cea51e9bf9a07c7f8a71d85c56d7b104fea84937"}}`),
 						Header:        map[string][]string{"graphql-client-name": {"my-client"}},
 					})
 					require.NoError(t, err)
@@ -4399,7 +5046,7 @@ func TestAccessLogs(t *testing.T) {
 	})
 }
 
-func checkValues(t *testing.T, requestContext map[string]interface{}, expectedValues map[string]interface{}, additionalExpectedKeys []string) {
+func checkValues(t *testing.T, requestContext map[string]any, expectedValues map[string]any, additionalExpectedKeys []string) {
 	t.Helper()
 
 	require.Lenf(t, requestContext, len(expectedValues)+len(additionalExpectedKeys), "unexpected number of keys")

@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { access } from 'node:fs/promises';
 import {
   CompositionOptions,
+  ContractTagOptions,
   federateSubgraphs,
+  federateSubgraphsContract,
   FederationResult,
   ROUTER_COMPATIBILITY_VERSION_ONE,
   Subgraph,
@@ -181,9 +183,24 @@ export const introspectSubgraph = async ({
 
 /**
  * Composes a list of subgraphs into a single schema.
+ * If contract tag options are provided, the resulting schema is a contract of the supergraph
+ * rather than the full supergraph.
  */
-export function composeSubgraphs(subgraphs: Subgraph[], options?: CompositionOptions): FederationResult {
+export function composeSubgraphs(
+  subgraphs: Subgraph[],
+  options?: CompositionOptions,
+  contractTagOptions?: ContractTagOptions,
+): FederationResult {
   // @TODO get router compatibility version programmatically
+  if (contractTagOptions) {
+    return federateSubgraphsContract({
+      contractTagOptions,
+      options,
+      subgraphs,
+      version: ROUTER_COMPATIBILITY_VERSION_ONE,
+    });
+  }
+
   return federateSubgraphs({
     options,
     subgraphs,
@@ -456,6 +473,23 @@ const gradientStops: [number, number, number][] = [
   [80, 120, 255], // blue
   [180, 100, 255], // purple
 ];
+
+/**
+ * JSON.stringify replacer that strips protobuf-es v2 internal fields
+ * (`$typeName`, `$unknown`) from message objects, so CLI `--json` output stays a
+ * clean, user-facing shape. It runs for every nested object too, so nested
+ * messages are handled as well.
+ */
+export function stripProtobufInternals(_key: string, value: unknown): unknown {
+  if (value != null && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if ('$typeName' in record || '$unknown' in record) {
+      const { $typeName, $unknown, ...rest } = record;
+      return rest;
+    }
+  }
+  return value;
+}
 
 function interpolateColor(t: number): [number, number, number] {
   const segment = t * (gradientStops.length - 1);

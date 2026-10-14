@@ -10,9 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	cachedirective "github.com/pquerna/cachecontrol/cacheobject"
 	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/wundergraph/cosmo/router/pkg/authentication"
 	"github.com/wundergraph/cosmo/router/pkg/config"
 	"github.com/wundergraph/cosmo/router/pkg/graphqlschemausage"
+	pubsub "github.com/wundergraph/cosmo/router/pkg/pubsub/datasource"
 	ctrace "github.com/wundergraph/cosmo/router/pkg/trace"
 
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/httpclient"
@@ -263,6 +266,8 @@ type requestContext struct {
 	request *http.Request
 	// operation is the GraphQL operation context
 	operation *operationContext
+	// cacheControl is the Cache-Control the client sent, nil when absent or malformed
+	cacheControl *cachedirective.RequestCacheDirectives
 	// subgraphResolver can be used to resolve Subgraph by ID or by request
 	subgraphResolver *SubgraphResolver
 	// dataSourceNames the list of datasource involved in resolving the operation
@@ -279,6 +284,42 @@ type requestContext struct {
 	customFieldValueRenderer resolve.FieldValueRenderer
 	// forceSha256Compute indicates whether the Sha256Hash of the operation should definitely be computed
 	forceSha256Compute bool
+	// responseCache counts what the response cache did for the fetches of the request
+	responseCache responseCacheStats
+}
+
+// responseCacheStats is written by concurrent fetches.
+type responseCacheStats struct {
+	fetches     atomic.Int32
+	hits        atomic.Int32
+	partialHits atomic.Int32
+}
+
+func (s *responseCacheStats) record(status resolve.ResponseCacheStatus) {
+	s.fetches.Add(1)
+	switch status {
+	case resolve.ResponseCacheStatusHit:
+		s.hits.Add(1)
+	case resolve.ResponseCacheStatusPartialHit:
+		s.partialHits.Add(1)
+	}
+}
+
+func (c *requestContext) responseCacheStatus() (resolve.ResponseCacheStatus, bool) {
+	if c.operation.opType == OperationTypeSubscription || c.operation.opType == OperationTypeMutation {
+		return resolve.ResponseCacheStatusNotCacheable, false
+	}
+	fetches, hits := c.responseCache.fetches.Load(), c.responseCache.hits.Load()
+	switch {
+	case fetches == 0:
+		return resolve.ResponseCacheStatusNotCacheable, false
+	case hits == fetches:
+		return resolve.ResponseCacheStatusHit, true
+	case hits > 0 || c.responseCache.partialHits.Load() > 0:
+		return resolve.ResponseCacheStatusPartialHit, true
+	default:
+		return resolve.ResponseCacheStatusMiss, true
+	}
 }
 
 type headerBuilder struct {
@@ -298,15 +339,12 @@ func (c *headerBuilder) HeadersForSubgraph(subgraphName string) (http.Header, ui
 }
 
 func SubgraphHeadersBuilder(ctx *requestContext, headerPropagation *HeaderPropagation, executionPlan plan.Plan) resolve.SubgraphHeadersBuilder {
-
 	keyGen := xxhash.New()
 
-	switch p := executionPlan.(type) {
-	case *plan.SynchronousResponsePlan:
-		headers := make(map[string]*HeaderWithHash, len(p.Response.DataSources))
-		for i := range p.Response.DataSources {
-			h, hh := headerPropagation.BuildRequestHeaderForSubgraph(p.Response.DataSources[i].Name, ctx)
-			headers[p.Response.DataSources[i].Name] = &HeaderWithHash{
+	makeHeaders := func(headers map[string]*HeaderWithHash, dataSources []resolve.DataSourceInfo) {
+		for i := range dataSources {
+			h, hh := headerPropagation.BuildRequestHeaderForSubgraph(dataSources[i].Name, ctx)
+			headers[dataSources[i].Name] = &HeaderWithHash{
 				Header: h,
 				Hash:   hh,
 			}
@@ -314,22 +352,38 @@ func SubgraphHeadersBuilder(ctx *requestContext, headerPropagation *HeaderPropag
 			binary.LittleEndian.PutUint64(b[:], hh)
 			_, _ = keyGen.Write(b[:])
 		}
+	}
+
+	switch p := executionPlan.(type) {
+	case *plan.SynchronousResponsePlan:
+		headers := make(map[string]*HeaderWithHash, len(p.Response.DataSources))
+		makeHeaders(headers, p.Response.DataSources)
+
+		return &headerBuilder{
+			headers: headers,
+			allHash: keyGen.Sum64(),
+		}
+	case *plan.DeferResponsePlan:
+		headers := make(map[string]*HeaderWithHash, len(p.Response.Response.DataSources))
+		makeHeaders(headers, p.Response.Response.DataSources)
+
 		return &headerBuilder{
 			headers: headers,
 			allHash: keyGen.Sum64(),
 		}
 	case *plan.SubscriptionResponsePlan:
 		headers := make(map[string]*HeaderWithHash, len(p.Response.Response.DataSources)+1)
-		for i := range p.Response.Response.DataSources {
-			h, hh := headerPropagation.BuildRequestHeaderForSubgraph(p.Response.Response.DataSources[i].Name, ctx)
-			headers[p.Response.Response.DataSources[i].Name] = &HeaderWithHash{
-				Header: h,
-				Hash:   hh,
+		makeHeaders(headers, p.Response.Response.DataSources)
+
+		// avoid adding header rules for pubsub triggers sources, as no headers are passed to them.
+		_, isPubSub := p.Response.Trigger.Source.(pubsub.SubscriptionDataSource)
+		if isPubSub {
+			return &headerBuilder{
+				headers: headers,
+				allHash: keyGen.Sum64(),
 			}
-			var b [8]byte
-			binary.LittleEndian.PutUint64(b[:], hh)
-			_, _ = keyGen.Write(b[:])
 		}
+
 		h, hh := headerPropagation.BuildRequestHeaderForSubgraph(p.Response.Trigger.SourceName, ctx)
 		headers[p.Response.Trigger.SourceName] = &HeaderWithHash{
 			Header: h,
@@ -627,6 +681,7 @@ type operationContext struct {
 	planCacheHit     bool
 	initialPayload   []byte
 	extensions       []byte
+	inlineArguments  []string
 	persistedID      string
 	// Hash on the original operation
 	sha256Hash string
@@ -658,8 +713,8 @@ func (o *operationContext) Variables() *astjson.Value {
 	return o.variables
 }
 
-func (c *operationContext) VariablesView() resolve.VariablesView {
-	return resolve.NewVariablesView(c.variables, c.remapVariables)
+func (o *operationContext) VariablesView() resolve.VariablesView {
+	return resolve.NewVariablesView(o.variables, o.remapVariables)
 }
 
 func (o *operationContext) Files() []*httpclient.FileUpload {
@@ -914,7 +969,6 @@ type requestContextOptions struct {
 }
 
 func buildRequestContext(opts requestContextOptions) *requestContext {
-
 	rootCtx := expr.Context{
 		Request: expr.LoadRequest(opts.r),
 	}

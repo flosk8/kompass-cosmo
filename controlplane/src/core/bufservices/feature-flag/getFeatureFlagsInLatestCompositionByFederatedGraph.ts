@@ -1,11 +1,10 @@
-import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import {
   GetFeatureFlagsInLatestCompositionByFederatedGraphRequest,
   GetFeatureFlagsInLatestCompositionByFederatedGraphResponse,
 } from '@wundergraph/cosmo-connect/dist/platform/v1/platform_pb';
-import { FeatureFlagDTO } from '../../../types/index.js';
+import { PlainMessage, FeatureFlagDTO } from '../../../types/index.js';
 import { FeatureFlagRepository } from '../../repositories/FeatureFlagRepository.js';
 import { FederatedGraphRepository } from '../../repositories/FederatedGraphRepository.js';
 import { NamespaceRepository } from '../../repositories/NamespaceRepository.js';
@@ -56,18 +55,10 @@ export function getFeatureFlagsInLatestCompositionByFederatedGraph(
         throw new UnauthorizedError();
       }
 
-      if (!federatedGraph.schemaVersionId) {
-        return {
-          response: {
-            code: EnumStatusCode.OK,
-          },
-          featureFlags: [],
-        };
-      }
-
       // Get feature flag IDs from the latest valid composition
-      const ffsInLatestValidComposition = await featureFlagRepo.getFeatureFlagSchemaVersionsByBaseSchemaVersion({
-        baseSchemaVersionId: federatedGraph.schemaVersionId,
+      const ffsInLatestValidComposition = await featureFlagRepo.getFeatureFlagSchemaVersionsInLatestComposition({
+        federatedGraphId: federatedGraph.id,
+        federatedGraphTargetId: federatedGraph.targetId,
       });
 
       const featureFlags: FeatureFlagDTO[] = [];
@@ -81,10 +72,9 @@ export function getFeatureFlagsInLatestCompositionByFederatedGraph(
             namespaceId: namespace.id,
             includeSubgraphs: false,
           });
-          // A disabled feature flag is no longer served in the latest composition (its router config is
-          // removed without recomposing), so exclude it even though its schema version rows still exist.
-          if (flag && flag.isEnabled) {
-            featureFlags.push(flag);
+          if (flag) {
+            // True means the composition reported for this flag is its last successful one, not its latest.
+            featureFlags.push({ ...flag, hasFailedLatestComposition: ff.hasFailedLatestComposition });
           }
         }
       }

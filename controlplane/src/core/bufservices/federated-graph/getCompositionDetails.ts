@@ -1,4 +1,3 @@
-import { PlainMessage } from '@bufbuild/protobuf';
 import { HandlerContext } from '@connectrpc/connect';
 import { EnumStatusCode } from '@wundergraph/cosmo-connect/dist/common/common_pb';
 import {
@@ -12,6 +11,7 @@ import { NamespaceRepository } from '../../repositories/NamespaceRepository.js';
 import type { RouterOptions } from '../../routes.js';
 import { UnauthorizedError } from '../../errors/errors.js';
 import { convertToSubgraphType, enrichLogger, getLogger, handleError } from '../../util.js';
+import type { PlainMessage } from '../../../types/index.js';
 
 export function getCompositionDetails(
   opts: RouterOptions,
@@ -58,15 +58,27 @@ export function getCompositionDetails(
       };
     }
 
-    if (composition.targetId) {
-      const graph = await fedRepo.byTargetId(composition.targetId);
-      if (graph && !authContext.rbac.hasFederatedGraphReadAccess(graph)) {
-        throw new UnauthorizedError();
-      }
+    // A composition is always tied to a federated graph (its target is only nulled once the graph is deleted), so an
+    // unresolvable graph means the composition is orphaned — treat it as not found rather than serving it without an
+    // authorization check.
+    const graph = composition.targetId ? await fedRepo.byTargetId(composition.targetId) : undefined;
+    if (!graph) {
+      return {
+        response: {
+          code: EnumStatusCode.ERR_NOT_FOUND,
+          details: `Federated graph for composition '${req.compositionId}' not found`,
+        },
+        compositionSubgraphs: [],
+        featureFlagCompositions: [],
+      };
+    }
+    if (!authContext.rbac.hasFederatedGraphReadAccess(graph)) {
+      throw new UnauthorizedError();
     }
 
     const compositionSubgraphs = await compositionRepo.getCompositionSubgraphs({
-      compositionId: req.compositionId,
+      compositionId: composition.id,
+      schemaVersionId: composition.schemaVersionId,
     });
 
     const changelogs = await fedRepo.fetchChangelogByVersion({

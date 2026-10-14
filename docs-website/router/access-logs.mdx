@@ -296,6 +296,41 @@ The response type of the expression is validated upon startup. You should ensure
  Note that while `subgraph` attributes can be accessed in the request logger, it will always have "zero" values.
 </Warning>
 
+#### Logging operation complexity
+
+Router access-log expressions can record the operation complexity values that are also attached to validation traces. Configure `security.complexity_limits` first. Use `measure` mode to calculate the values without rejecting operations.
+
+```yaml
+security:
+  complexity_calculation_cache:
+    enabled: true
+    size: 1024
+  complexity_limits:
+    mode: measure
+
+access_logs:
+  enabled: true
+  router:
+    fields:
+      - key: "query_depth"
+        value_from:
+          expression: "request.operation.queryDepth"
+      - key: "query_total_fields"
+        value_from:
+          expression: "request.operation.queryTotalFields"
+      - key: "query_root_fields"
+        value_from:
+          expression: "request.operation.queryRootFields"
+      - key: "query_root_field_aliases"
+        value_from:
+          expression: "request.operation.queryRootFieldAliases"
+      - key: "query_complexity_cache_hit"
+        value_from:
+          expression: "request.operation.queryComplexityCacheHit"
+```
+
+The numeric values are logged as integers and the cache status as a boolean. See [Template Expressions](/router/configuration/template-expressions#operation-object) for field definitions and lifecycle limitations.
+
 #### Subgraph Access Log Expressions
 
 <Info>
@@ -313,6 +348,25 @@ access_logs:
 ```
 
 In addition to the router access logger, you can also add attributes to the subgraph access logger, this is useful when you want to log anything related to the `subgraph` expression context object.
+
+Subgraph response headers are available through `subgraph.response.header.Get('Header-Name')`, and the start of the subgraph latency measurement is available as `subgraph.request.startTime` (Unix epoch in milliseconds). Combined with the [`date`](https://expr-lang.org/docs/language-definition#date) function, these let you derive timing values from subgraph responses.
+
+Guard header access with a conditional so the expression still resolves when a response does not carry the header. An absent header makes `float(...)` or `date(...)` fail to resolve, in which case the field falls back to its configured `default` (or is omitted).
+
+```yaml
+access_logs:
+  subgraphs:
+    enabled: true
+    fields:
+      # Convert a numeric duration header from milliseconds to seconds
+      - key: "subgraph_duration_clean"
+        value_from:
+          expression: "subgraph.response.header.Get('X-Upstream-Duration-Ms') != '' ? float(subgraph.response.header.Get('X-Upstream-Duration-Ms')) / 1000 : 0.0"
+      # Time between the router starting the fetch and the subgraph starting processing
+      - key: "subgraph_start_latency"
+        value_from:
+          expression: "subgraph.response.header.Get('X-Server-Start') != '' ? (date(subgraph.response.header.Get('X-Server-Start')) - subgraph.request.startTime).UnixMilli() / 1000 : 0.0"
+```
 
 You can find more information about expressions and the fields accessible for expressions [here](/router/configuration/template-expressions).
 
@@ -546,4 +600,3 @@ Additionally, currently the following context fields available in router access 
 ## Conclusion
 
 By configuring access logs, you can gather vital data on the traffic processed by your router. This helps in monitoring performance, debugging issues, and understanding request patterns. Whether logging to `stdout` or to a file, the logs provide flexibility with both default and custom fields to suit your specific needs.
-

@@ -6,13 +6,13 @@ import {
   type ObjectDefinitionData,
 } from '../schema-building/types/types';
 import {
-  type InvalidEntityReturnTypeErrorParams,
   type IncompatibleMergedTypesErrorParams,
   type IncompatibleParentTypeMergeErrorParams,
   type IncompatibleTypeWithProvidesErrorMessageParams,
   type InvalidArgumentValueErrorParams,
   type InvalidCustomDirectiveErrorParams,
   type InvalidDirectiveLocationErrorParams,
+  type InvalidEntityReturnTypeErrorParams,
   type InvalidLinkDirectiveImportObjectErrorParams,
   type InvalidNamedTypeErrorParams,
   type InvalidRepeatedDirectiveErrorParams,
@@ -22,6 +22,7 @@ import {
   type OneOfRequiredFieldsErrorParams,
   type SemanticNonNullLevelsIndexOutOfBoundsErrorParams,
   type SemanticNonNullLevelsNonNullErrorParams,
+  type DirectlyProvidedInterfaceFieldErrorParams,
 } from './types/params';
 import { type UnresolvableFieldData } from '../resolvability-graph/utils/utils';
 import {
@@ -29,6 +30,7 @@ import {
   ARGUMENT,
   FIELD,
   FIELD_PATH,
+  FROM_CONTEXT,
   IN_UPPER,
   INPUT_FIELD,
   INTERFACE,
@@ -36,6 +38,7 @@ import {
   LITERAL_NEW_LINE,
   LITERAL_PERIOD,
   NOT_UPPER,
+  OBJECT,
   OR_UPPER,
   QUOTATION_JOIN,
   SUBSCRIPTION_FIELD_CONDITION,
@@ -583,6 +586,25 @@ export function invalidInterfaceImplementationError(
           invalidFieldImplementation.originalResponseType +
           `" for "${interfaceName}.${fieldName}".\n`;
       }
+      if (invalidFieldImplementation.interfaceContextCoords.size > 0) {
+        message +=
+          `   "@${FROM_CONTEXT}" cannot be defined on an Interface field.\n` +
+          `    The following argument` +
+          (invalidFieldImplementation.interfaceContextCoords.size > 1 ? `s define` : ` defines`) +
+          ` "@${FROM_CONTEXT}": "` +
+          [...invalidFieldImplementation.interfaceContextCoords].join(QUOTATION_JOIN) +
+          `"\n`;
+      }
+      if (invalidFieldImplementation.implementationContextCoords.size > 0) {
+        message +=
+          `   "@${FROM_CONTEXT}" cannot be defined on the implementation of the Interface field` +
+          ` "${interfaceName}.${fieldName}".\n` +
+          `    The following argument` +
+          (invalidFieldImplementation.implementationContextCoords.size > 1 ? `s define` : ` defines`) +
+          ` "@${FROM_CONTEXT}": "` +
+          [...invalidFieldImplementation.implementationContextCoords].join(QUOTATION_JOIN) +
+          `"\n`;
+      }
       if (invalidFieldImplementation.isInaccessible) {
         message +=
           `   The field has been declared "@inaccessible"; however, the same field has not been declared "@inaccessible"` +
@@ -621,6 +643,27 @@ export function invalidRequiredInputValueError(
       ` as optional on all other definitions of that ${typeString} in all other subgraphs.\n`;
   }
   return new Error(message);
+}
+
+export function requiredContextArgumentError(
+  coords: string,
+  fromContextSubgraphNames: Array<string>,
+  requiredSubgraphNames: Array<string>,
+): Error {
+  return new Error(
+    `The ${ARGUMENT} "${coords}" is invalid because:\n` +
+      ` It defines "@${FROM_CONTEXT}" in the following subgraph` +
+      (fromContextSubgraphNames.length > 1 ? 's' : '') +
+      ': "' +
+      fromContextSubgraphNames.join(QUOTATION_JOIN) +
+      `"\n` +
+      ` However, this argument is required in the following subgraph` +
+      (requiredSubgraphNames.length > 1 ? 's' : '') +
+      ': "' +
+      requiredSubgraphNames.join(QUOTATION_JOIN) +
+      `"\n` +
+      ` An ${ARGUMENT} that defines "@${FROM_CONTEXT}" must be optional in any subgraph that references it.\n`,
+  );
 }
 
 export function duplicateArgumentsError(fieldPath: string, duplicatedArguments: string[]): Error {
@@ -771,14 +814,32 @@ export function duplicateFieldInFieldSetErrorMessage(fieldSet: string, fieldPath
   );
 }
 
-export function incompatibleTypeWithProvidesErrorMessage({
+export function incompatibleTypeWithProvidesError({
   fieldCoords,
   responseType,
   subgraphName,
-}: IncompatibleTypeWithProvidesErrorMessageParams): string {
-  return (
+}: IncompatibleTypeWithProvidesErrorMessageParams): Error {
+  return new Error(
     ` A "@provides" directive is declared on field "${fieldCoords}" in subgraph "${subgraphName}".\n` +
-    ` However, the response type "${responseType}" is not an Object nor Interface.`
+      ` However, the response type "${responseType}" is not an Object, Interface, nor Union.`,
+  );
+}
+
+export function directlyProvidedInterfaceFieldError({
+  directiveCoords,
+  directiveName,
+  fieldSet,
+  selection,
+  subgraphName,
+  targetCoords,
+}: DirectlyProvidedInterfaceFieldErrorParams): Error {
+  return new Error(
+    `The field "${directiveCoords}" in subgraph "${subgraphName}" defines a "@${directiveName}"` +
+      ` directive with the following field set:\n "${fieldSet}".` +
+      `\n"${selection}" is a direct Interface selection, corresponding to field "${targetCoords}".` +
+      `\nHowever, no selection ancestors are declared "@external", and Interface fields themselves cannot be` +
+      ` declared "@external".\nConsequently, without a type fragment specifying the underlying type, it is` +
+      ` uncertain which fields are actually provided on this path.`,
   );
 }
 
@@ -828,8 +889,7 @@ export function invalidInlineFragmentTypeErrorMessage(
     ` This is because an inline fragment with the type condition "${typeConditionName}" is defined on the` +
     ` selection set corresponding to the ` +
     getSelectionSetLocation(fieldCoordinatesPath, selectionSetTypeName, true) +
-    ` However, "${selectionSetTypeName}" is not an abstract (Interface or Union) type.\n` +
-    ` Consequently, the only valid type condition at this selection set would be "${selectionSetTypeName}".`
+    ` However, "${selectionSetTypeName}" is not an abstract (Interface or Union) type and is therefore incompatible.`
   );
 }
 
@@ -877,16 +937,72 @@ export function invalidInlineFragmentTypeConditionErrorMessage(
   typeConditionName: string,
   parentTypeString: string,
   selectionSetTypeName: string,
+  typeConditionTypeString: string,
 ): string {
   const message =
     ` The following field set is invalid:\n  "${fieldSet}"\n` +
     ` This is because an inline fragment with the type condition "${typeConditionName}" is defined on the` +
     ` selection set corresponding to the ` +
     getSelectionSetLocationWithTypeString(fieldCoordinatesPath, selectionSetTypeName, parentTypeString);
-  if (parentTypeString === INTERFACE) {
-    return message + ` However, "${typeConditionName}" does not implement "${selectionSetTypeName}"`;
+  switch (parentTypeString) {
+    case INTERFACE: {
+      switch (typeConditionTypeString) {
+        case INTERFACE: {
+          return (
+            message +
+            ` However, Interfaces "${typeConditionName}" and "${selectionSetTypeName}" are neither an` +
+            ` implementation of the other.`
+          );
+        }
+        case OBJECT: {
+          return (
+            message + ` However, Object "${typeConditionName}" does not implement Interface "${selectionSetTypeName}".`
+          );
+        }
+        case UNION: {
+          return (
+            message +
+            ` However, no members of Union "${typeConditionName}" implement Interface "${selectionSetTypeName}".`
+          );
+        }
+      }
+      break;
+    }
+    case OBJECT: {
+      switch (typeConditionTypeString) {
+        case INTERFACE: {
+          return (
+            message + ` However, Object "${selectionSetTypeName}" does not implement Interface "${typeConditionName}".`
+          );
+        }
+        case UNION: {
+          return (
+            message + ` However, Object "${selectionSetTypeName}" is not a member of Union "${typeConditionName}".`
+          );
+        }
+      }
+      break;
+    }
+    case UNION: {
+      switch (typeConditionTypeString) {
+        case INTERFACE: {
+          return message + ` However, no members of Union "${selectionSetTypeName}" implement "${typeConditionName}".`;
+        }
+        case OBJECT: {
+          return (
+            message + ` However, Object "${typeConditionName}" is not a member of Union "${selectionSetTypeName}".`
+          );
+        }
+        case UNION: {
+          return (
+            message + ` However, Unions "${typeConditionName}" and "${selectionSetTypeName}" share no mutual members.`
+          );
+        }
+      }
+      break;
+    }
   }
-  return message + ` However, "${typeConditionName}" is not a member of "${selectionSetTypeName}".`;
+  return message;
 }
 
 export function invalidSelectionOnUnionErrorMessage(
@@ -2079,5 +2195,14 @@ export function invalidMutuallyExclusiveCacheDirectivesError(fieldCoords: string
   return new Error(
     `Field coordinates "${fieldCoords}" define both mutually exclusive directives "@openfed__cacheInvalidate"` +
       ` and "@openfed__cachePopulate".`,
+  );
+}
+
+export function intersectingExcludeAndIncludeContractTagsError(tagNames: Array<string>): Error {
+  return new Error(
+    `Cannot create contract because the following tag${tagNames.length > 1 ? 's are' : ' is'}` +
+      ` provided to both the include and exclude tag sets (which must be mutually exclusive): "` +
+      tagNames.join(QUOTATION_JOIN) +
+      `".`,
   );
 }

@@ -3,14 +3,19 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"testing"
 
+	"github.com/dgraph-io/ristretto/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/asttransform"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/operationreport"
 )
 
 func TestOperationProcessorPersistentOperations(t *testing.T) {
@@ -46,7 +51,6 @@ func TestOperationProcessorPersistentOperations(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Input, func(t *testing.T) {
 			kit, err := parser.NewKit()
 			require.NoError(t, err)
@@ -257,7 +261,6 @@ func TestParseOperationProcessor(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Input, func(t *testing.T) {
 			kit, err := parser.NewKit()
 			require.NoError(t, err)
@@ -296,7 +299,6 @@ func TestNormalizeVariablesOperationProcessor(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Name, func(t *testing.T) {
 			clientSchema, report := astparser.ParseGraphqlDocumentString(tc.ClientSchema)
 			require.False(t, report.HasErrors(), "failed to parse client schema")
@@ -385,7 +387,6 @@ func TestOperationProcessorUnmarshalExtensions(t *testing.T) {
 	}
 	var inputError HttpError
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Input, func(t *testing.T) {
 
 			kit, err := parser.NewKit()
@@ -499,7 +500,6 @@ func TestUnmarshalOperationFromBody(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Name, func(t *testing.T) {
 			kit, err := parser.NewKit()
 			require.NoError(t, err)
@@ -628,7 +628,6 @@ func TestOperationProcessorIntrospectionQuery(t *testing.T) {
 
 	var inputError HttpError
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.Name, func(t *testing.T) {
 
 			kit, err := parser.NewKit()
@@ -652,7 +651,7 @@ func TestOperationProcessorIntrospectionQuery(t *testing.T) {
 	}
 }
 
-// TestSkipIncludeVariableNamesStableAfterKitReuse verifies that skipIncludeVariableNames
+// TestSkipIncludeVariableNamesStableAfterKitReuse verifies that conditionalsVariableNames
 // returns owned strings (not unsafe aliases into kit.doc.Input.RawBytes) so that the slice
 // stored in persistedOperationVariableNames remains valid after the kit is returned to the
 // pool and reused for a different query. Without explicit string creation the aliased strings would
@@ -682,9 +681,9 @@ func TestSkipIncludeVariableNamesStableAfterKitReuse(t *testing.T) {
 	kit1.parsedOperation.Request.Query = skipIncludeQuery
 	require.NoError(t, kit1.Parse())
 
-	names := kit1.skipIncludeVariableNames()
+	names := kit1.conditionalsVariableNames()
 	require.Equal(t, []string{"withAligators", "withCats"}, names,
-		"skipIncludeVariableNames should return sorted variable names")
+		"conditionalsVariableNames should return sorted variable names")
 
 	kit1.Free() // returns kit to pool; RawBytes are zeroed in length but NOT zeroed in content
 
@@ -699,13 +698,501 @@ func TestSkipIncludeVariableNamesStableAfterKitReuse(t *testing.T) {
 	kit2.parsedOperation.Request.Query = polluterQuery
 	require.NoError(t, kit2.Parse())
 
-	// Without strings.Clone in skipIncludeVariableNames, names[0] and names[1]
+	// Without strings.Clone in conditionalsVariableNames, names[0] and names[1]
 	// are unsafe aliases into the now-overwritten RawBytes — they will read the
 	// polluter query's bytes and no longer equal the original variable names.
 	require.Equal(t, "withAligators", names[0],
-		"skipIncludeVariableNames must return cloned (not aliased) strings: "+
+		"conditionalsVariableNames must return cloned (not aliased) strings: "+
 			"'withAligators' was corrupted after kit reuse")
 	require.Equal(t, "withCats", names[1],
-		"skipIncludeVariableNames must return cloned (not aliased) strings: "+
+		"conditionalsVariableNames must return cloned (not aliased) strings: "+
 			"'withCats' was corrupted after kit reuse")
+}
+
+// newValidationCacheProcessor builds an OperationProcessor whose operations are
+// validated against clientSchemaSDL and whose validation results are stored in
+// the returned cache, so cache behaviour can be asserted directly.
+func newValidationCacheProcessor(t *testing.T, clientSchemaSDL string) (*OperationProcessor, *ristretto.Cache[uint64, bool]) {
+	t.Helper()
+
+	clientSchema, report := astparser.ParseGraphqlDocumentString(clientSchemaSDL)
+	require.False(t, report.HasErrors(), "failed to parse client schema")
+	require.NoError(t, asttransform.MergeDefinitionWithBaseSchema(&clientSchema))
+
+	validationCache, err := ristretto.NewCache[uint64, bool](&ristretto.Config[uint64, bool]{
+		MaxCost:            1024,
+		NumCounters:        1024 * 10,
+		IgnoreInternalCost: true,
+		BufferItems:        64,
+	})
+	require.NoError(t, err)
+
+	processor := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                &Executor{ClientSchema: &clientSchema},
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        4,
+		ValidationCache:         validationCache,
+	})
+
+	return processor, validationCache
+}
+
+// validateOperationBody runs the pre-extraction pipeline (Parse + NormalizeOperation)
+// and then ValidateOperation, mirroring what the prehandler does before variable
+// extraction.
+func validateOperationBody(t *testing.T, p *OperationProcessor, body string) (cacheHit bool, err error) {
+	t.Helper()
+
+	kit, err := p.NewKit()
+	require.NoError(t, err)
+	defer kit.Free()
+
+	require.NoError(t, kit.UnmarshalOperationFromBody([]byte(body)))
+	require.NoError(t, kit.Parse())
+	_, err = kit.NormalizeOperation("test", false)
+	require.NoError(t, err)
+
+	return kit.ValidateOperation()
+}
+
+func TestOperationProcessorRejectsIncompatibleVariableTypeBeforeExtraction(t *testing.T) {
+	const schema = `
+		scalar DateTime
+		input Input { date: DateTime! }
+		type Query { field(input: Input!): String }
+	`
+	processor, _ := newValidationCacheProcessor(t, schema)
+	_, err := validateOperationBody(t, processor, `{"query":"query Q($value: String!) { field(input: {date: $value}) }","variables":{"value":"x"}}`)
+	require.EqualError(t, err, `Variable "$value" of type "String!" used in position expecting type "DateTime!".`)
+}
+
+// TestOperationProcessorValidationCache verifies that after splitting schema
+// validation (ValidateOperation) out of Validate and re-keying the validation
+// cache on the pre-extraction normalized representation, the cache still behaves
+// correctly: results are reused across requests, keyed on the operation (not on
+// variable values), and distinct per operation.
+func TestOperationProcessorValidationCache(t *testing.T) {
+	const clientSchemaSDL = `type Query { hello(name: String!): String greet(name: String!): String }`
+
+	t.Run("valid operation is cached as valid", func(t *testing.T) {
+		p, cache := newValidationCacheProcessor(t, clientSchemaSDL)
+
+		cacheHit, err := validateOperationBody(t, p, `{"query":"{ hello(name: \"world\") }"}`)
+		require.NoError(t, err)
+		require.False(t, cacheHit, "first validation of an operation must be a cache miss")
+
+		cache.Wait()
+
+		cacheHit, err = validateOperationBody(t, p, `{"query":"{ hello(name: \"world\") }"}`)
+		require.NoError(t, err)
+		require.True(t, cacheHit, "second validation of the same operation must be a cache hit")
+	})
+
+	t.Run("invalid operation is cached as invalid", func(t *testing.T) {
+		p, cache := newValidationCacheProcessor(t, clientSchemaSDL)
+
+		// Unquoted enum literal for a String argument: rejected by schema validation.
+		cacheHit, err := validateOperationBody(t, p, `{"query":"{ hello(name: nope) }"}`)
+		require.Error(t, err)
+		require.False(t, cacheHit)
+		require.EqualError(t, err, "String cannot represent a non string value: nope")
+
+		cache.Wait()
+
+		cacheHit, err = validateOperationBody(t, p, `{"query":"{ hello(name: nope) }"}`)
+		require.Error(t, err, "an invalid operation must stay invalid on a cache hit")
+		require.True(t, cacheHit, "the invalid result must be served from the cache")
+		require.EqualError(t, err, "String cannot represent a non string value: nope")
+	})
+
+	t.Run("cache key is independent of variable values", func(t *testing.T) {
+		p, cache := newValidationCacheProcessor(t, clientSchemaSDL)
+
+		const query = `query Q($n: String!) { hello(name: $n) }`
+
+		cacheHit, err := validateOperationBody(t, p, `{"query":"`+query+`","variables":{"n":"a"}}`)
+		require.NoError(t, err)
+		require.False(t, cacheHit)
+
+		cache.Wait()
+
+		// Same operation, different variable value: validity does not depend on the
+		// value, so this must hit the cache populated by the previous request.
+		cacheHit, err = validateOperationBody(t, p, `{"query":"`+query+`","variables":{"n":"b"}}`)
+		require.NoError(t, err)
+		require.True(t, cacheHit, "different variable values must reuse the same validation cache entry")
+	})
+
+	t.Run("distinct operations get distinct cache entries", func(t *testing.T) {
+		p, cache := newValidationCacheProcessor(t, clientSchemaSDL)
+
+		cacheHit, err := validateOperationBody(t, p, `{"query":"{ hello(name: \"a\") }"}`)
+		require.NoError(t, err)
+		require.False(t, cacheHit)
+
+		cache.Wait()
+
+		// A different field is a different operation and must not reuse the entry above.
+		cacheHit, err = validateOperationBody(t, p, `{"query":"{ greet(name: \"a\") }"}`)
+		require.NoError(t, err)
+		require.False(t, cacheHit, "a different operation must be a cache miss")
+	})
+
+	t.Run("validation cache is optional", func(t *testing.T) {
+		// No ValidationCache configured: ValidateOperation must still validate and
+		// never report a cache hit.
+		clientSchema, report := astparser.ParseGraphqlDocumentString(clientSchemaSDL)
+		require.False(t, report.HasErrors())
+		require.NoError(t, asttransform.MergeDefinitionWithBaseSchema(&clientSchema))
+		p := NewOperationProcessor(OperationProcessorOptions{
+			Executor:                &Executor{ClientSchema: &clientSchema},
+			MaxOperationSizeInBytes: 10 << 20,
+			ParseKitPoolSize:        4,
+		})
+
+		cacheHit, err := validateOperationBody(t, p, `{"query":"{ hello(name: nope) }"}`)
+		require.Error(t, err)
+		require.False(t, cacheHit)
+
+		cacheHit, err = validateOperationBody(t, p, `{"query":"{ hello(name: \"world\") }"}`)
+		require.NoError(t, err)
+		require.False(t, cacheHit)
+	})
+}
+
+// deferTestSchema is a small client schema used by the @defer tests. The @defer
+// directive itself is NOT declared here — it is part of the GraphQL base schema
+// that asttransform.MergeDefinitionWithBaseSchema merges in below. Per the spec
+// (and the Apollo docs) @defer is valid on INLINE_FRAGMENT and FRAGMENT_SPREAD,
+// and accepts two optional args: `if: Boolean! = true` and `label: String`.
+const deferTestSchema = `
+	type Query { user: User }
+	type Mutation { updateUser: User }
+	type Subscription { userUpdated: User }
+	type User { id: ID! name: String! profile: Profile }
+	type Profile { email: String! bio: String }
+`
+
+// newDeferOperationKit builds an OperationKit whose executor uses deferTestSchema
+// (merged with the base schema so @defer is defined). enableDefer mirrors the
+// router's `engine.enable_defer` config option (OperationProcessorOptions.EnableDefer).
+func newDeferOperationKit(t *testing.T, enableDefer bool) *OperationKit {
+	t.Helper()
+
+	clientSchema, report := astparser.ParseGraphqlDocumentString(deferTestSchema)
+	require.False(t, report.HasErrors(), "failed to parse defer client schema")
+	require.NoError(t, asttransform.MergeDefinitionWithBaseSchema(&clientSchema))
+
+	executor := &Executor{
+		PlanConfig:   plan.Configuration{},
+		ClientSchema: &clientSchema,
+	}
+	processor := NewOperationProcessor(OperationProcessorOptions{
+		Executor:                executor,
+		MaxOperationSizeInBytes: 10 << 20,
+		ParseKitPoolSize:        4,
+		EnableDefer:             enableDefer,
+	})
+
+	kit, err := processor.NewKit()
+	require.NoError(t, err)
+	return kit
+}
+
+// TestOperationProcessorDeferNormalization covers the valid @defer placements
+// (the ones the Apollo docs allow) and shows how the EnableDefer option changes
+// the normalized representation:
+//
+//   - EnableDefer=true  -> the @defer fragment is expanded into internal
+//     `@__defer_internal(id: N[, label: "..."])` markers on the deferred fields.
+//   - EnableDefer=false -> @defer is stripped and the fragment is inlined as if
+//     the directive were not present.
+//
+// Note: `@defer(if: false)` is a compile-time false, so the fragment is always
+// inlined without a defer marker, regardless of EnableDefer.
+func TestOperationProcessorDeferNormalization(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		Name             string
+		Query            string
+		Variables        string
+		ExpectedEnabled  string // normalized representation when EnableDefer=true
+		ExpectedDisabled string // normalized representation when EnableDefer=false
+	}{
+		{
+			Name:             "@defer on inline fragment is rewritten to internal markers when enabled",
+			Query:            `query Q { user { id name ... @defer { profile { email } } } }`,
+			ExpectedEnabled:  `query Q {user {id name profile @__defer_internal(id: 1) {email @__defer_internal(id: 1)}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+		{
+			Name:             "@defer label is preserved on the internal markers",
+			Query:            `query Q { user { id name ... @defer(label: "profileDefer") { profile { email } } } }`,
+			ExpectedEnabled:  `query Q {user {id name profile @__defer_internal(id: 1, label: "profileDefer") {email @__defer_internal(id: 1, label: "profileDefer")}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+		{
+			Name:             "@defer on named fragment spread is inlined and marked when enabled",
+			Query:            `query Q { user { id name ...UserProfile @defer } } fragment UserProfile on User { profile { email } }`,
+			ExpectedEnabled:  `query Q {user {id name profile @__defer_internal(id: 1) {email @__defer_internal(id: 1)}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+		{
+			Name:             "@defer(if: true) is treated as an unconditional defer",
+			Query:            `query Q { user { id name ... @defer(if: true) { profile { email } } } }`,
+			ExpectedEnabled:  `query Q {user {id name profile @__defer_internal(id: 1) {email @__defer_internal(id: 1)}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+		{
+			Name:             "@defer(if: false) is inlined without markers regardless of EnableDefer",
+			Query:            `query Q { user { id name ... @defer(if: false) { profile { email } } } }`,
+			ExpectedEnabled:  `query Q {user {id name profile {email}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+		{
+			Name:             "@defer(if: $var) with a truthy variable is treated as a defer",
+			Query:            `query Q($withProfile: Boolean!) { user { id name ... @defer(if: $withProfile) { profile { email } } } }`,
+			Variables:        `{"withProfile": true}`,
+			ExpectedEnabled:  `query Q {user {id name profile @__defer_internal(id: 1) {email @__defer_internal(id: 1)}}}`,
+			ExpectedDisabled: `query Q {user {id name profile {email}}}`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, enableDefer := range []bool{true, false} {
+				t.Run(fmt.Sprintf("name=%s enableDefer=%t", tc.Name, enableDefer), func(t *testing.T) {
+					t.Parallel()
+
+					kit := newDeferOperationKit(t, enableDefer)
+					defer kit.Free()
+
+					variables := tc.Variables
+					if variables == "" {
+						variables = "{}"
+					}
+					body := fmt.Sprintf(`{"query":%q,"operationName":"Q","variables":%s}`, tc.Query, variables)
+
+					require.NoError(t, kit.UnmarshalOperationFromBody([]byte(body)))
+					require.NoError(t, kit.Parse())
+
+					_, err := kit.NormalizeOperation("test", false)
+					require.NoError(t, err)
+
+					expected := tc.ExpectedDisabled
+					if enableDefer {
+						expected = tc.ExpectedEnabled
+					}
+					assert.Equal(t, expected, kit.parsedOperation.NormalizedRepresentation)
+				})
+			}
+		})
+	}
+}
+
+// TestOperationProcessorDeferValidation covers the @defer placements that are
+// rejected. These prevalidation rules run regardless of the EnableDefer option,
+// so the operation is rejected during normalization either way.
+func TestOperationProcessorDeferValidation(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		Name                     string
+		Query                    string
+		ExpectedErrorWhenEnabled string
+	}{
+		{
+			Name:                     "@defer on a subscription operation is rejected",
+			Query:                    `subscription S { userUpdated { id ... @defer { profile { email } } } }`,
+			ExpectedErrorWhenEnabled: `directive "@defer" is not allowed on subscription operations`,
+		},
+		{
+			Name:                     "@defer on a mutation root field is rejected",
+			Query:                    `mutation M { ... @defer { updateUser { id } } }`,
+			ExpectedErrorWhenEnabled: `directive "@defer" is not allowed on root fields of mutation operations`,
+		},
+		{
+			Name:                     "@defer with a duplicate label is rejected",
+			Query:                    `query Q { user { ... @defer(label: "dup") { name } ... @defer(label: "dup") { id } } }`,
+			ExpectedErrorWhenEnabled: `directive "@defer" label "dup" must be unique, but was already used on "@defer" directive`,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+			// Validation is independent of the EnableDefer option.
+			for _, enableDefer := range []bool{true, false} {
+				t.Run(fmt.Sprintf("name=%s enableDefer=%t", tc.Name, enableDefer), func(t *testing.T) {
+					t.Parallel()
+					kit := newDeferOperationKit(t, enableDefer)
+					defer kit.Free()
+
+					body := fmt.Sprintf(`{"query":%q,"variables":{}}`, tc.Query)
+					require.NoError(t, kit.UnmarshalOperationFromBody([]byte(body)))
+					require.NoError(t, kit.Parse())
+
+					_, err := kit.NormalizeOperation("test", false)
+
+					if enableDefer {
+						require.Error(t, err)
+						assert.ErrorContains(t, err, tc.ExpectedErrorWhenEnabled)
+					} else {
+						require.NoError(t, err)
+					}
+
+				})
+			}
+		})
+	}
+}
+
+func newTestRistrettoCache[V any](t *testing.T) *ristretto.Cache[uint64, V] {
+	t.Helper()
+	cache, err := ristretto.NewCache[uint64, V](&ristretto.Config[uint64, V]{
+		MaxCost:            1024,
+		NumCounters:        1024 * 10,
+		IgnoreInternalCost: true,
+		BufferItems:        64,
+	})
+	require.NoError(t, err)
+	return cache
+}
+
+// TestOperationProcessorParserLimitsOnCachedNormalizedOperation verifies that the
+// parser tokenizer limits are enforced against the operation as sent by the client,
+// and not against the normalized representation restored from the operation caches.
+// Normalization inlines fragment spreads, so the normalized representation can
+// contain more fields than the original operation. Re-applying the limits on a
+// cache hit would reject an operation that was accepted on its first request.
+func TestOperationProcessorParserLimitsOnCachedNormalizedOperation(t *testing.T) {
+	const clientSchemaSDL = `
+		type Query { u1: User u2: User u3: User }
+		type User { a: String b: String c: String d: String }
+	`
+
+	// The tokenizer counts 7 fields here (u1, u2, u3 and a, b, c, d in the fragment),
+	// while the normalized representation inlines the fragment into every root field:
+	// query Q { u1 { a b c d } u2 { a b c d } u3 { a b c d } } -> 15 fields.
+	const body = `{"query":"query Q { u1 { ...F } u2 { ...F } u3 { ...F } } fragment F on User { a b c d }"}`
+
+	limits := astparser.TokenizerLimits{MaxFields: 10}
+
+	newProcessor := func(t *testing.T) (*OperationProcessor, func()) {
+		t.Helper()
+
+		clientSchema, report := astparser.ParseGraphqlDocumentString(clientSchemaSDL)
+		require.False(t, report.HasErrors(), "failed to parse client schema")
+		require.NoError(t, asttransform.MergeDefinitionWithBaseSchema(&clientSchema))
+
+		normalizationCache := newTestRistrettoCache[NormalizationCacheEntry](t)
+		variablesNormalizationCache := newTestRistrettoCache[VariablesNormalizationCacheEntry](t)
+		remapVariablesCache := newTestRistrettoCache[RemapVariablesCacheEntry](t)
+
+		processor := NewOperationProcessor(OperationProcessorOptions{
+			Executor:                    &Executor{ClientSchema: &clientSchema},
+			MaxOperationSizeInBytes:     10 << 20,
+			ParseKitPoolSize:            4,
+			ParserTokenizerLimits:       limits,
+			NormalizationCache:          normalizationCache,
+			VariablesNormalizationCache: variablesNormalizationCache,
+			RemapVariablesCache:         remapVariablesCache,
+		})
+
+		waitForCaches := func() {
+			normalizationCache.Wait()
+			variablesNormalizationCache.Wait()
+			remapVariablesCache.Wait()
+		}
+
+		return processor, waitForCaches
+	}
+
+	type cacheHits struct {
+		normalization          bool
+		variablesNormalization bool
+		remapVariables         bool
+	}
+
+	// process mirrors the order in which the prehandler runs the operation kit.
+	process := func(t *testing.T, p *OperationProcessor, body string) (cacheHits, string) {
+		t.Helper()
+
+		kit, err := p.NewKit()
+		require.NoError(t, err)
+		defer kit.Free()
+
+		var hits cacheHits
+
+		require.NoError(t, kit.UnmarshalOperationFromBody([]byte(body)))
+		require.NoError(t, kit.Parse())
+
+		hits.normalization, err = kit.NormalizeOperation("test", false)
+		require.NoError(t, err)
+
+		hits.variablesNormalization, _, err = kit.NormalizeVariables()
+		require.NoError(t, err)
+
+		hits.remapVariables, err = kit.RemapVariables(false)
+		require.NoError(t, err)
+
+		return hits, kit.parsedOperation.NormalizedRepresentation
+	}
+
+	t.Run("operation exceeding the limits before normalization is rejected", func(t *testing.T) {
+		p, _ := newProcessor(t)
+
+		kit, err := p.NewKit()
+		require.NoError(t, err)
+		defer kit.Free()
+
+		// 11 fields in the operation as sent by the client.
+		require.NoError(t, kit.UnmarshalOperationFromBody([]byte(`{"query":"{ u1 { a b c d } u2 { a b c d } u3 }"}`)))
+		err = kit.Parse()
+		require.Error(t, err)
+
+		var httpErr *httpGraphqlError
+		require.ErrorAs(t, err, &httpErr)
+		require.Equal(t, http.StatusBadRequest, httpErr.StatusCode())
+		require.EqualError(t, err, "allowed number of fields per GraphQL document of '10' exceeded")
+	})
+
+	t.Run("normalized representation exceeding the limits is accepted on cache hits", func(t *testing.T) {
+		p, waitForCaches := newProcessor(t)
+
+		hits, firstNormalized := process(t, p, body)
+		require.Equal(t, cacheHits{}, hits, "first request must not hit any cache")
+
+		// Make sure the scenario is meaningful: the normalized representation must exceed
+		// the limit, otherwise this test would pass regardless of where the limits are applied.
+		normalizedDoc := ast.NewSmallDocument()
+		normalizedDoc.Input.ResetInputString(firstNormalized)
+		_, err := astparser.NewParser().ParseWithLimits(limits, normalizedDoc, &operationreport.Report{})
+		require.ErrorAs(t, err, &astparser.ErrFieldsLimitExceeded{}, "normalized representation must exceed the field limit")
+
+		waitForCaches()
+
+		hits, secondNormalized := process(t, p, body)
+		require.Equal(t, cacheHits{normalization: true, variablesNormalization: true, remapVariables: true}, hits,
+			"second request must be served from the caches")
+		require.Equal(t, firstNormalized, secondNormalized)
+	})
+
+	t.Run("persisted operation entry exceeding the limits is accepted", func(t *testing.T) {
+		p, _ := newProcessor(t)
+
+		kit, err := p.NewKit()
+		require.NoError(t, err)
+		defer kit.Free()
+
+		err = kit.handleFoundPersistedOperationEntry(NormalizationCacheEntry{
+			normalizedRepresentation: "query Q { u1 { a b c d } u2 { a b c d } u3 { a b c d } }",
+			operationType:            "query",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "Q", kit.parsedOperation.Request.OperationName)
+	})
 }

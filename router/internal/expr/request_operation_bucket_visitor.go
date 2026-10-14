@@ -17,6 +17,7 @@ const (
 	BucketNormalizationTime
 	BucketHash
 	BucketQueryPlanHash
+	BucketQueryComplexity
 	BucketValidationTime
 	BucketPlanningTime
 	BucketSubgraph
@@ -24,7 +25,7 @@ const (
 
 // RequestOperationBucketVisitor inspects nodes and sets Bucket to the highest-priority match
 // Priority (low -> high): any, auth, sha256, parsingTime, name/type, persistedId, normalizationTime,
-// hash, queryPlanHash, validationTime, planningTime, subgraph
+// hash, queryPlanHash, query complexity, validationTime, planningTime, subgraph
 type RequestOperationBucketVisitor struct {
 	Bucket AttributeBucket
 }
@@ -87,12 +88,22 @@ func (v *RequestOperationBucketVisitor) Visit(baseNode *ast.Node) {
 			v.setBucketIfHigher(BucketNameOrType)
 		case "persistedId":
 			v.setBucketIfHigher(BucketPersistedID)
-		case "normalizationTime":
+		case "normalizationTime", "variables":
+			// Variables are available right after the operation body is parsed, but we group them
+			// with the normalization phase: they are commonly combined with the variables*CacheHit
+			// flags, which are only set during normalization, so evaluating at this phase keeps the
+			// combined value consistent.
 			v.setBucketIfHigher(BucketNormalizationTime)
 		case "hash":
 			v.setBucketIfHigher(BucketHash)
 		case "queryPlanHash":
 			v.setBucketIfHigher(BucketQueryPlanHash)
+		case "queryDepth",
+			"queryTotalFields",
+			"queryRootFields",
+			"queryRootFieldAliases",
+			"queryComplexityCacheHit":
+			v.setBucketIfHigher(BucketQueryComplexity)
 		case "validationTime":
 			v.setBucketIfHigher(BucketValidationTime)
 		case "planningTime":

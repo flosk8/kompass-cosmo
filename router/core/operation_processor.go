@@ -26,6 +26,7 @@ import (
 	fastjson "github.com/wundergraph/astjson"
 
 	"github.com/wundergraph/cosmo/router/internal/persistedoperation"
+	"github.com/wundergraph/cosmo/router/internal/persistedoperation/pqlmanifest"
 	"github.com/wundergraph/cosmo/router/internal/unsafebytes"
 	"github.com/wundergraph/cosmo/router/pkg/config"
 
@@ -78,6 +79,8 @@ type ParsedOperation struct {
 	// NormalizationCacheHit is set to true if the request is a non-persisted operation,
 	// and the normalized operation was loaded from cache.
 	NormalizationCacheHit bool
+
+	InlineArguments []astnormalization.InlineArgument
 }
 
 func (o *ParsedOperation) IDString() string {
@@ -126,10 +129,13 @@ type OperationProcessorOptions struct {
 	ApolloRouterCompatibilityFlags                         config.ApolloRouterCompatibilityFlags
 	DisableExposingVariablesContentOnValidationError       bool
 	RelaxSubgraphOperationFieldSelectionMergingNullability bool
+	AllowStringLiteralsForEnums                            bool
 	ComplexityLimits                                       *config.ComplexityLimits
 	CostControl                                            *config.CostControl
 	ParserTokenizerLimits                                  astparser.TokenizerLimits
 	OperationNameLengthLimit                               int
+	EnableDefer                                            bool
+	ValidateInlineArguments                                config.ValidateInlineArguments
 }
 
 // OperationProcessor provides shared resources to the parseKit and OperationKit.
@@ -167,10 +173,20 @@ type parseKit struct {
 	normalizedOperation *bytes.Buffer
 	variablesValidator  *variablesvalidation.VariablesValidator
 	operationValidator  *astvalidation.OperationValidator
+
+	// inlineArgumentsIncludePersisted controls whether persisted operations are
+	// subject to inline-argument detection. When false, persisted operations are
+	// exempted per run via astnormalization.RunOptions.SkipInlineArguments.
+	inlineArgumentsIncludePersisted bool
+}
+
+type persistedOperationVariableNames struct {
+	manifestRevision string
+	names            []string
 }
 
 type OperationCache struct {
-	persistedOperationVariableNames     map[string][]string
+	persistedOperationVariableNames     map[string]persistedOperationVariableNames
 	persistedOperationVariableNamesLock *sync.RWMutex
 
 	automaticPersistedOperationCacheTtl float64
@@ -195,6 +211,13 @@ type OperationKit struct {
 	kit                      *parseKit
 	parsedOperation          *ParsedOperation
 	introspectionEnabled     bool
+
+	// persistedOperationManifest is the manifest snapshot captured when the kit
+	// is created. The manifest poller replaces the store's manifest in the
+	// background, and custom IDs can keep their ID while their body changes, so
+	// every persisted operation lookup, cache key and variable metadata check in
+	// this request must read this snapshot instead of the live store.
+	persistedOperationManifest *pqlmanifest.Manifest
 }
 
 type GraphQLRequest struct {
@@ -242,6 +265,8 @@ func NewOperationKit(processor *OperationProcessor) *OperationKit {
 		cache:                  processor.operationCache,
 		parsedOperation:        &ParsedOperation{},
 		introspectionEnabled:   processor.introspectionEnabled,
+
+		persistedOperationManifest: processor.persistedOperationClient.ManifestSnapshot(),
 	}
 }
 
@@ -254,6 +279,8 @@ func NewIndependentOperationKit(processor *OperationProcessor) *OperationKit {
 		cache:                  processor.operationCache,
 		parsedOperation:        &ParsedOperation{},
 		introspectionEnabled:   processor.introspectionEnabled,
+
+		persistedOperationManifest: processor.persistedOperationClient.ManifestSnapshot(),
 	}
 }
 
@@ -333,12 +360,9 @@ func (o *OperationKit) unmarshalOperation() error {
 				statusCode: http.StatusBadRequest,
 			}
 		}
-		if o.parsedOperation.GraphQLRequestExtensions.PersistedQuery != nil {
-			if !o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.isValidHash() {
-				return &httpGraphqlError{
-					message:    "persistedQuery does not have a valid sha256 hash",
-					statusCode: http.StatusBadRequest,
-				}
+		if pq := o.parsedOperation.GraphQLRequestExtensions.PersistedQuery; pq != nil {
+			if err := o.validatePersistedOperationID(pq); err != nil {
+				return err
 			}
 
 			// Delete persistedQuery from extensions to avoid it being passed to the subgraphs
@@ -394,6 +418,51 @@ func (o *OperationKit) unmarshalOperation() error {
 	return nil
 }
 
+// APQ IDs must be SHA256 hashes. Published IDs are opaque storage keys.
+func (o *OperationKit) validatePersistedOperationID(pq *GraphQLRequestExtensionsPersistedQuery) error {
+	if o.operationProcessor.persistedOperationIDsAreQueryHashes() {
+		if !pq.isValidHash() {
+			return &httpGraphqlError{message: "persistedQuery does not have a valid sha256 hash", statusCode: http.StatusBadRequest}
+		}
+		return nil
+	}
+	if len(pq.Sha256Hash) == 0 || len(pq.Sha256Hash) > 250 {
+		return &httpGraphqlError{message: "persistedQuery id must be 1-250 characters long", statusCode: http.StatusBadRequest}
+	}
+	for _, c := range []byte(pq.Sha256Hash) {
+		if !isCustomPersistedOperationIDChar(c) {
+			return &httpGraphqlError{message: `persistedQuery id must use printable ASCII, without / or \`, statusCode: http.StatusBadRequest}
+		}
+	}
+	return nil
+}
+
+// persistedOperationIDsAreQueryHashes reports whether persisted operation IDs must be
+// SHA-256 hashes of the request query. This holds unless persisted operation storage
+// is configured with APQ disabled, which enables custom IDs.
+func (p *OperationProcessor) persistedOperationIDsAreQueryHashes() bool {
+	return p.persistedOperationClient == nil || p.persistedOperationClient.APQEnabled()
+}
+
+// hasCustomPersistedOperationID reports whether the request's persisted ID is an
+// opaque published ID, resolved without checking it against a query. SHA256 IDs
+// are never custom: a stored SHA256 ID must be the hash of its body.
+func (o *OperationKit) hasCustomPersistedOperationID() bool {
+	pq := o.parsedOperation.GraphQLRequestExtensions.PersistedQuery
+	return pq.HasHash() &&
+		!o.operationProcessor.persistedOperationIDsAreQueryHashes() &&
+		!persistedoperation.IsSHA256ID(pq.Sha256Hash)
+}
+
+// persistedQueryHashMustMatchQuery reports whether the request supplies both a
+// SHA-256 persisted ID and a query, which must hash to that ID.
+func (o *OperationKit) persistedQueryHashMustMatchQuery() bool {
+	pq := o.parsedOperation.GraphQLRequestExtensions.PersistedQuery
+	return pq.HasHash() &&
+		o.parsedOperation.Request.Query != "" &&
+		(o.operationProcessor.persistedOperationIDsAreQueryHashes() || persistedoperation.IsSHA256ID(pq.Sha256Hash))
+}
+
 func (o *OperationKit) computeVariablesHash() {
 	_, _ = o.kit.keyGen.Write(o.kit.doc.Input.Variables)
 	o.parsedOperation.VariablesHash = o.kit.keyGen.Sum64()
@@ -446,8 +515,7 @@ func (o *OperationKit) FetchPersistedOperation(ctx context.Context, clientInfo *
 	}
 	if fromCache {
 		if fromCacheHasTTL, _ := o.persistedOperationCacheKeyHasTtl(clientInfo.Name, includeOperationName); fromCacheHasTTL {
-			// if it is an APQ request, we need to save it again to renew the TTL expiration
-			if err = o.operationProcessor.persistedOperationClient.SaveOperation(ctx, clientInfo.Name, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, o.parsedOperation.NormalizedRepresentation); err != nil {
+			if err := o.renewAPQTTL(ctx); err != nil {
 				return false, false, err
 			}
 		}
@@ -459,7 +527,7 @@ func (o *OperationKit) FetchPersistedOperation(ctx context.Context, clientInfo *
 		isAPQ = true
 
 		// If the operation was fetched with APQ, save it again to renew the TTL
-		err := o.operationProcessor.persistedOperationClient.SaveOperation(ctx, clientInfo.Name, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, o.parsedOperation.Request.Query)
+		err := o.operationProcessor.persistedOperationClient.SaveOperation(ctx, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, o.parsedOperation.Request.Query)
 		if err != nil {
 			return false, true, err
 		}
@@ -467,13 +535,17 @@ func (o *OperationKit) FetchPersistedOperation(ctx context.Context, clientInfo *
 		var persistedOperationData []byte
 		var err error
 
-		persistedOperationData, isAPQ, err = o.operationProcessor.persistedOperationClient.PersistedOperation(ctx, clientInfo.Name, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash)
+		persistedOperationData, isAPQ, err = o.operationProcessor.persistedOperationClient.PersistedOperationWithManifest(
+			ctx, clientInfo.Name, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash,
+			o.persistedOperationManifest,
+		)
 		if err != nil {
 			return false, isAPQ, err
 		}
 
-		if isAPQ && persistedOperationData == nil && o.parsedOperation.Request.Query == "" {
-			// If the client has APQ enabled, throw an error if the operation wasn't attached to the request
+		if (!o.operationProcessor.persistedOperationClient.APQEnabled() && len(persistedOperationData) == 0) ||
+			(isAPQ && persistedOperationData == nil && o.parsedOperation.Request.Query == "") {
+			// Published IDs must resolve; APQ misses need a body to register.
 			return false, isAPQ, &persistedoperation.PersistentOperationNotFoundError{
 				ClientName: clientInfo.Name,
 				Sha256Hash: o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash,
@@ -492,13 +564,18 @@ func (o *OperationKit) FetchPersistedOperation(ctx context.Context, clientInfo *
 
 		// If the operation was fetched with APQ, save it again to renew the TTL
 		if isAPQ {
-			if err = o.operationProcessor.persistedOperationClient.SaveOperation(ctx, clientInfo.Name, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, o.parsedOperation.Request.Query); err != nil {
+			if err = o.operationProcessor.persistedOperationClient.SaveOperation(ctx, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, o.parsedOperation.Request.Query); err != nil {
 				return false, true, err
 			}
 		}
 	}
 
 	return false, isAPQ, nil
+}
+
+func (o *OperationKit) renewAPQTTL(ctx context.Context) error {
+	sha256Hash := o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash
+	return o.operationProcessor.persistedOperationClient.RenewOperation(ctx, sha256Hash)
 }
 
 const (
@@ -720,6 +797,19 @@ func (o *OperationKit) Parse() error {
 	return nil
 }
 
+func (o *OperationKit) inlineArgumentsRunOptions() astnormalization.RunOptions {
+	return astnormalization.RunOptions{
+		SkipInlineArguments: o.parsedOperation.IsPersistedOperation && !o.kit.inlineArgumentsIncludePersisted,
+	}
+}
+
+func (o *OperationKit) collectInlineArguments(result *astnormalization.NormalizationResult) {
+	if result == nil || len(result.InlineArguments) == 0 {
+		return
+	}
+	o.parsedOperation.InlineArguments = slices.Clone(result.InlineArguments)
+}
+
 // NormalizeOperation normalizes the operation. After normalization the normalized representation of the operation
 // and variables is available. Also, the final operation ID is generated.
 func (o *OperationKit) NormalizeOperation(clientName string, isApq bool) (bool, error) {
@@ -738,16 +828,17 @@ func (o *OperationKit) normalizePersistedOperation(clientName string, isApq bool
 		// normalized operation was loaded from cache
 		return true, nil
 	}
-	skipIncludeNames := o.skipIncludeVariableNames()
+	skipIncludeNames := o.conditionalsVariableNames()
 
 	report := &operationreport.Report{}
 	o.kit.doc.Input.Variables = o.parsedOperation.Request.Variables
-	o.kit.staticNormalizer.NormalizeNamedOperation(o.kit.doc, o.operationProcessor.executor.ClientSchema, staticOperationName, report)
+	inlineArgsResult := o.kit.staticNormalizer.NormalizeNamedOperationWithResult(o.kit.doc, o.operationProcessor.executor.ClientSchema, staticOperationName, report, o.inlineArgumentsRunOptions())
 	if report.HasErrors() {
 		return false, &reportError{
 			report: report,
 		}
 	}
+	o.collectInlineArguments(inlineArgsResult)
 
 	// Print the operation with the original operation name
 	o.kit.doc.OperationDefinitions[o.operationDefinitionRef].Name = o.originalOperationNameRef
@@ -771,6 +862,9 @@ type NormalizationCacheEntry struct {
 	normalizedRepresentation string
 	operationType            string
 	operationDefinitionRef   int
+	inlineArguments          []astnormalization.InlineArgument
+
+	removedSkipIncludeVariableNames []string
 }
 
 type VariablesNormalizationCacheEntry struct {
@@ -813,7 +907,7 @@ type ComplexityCacheEntry struct {
 }
 
 func (o *OperationKit) normalizeNonPersistedOperation() (cached bool, err error) {
-	skipIncludeVariableNames := o.skipIncludeVariableNames()
+	skipIncludeVariableNames := o.conditionalsVariableNames()
 	cacheKey := o.normalizationCacheKey(skipIncludeVariableNames)
 	if o.cache != nil && o.cache.normalizationCache != nil {
 		entry, ok := o.cache.normalizationCache.Get(cacheKey)
@@ -821,11 +915,12 @@ func (o *OperationKit) normalizeNonPersistedOperation() (cached bool, err error)
 			o.parsedOperation.NormalizedRepresentation = entry.normalizedRepresentation
 			o.parsedOperation.Type = entry.operationType
 			o.parsedOperation.NormalizationCacheHit = true
+			o.parsedOperation.InlineArguments = entry.inlineArguments
 
-			// Remove skip/include variables because they come directly from the user.
-			// They were removed during normalization, but we did not cache variables,
-			// thus we have to do it every time.
-			for _, varName := range skipIncludeVariableNames {
+			// Variables are not cached, so the skip/include variables that normalization
+			// removed have to be stripped from the request variables on every hit. Dual-use
+			// variables are still declared in the cached operation and must be kept.
+			for _, varName := range entry.removedSkipIncludeVariableNames {
 				o.parsedOperation.Request.Variables = jsonparser.Delete(o.parsedOperation.Request.Variables, varName)
 			}
 
@@ -840,12 +935,13 @@ func (o *OperationKit) normalizeNonPersistedOperation() (cached bool, err error)
 	// normalize the operation
 	report := &operationreport.Report{}
 	o.kit.doc.Input.Variables = o.parsedOperation.Request.Variables
-	o.kit.staticNormalizer.NormalizeNamedOperation(o.kit.doc, o.operationProcessor.executor.ClientSchema, staticOperationName, report)
+	inlineArgsResult := o.kit.staticNormalizer.NormalizeNamedOperationWithResult(o.kit.doc, o.operationProcessor.executor.ClientSchema, staticOperationName, report, o.inlineArgumentsRunOptions())
 	if report.HasErrors() {
 		return false, &reportError{
 			report: report,
 		}
 	}
+	o.collectInlineArguments(inlineArgsResult)
 
 	// Normalization removed skip/include variables from the operation and variables. For example,
 	//
@@ -876,11 +972,22 @@ func (o *OperationKit) normalizeNonPersistedOperation() (cached bool, err error)
 	o.parsedOperation.NormalizedRepresentation = o.kit.normalizedOperation.String()
 
 	if o.cache != nil && o.cache.normalizationCache != nil {
-		// Do not cache variables because, because we allow different values of variables
+		// A skip/include variable that is no longer declared in the normalized operation
+		// was removed by the normalizer, along with its value.
+		var removedSkipIncludeVariableNames []string
+		for _, varName := range skipIncludeVariableNames {
+			if !o.kit.doc.OperationDefinitionHasVariableDefinition(o.operationDefinitionRef, varName) {
+				removedSkipIncludeVariableNames = append(removedSkipIncludeVariableNames, varName)
+			}
+		}
+
+		// Do not cache variables because we allow different values of variables
 		// for the same normalized entry cache.
 		entry := NormalizationCacheEntry{
-			normalizedRepresentation: o.parsedOperation.NormalizedRepresentation,
-			operationType:            o.parsedOperation.Type,
+			normalizedRepresentation:        o.parsedOperation.NormalizedRepresentation,
+			operationType:                   o.parsedOperation.Type,
+			inlineArguments:                 o.parsedOperation.InlineArguments,
+			removedSkipIncludeVariableNames: removedSkipIncludeVariableNames,
 		}
 		o.cache.normalizationCache.Set(cacheKey, entry, 1)
 	}
@@ -888,17 +995,17 @@ func (o *OperationKit) normalizeNonPersistedOperation() (cached bool, err error)
 	return false, nil
 }
 
+// setAndParseOperationDoc parses the normalized representation restored from an
+// operation cache. The original document already passed the parser limits in Parse.
+// Normalization inlines fragment spreads, so the normalized representation can exceed
+// those limits; applying them again here would reject an operation that was accepted
+// on its first request.
 func (o *OperationKit) setAndParseOperationDoc() error {
 	o.kit.doc.Reset()
 	o.kit.doc.Input.ResetInputString(o.parsedOperation.NormalizedRepresentation)
 	o.kit.doc.Input.Variables = o.parsedOperation.Request.Variables
 	report := &operationreport.Report{}
-	if _, err := o.kit.parser.ParseWithLimits(o.operationProcessor.parserTokenizerLimits, o.kit.doc, report); err != nil {
-		return &httpGraphqlError{
-			message:    err.Error(),
-			statusCode: http.StatusBadRequest,
-		}
-	}
+	o.kit.parser.Parse(o.kit.doc, report)
 	if report.HasErrors() {
 		return &reportError{
 			report: report,
@@ -1126,7 +1233,7 @@ func (o *OperationKit) loadPersistedOperationFromCache(clientName string) (ok bo
 		return false, false, nil
 	}
 
-	cacheKey, ok := o.loadPersistedOperationCacheKey(clientName, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, false)
+	cacheKey, ok := o.loadPersistedOperationCacheKey(clientName, false)
 	if !ok {
 		_, _ = o.cache.persistedOperationNormalizationCache.Get(0) // register cache miss
 		return false, false, nil
@@ -1141,7 +1248,7 @@ func (o *OperationKit) loadPersistedOperationFromCache(clientName string) (ok bo
 		return false, false, nil
 	}
 
-	if namedCacheKey, namedOk := o.loadPersistedOperationCacheKey(clientName, o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash, true); namedOk {
+	if namedCacheKey, namedOk := o.loadPersistedOperationCacheKey(clientName, true); namedOk {
 		if namedEntry, ok := o.cache.persistedOperationNormalizationCache.Get(namedCacheKey); ok {
 			return true, true, o.handleFoundPersistedOperationEntry(namedEntry)
 		}
@@ -1159,6 +1266,7 @@ func (o *OperationKit) handleFoundPersistedOperationEntry(entry NormalizationCac
 	o.parsedOperation.NormalizationCacheHit = true
 	o.parsedOperation.NormalizedRepresentation = entry.normalizedRepresentation
 	o.parsedOperation.Type = entry.operationType
+	o.parsedOperation.InlineArguments = entry.inlineArguments
 	// We will always only have a single operation definition in the document
 	// Because we removed the unused operations during normalization
 	o.operationDefinitionRef = 0
@@ -1195,12 +1303,11 @@ func (o *OperationKit) persistedOperationCacheKeyHasTtl(clientName string, inclu
 		return false, nil
 	}
 
-	o.cache.persistedOperationVariableNamesLock.RLock()
-	variableNames, present := o.cache.persistedOperationVariableNames[o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash]
-	o.cache.persistedOperationVariableNamesLock.RUnlock()
-	if !present {
-		return false, variableNames
+	entry, present := o.loadPersistedOperationVariableNames(clientName)
+	if !present || entry.manifestRevision != o.manifestRevision() {
+		return false, nil
 	}
+	variableNames := entry.names
 	cacheKey := o.generatePersistedOperationCacheKey(clientName, variableNames, includeOperationName)
 
 	ttl, ok := o.cache.persistedOperationNormalizationCache.GetTTL(cacheKey)
@@ -1213,6 +1320,7 @@ func (o *OperationKit) savePersistedOperationToCache(clientName string, isApq bo
 		normalizedRepresentation: o.parsedOperation.NormalizedRepresentation,
 		operationType:            o.parsedOperation.Type,
 		operationDefinitionRef:   o.operationDefinitionRef,
+		inlineArguments:          o.parsedOperation.InlineArguments,
 	}
 
 	if isApq {
@@ -1224,36 +1332,74 @@ func (o *OperationKit) savePersistedOperationToCache(clientName string, isApq bo
 	}
 
 	// This should be the final step to confirm the operation was successfully handled. We rely on this in isPersistedOperationAlreadyCached.
+	var buf [persistedOperationKeyBufferSize]byte
+	identity := o.appendPersistedOperationIdentity(buf[:0], clientName)
 	o.cache.persistedOperationVariableNamesLock.Lock()
-	o.cache.persistedOperationVariableNames[o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash] = skipIncludeVariableNames
+	o.cache.persistedOperationVariableNames[string(identity)] = persistedOperationVariableNames{
+		manifestRevision: o.manifestRevision(),
+		names:            skipIncludeVariableNames,
+	}
 	o.cache.persistedOperationVariableNamesLock.Unlock()
 }
 
-func (o *OperationKit) loadPersistedOperationCacheKey(clientName, persistedQuerySha256Hash string, includeOperationName bool) (key uint64, ok bool) {
-	o.cache.persistedOperationVariableNamesLock.RLock()
-	variableNames := o.cache.persistedOperationVariableNames[persistedQuerySha256Hash]
-	o.cache.persistedOperationVariableNamesLock.RUnlock()
+func (o *OperationKit) loadPersistedOperationCacheKey(clientName string, includeOperationName bool) (key uint64, ok bool) {
+	entry, present := o.loadPersistedOperationVariableNames(clientName)
+	// A reused ID can have different @skip/@include variables after a reload.
+	// An in-flight request may have written metadata from another revision, so
+	// only use variable names that match this request's captured manifest.
+	var variableNames []string
+	if present && entry.manifestRevision == o.manifestRevision() {
+		variableNames = entry.names
+	}
 	key = o.generatePersistedOperationCacheKey(clientName, variableNames, includeOperationName)
 	return key, true
 }
 
-func (o *OperationKit) generatePersistedOperationCacheKey(clientName string, skipIncludeVariableNames []string, includeOperationName bool) uint64 {
-	_, _ = o.kit.keyGen.WriteString(o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash)
-	if includeOperationName {
-		// If there are multiple operations in the document, we need to include the operation name in the cache key
-		_, _ = o.kit.keyGen.WriteString(o.parsedOperation.Request.OperationName)
+func (o *OperationKit) manifestRevision() string {
+	if o.persistedOperationManifest == nil {
+		return ""
 	}
-	manifestEnabled := o.operationProcessor.persistedOperationClient != nil &&
-		o.operationProcessor.persistedOperationClient.ManifestEnabled()
+	return o.persistedOperationManifest.Revision
+}
 
-	if !manifestEnabled {
-		// Non-manifest mode: include clientName since operations are per-client.
-		// Manifest mode: exclude clientName because manifest operations are global
-		// and the SHA256 hash already uniquely identifies the operation body.
-		// Cache entries persist across manifest reloads — removed operations are
-		// naturally evicted by the LRU.
-		_, _ = o.kit.keyGen.WriteString(clientName)
+// persistedOperationKeyBufferSize fits a manifest revision, a maximum-length custom
+// ID and typical client and operation names, so building keys doesn't allocate.
+const persistedOperationKeyBufferSize = 512
+
+func (o *OperationKit) loadPersistedOperationVariableNames(clientName string) (persistedOperationVariableNames, bool) {
+	var buf [persistedOperationKeyBufferSize]byte
+	identity := o.appendPersistedOperationIdentity(buf[:0], clientName)
+	o.cache.persistedOperationVariableNamesLock.RLock()
+	entry, present := o.cache.persistedOperationVariableNames[string(identity)]
+	o.cache.persistedOperationVariableNamesLock.RUnlock()
+	return entry, present
+}
+
+// Keep one metadata entry per scoped ID; its revision is checked before reuse.
+// Each component is length-prefixed so bytes can't shift between the ID and the
+// components written around it in the normalization cache key.
+func (o *OperationKit) appendPersistedOperationIdentity(dst []byte, clientName string) []byte {
+	id := o.parsedOperation.GraphQLRequestExtensions.PersistedQuery.Sha256Hash
+	if o.persistedOperationManifest != nil {
+		// Manifest operations are graph-wide, so their identity excludes clientName.
+		// The normalization cache key adds the captured manifest revision separately.
+		return appendLengthPrefixed(dst, id)
 	}
+	// Without a manifest, operations are per-client.
+	dst = appendLengthPrefixed(dst, clientName)
+	return appendLengthPrefixed(dst, id)
+}
+
+func (o *OperationKit) generatePersistedOperationCacheKey(clientName string, skipIncludeVariableNames []string, includeOperationName bool) uint64 {
+	name := ""
+	if includeOperationName {
+		name = o.parsedOperation.Request.OperationName
+	}
+	var buf [persistedOperationKeyBufferSize]byte
+	key := appendLengthPrefixed(buf[:0], o.manifestRevision())
+	key = o.appendPersistedOperationIdentity(key, clientName)
+	key = appendLengthPrefixed(key, name)
+	_, _ = o.kit.keyGen.Write(key)
 	o.writeSkipIncludeCacheKeyToKeyGen(skipIncludeVariableNames)
 	sum := o.kit.keyGen.Sum64()
 	o.kit.keyGen.Reset()
@@ -1287,51 +1433,82 @@ func (o *OperationKit) writeSkipIncludeCacheKeyToKeyGen(skipIncludeVariableNames
 	}
 }
 
-// Validate validates the operation variables.
-func (o *OperationKit) Validate(skipLoader bool, remapVariables map[string]string, apolloCompatibilityFlags *config.ApolloCompatibilityFlags) (cacheHit bool, err error) {
-	if !skipLoader {
-		// in case we're skipping the loader, it means that we won't execute the operation
-		// this means that we don't need to validate the variables as they are not used
-		// this is useful to return a query plan without having to provide variables
-		err = o.kit.variablesValidator.ValidateWithRemap(o.kit.doc, o.operationProcessor.executor.ClientSchema, o.kit.doc.Input.Variables, remapVariables)
-		if err != nil {
-			var invalidVarErr *variablesvalidation.InvalidVariableError
-			if errors.As(err, &invalidVarErr) {
-				graphqlErr := &httpGraphqlError{
-					extensionCode: invalidVarErr.ExtensionCode,
-					message:       invalidVarErr.Error(),
-					statusCode:    http.StatusOK,
-				}
-				if apolloCompatibilityFlags != nil && apolloCompatibilityFlags.ReplaceValidationErrorStatus.Enabled {
-					graphqlErr.statusCode = http.StatusBadRequest
-				}
-				return false, graphqlErr
+// operationValidationCacheKey returns the cache key used for the operation
+// (schema) validation result. It is keyed on the pre-extraction normalized
+// representation, which is deterministic for a given operation and independent
+// of the concrete variable values, so the cached validity is safe to reuse.
+func (o *OperationKit) operationValidationCacheKey() uint64 {
+	_, _ = o.kit.keyGen.WriteString(o.parsedOperation.NormalizedRepresentation)
+	sum := o.kit.keyGen.Sum64()
+	o.kit.keyGen.Reset()
+	return sum
+}
+
+// ValidateOperation runs full schema validation of the operation against the
+// client schema.
+//
+// It MUST run on the pre-extraction document, i.e. after NormalizeOperation but
+// before NormalizeVariables. Variable extraction serializes inline argument
+// literals into JSON variables which erases their GraphQL type: an enum literal
+// such as `hello` becomes the JSON string "hello" and would then wrongly
+// satisfy a String argument. Validating before extraction lets the
+// ValuesOfCorrectType rule reject such literals.
+func (o *OperationKit) ValidateOperation() (cacheHit bool, err error) {
+	var cacheKey uint64
+	useCache := o.cache != nil && o.cache.validationCache != nil
+	if useCache {
+		cacheKey = o.operationValidationCacheKey()
+		valid, ok := o.cache.validationCache.Get(cacheKey)
+		if ok {
+			cacheHit = true
+			if valid {
+				return cacheHit, nil
 			}
-			return false, &httpGraphqlError{
-				message:    err.Error(),
-				statusCode: http.StatusOK,
-			}
-		}
-	}
-	if o.cache != nil && o.cache.validationCache != nil {
-		var valid bool
-		valid, cacheHit = o.cache.validationCache.Get(o.parsedOperation.InternalID)
-		if valid {
-			return
 		}
 	}
 	report := &operationreport.Report{}
 	o.kit.operationValidator.Validate(o.kit.doc, o.operationProcessor.executor.ClientSchema, report)
-	if o.cache != nil && o.cache.validationCache != nil {
-		valid := !report.HasErrors()
-		o.cache.validationCache.Set(o.parsedOperation.InternalID, valid, 1)
+	if useCache {
+		o.cache.validationCache.Set(cacheKey, !report.HasErrors(), 1)
 	}
 	if report.HasErrors() {
 		return cacheHit, &reportError{
 			report: report,
 		}
 	}
-	return
+	return cacheHit, nil
+}
+
+// ValidateOperationVariables validates the operation variables. Schema validation
+// of the operation itself is performed separately by ValidateOperation, before
+// variable extraction.
+func (o *OperationKit) ValidateOperationVariables(skipLoader bool, remapVariables map[string]string, apolloCompatibilityFlags *config.ApolloCompatibilityFlags) error {
+	if skipLoader {
+		// in case we're skipping the loader, it means that we won't execute the operation
+		// this means that we don't need to validate the variables as they are not used
+		// this is useful to return a query plan without having to provide variables
+		return nil
+	}
+	err := o.kit.variablesValidator.ValidateWithRemap(o.kit.doc, o.operationProcessor.executor.ClientSchema, o.kit.doc.Input.Variables, remapVariables)
+	if err != nil {
+		var invalidVarErr *variablesvalidation.InvalidVariableError
+		if errors.As(err, &invalidVarErr) {
+			graphqlErr := &httpGraphqlError{
+				extensionCode: invalidVarErr.ExtensionCode,
+				message:       invalidVarErr.Error(),
+				statusCode:    http.StatusOK,
+			}
+			if apolloCompatibilityFlags != nil && apolloCompatibilityFlags.ReplaceValidationErrorStatus.Enabled {
+				graphqlErr.statusCode = http.StatusBadRequest
+			}
+			return graphqlErr
+		}
+		return &httpGraphqlError{
+			message:    err.Error(),
+			statusCode: http.StatusOK,
+		}
+	}
+	return nil
 }
 
 // ValidateQueryComplexity validates that the query complexity is within the limits set in the configuration
@@ -1355,7 +1532,7 @@ func (o *OperationKit) ValidateQueryComplexity() (ok bool, cacheEntry Complexity
 	globalComplexity, rootFieldStats := estimator.Do(o.kit.doc, o.operationProcessor.executor.ClientSchema, &report)
 	cacheResult := ComplexityCacheEntry{
 		Depth:       globalComplexity.Depth,
-		TotalFields: globalComplexity.NodeCount,
+		TotalFields: globalComplexity.FieldCount,
 	}
 	for _, entry := range rootFieldStats {
 		if entry.Alias == "" {
@@ -1396,7 +1573,7 @@ func (o *OperationKit) runComplexityComparisons(complexityLimitConfig *config.Co
 	}
 
 	for _, comparison := range testComparisons {
-		valid := comparison.field <= 0 || comparison.cachedField <= comparison.field
+		valid := comparison.field < 0 || comparison.cachedField <= comparison.field
 		if !valid {
 			return &httpGraphqlError{
 				message:    comparison.errorMessage,
@@ -1455,9 +1632,9 @@ var (
 	literalIF = []byte("if")
 )
 
-// skipIncludeVariableNames returns a slice of variable names that are used as arguments
+// conditionalsVariableNames returns a slice of variable names that are used as arguments
 // in the skip/include conditionals.
-func (o *OperationKit) skipIncludeVariableNames() []string {
+func (o *OperationKit) conditionalsVariableNames() []string {
 	if len(o.kit.doc.Directives) == 0 {
 		return nil
 	}
@@ -1465,7 +1642,7 @@ func (o *OperationKit) skipIncludeVariableNames() []string {
 	for i := range o.kit.doc.Directives {
 		name := o.kit.doc.DirectiveNameBytes(i)
 		switch string(name) {
-		case "skip", "include":
+		case "skip", "include", "defer", "stream":
 			if value, ok := o.kit.doc.DirectiveArgumentValueByName(i, literalIF); ok {
 				if value.Kind != ast.ValueKindVariable {
 					continue
@@ -1486,26 +1663,39 @@ func (o *OperationKit) skipIncludeVariableNames() []string {
 	return names
 }
 
+// appendLengthPrefixed appends "<len(s)>:<s>" to dst.
+func appendLengthPrefixed(dst []byte, s string) []byte {
+	dst = strconv.AppendInt(dst, int64(len(s)), 10)
+	dst = append(dst, ':')
+	return append(dst, s...)
+}
+
+func isCustomPersistedOperationIDChar(c byte) bool {
+	// IDs become <id>.json filenames. Exclude separators without normalizing
+	// otherwise valid printable ASCII, including spaces and periods.
+	return c >= 0x20 && c <= 0x7e && c != '/' && c != '\\'
+}
+
 type parseKitOptions struct {
 	apolloCompatibilityFlags                               config.ApolloCompatibilityFlags
 	apolloRouterCompatibilityFlags                         config.ApolloRouterCompatibilityFlags
 	disableExposingVariablesContentOnValidationError       bool
 	relaxSubgraphOperationFieldSelectionMergingNullability bool
+	allowStringLiteralsForEnums                            bool
+	enableDefer                                            bool
+	validateInlineArguments                                config.ValidateInlineArguments
 }
 
 func createParseKit(i int, options *parseKitOptions) *parseKit {
+	normalizationOptions := buildNormalizationOptions(options.enableDefer, options.validateInlineArguments)
+
 	return &parseKit{
-		i:          i,
-		parser:     astparser.NewParser(),
-		doc:        ast.NewSmallDocument(),
-		keyGen:     xxhash.New(),
-		sha256Hash: sha256.New(),
-		staticNormalizer: astnormalization.NewWithOpts(
-			astnormalization.WithRemoveNotMatchingOperationDefinitions(),
-			astnormalization.WithInlineFragmentSpreads(),
-			astnormalization.WithRemoveFragmentDefinitions(),
-			astnormalization.WithRemoveUnusedVariables(),
-		),
+		i:                   i,
+		parser:              astparser.NewParser(),
+		doc:                 ast.NewSmallDocument(),
+		keyGen:              xxhash.New(),
+		sha256Hash:          sha256.New(),
+		staticNormalizer:    astnormalization.NewWithOpts(normalizationOptions...),
 		variablesNormalizer: astnormalization.NewVariablesNormalizer(),
 		variablesRemapper:   astnormalization.NewVariablesMapper(),
 		printer:             &astprinter.Printer{},
@@ -1516,11 +1706,45 @@ func createParseKit(i int, options *parseKitOptions) *parseKit {
 			},
 			ApolloRouterCompatibilityFlags: apollocompatibility.ApolloRouterFlags{
 				ReplaceInvalidVarError: options.apolloRouterCompatibilityFlags.ReplaceInvalidVarErrors.Enabled,
+				SkipNullVariablesError: options.apolloRouterCompatibilityFlags.SkipNullVariablesError.Enabled,
 			},
 			DisableExposingVariablesContent: options.disableExposingVariablesContentOnValidationError,
 		}),
-		operationValidator: createOperationValidator(options),
+		inlineArgumentsIncludePersisted: options.validateInlineArguments.IncludePersistedOperations,
+		operationValidator:              createOperationValidator(options),
 	}
+}
+
+func buildNormalizationOptions(enableDefer bool, validateInlineArguments config.ValidateInlineArguments) []astnormalization.Option {
+	opts := []astnormalization.Option{
+		astnormalization.WithRemoveNotMatchingOperationDefinitions(),
+		astnormalization.WithInlineFragmentSpreads(),
+		astnormalization.WithRemoveFragmentDefinitions(),
+		astnormalization.WithRemoveUnusedVariables(),
+	}
+
+	if enableDefer {
+		opts = append(opts,
+			astnormalization.WithEnableDefer(),
+			astnormalization.WithPrevalidationRules(
+				astvalidation.DeferStreamOnValidOperations(),
+				astvalidation.DeferStreamHaveUniqueLabels(),
+				astvalidation.DirectivesAreInValidLocations(),
+				astvalidation.StreamAppliedToListFieldsOnly(),
+			),
+		)
+	}
+
+	if validateInlineArguments.Enabled() {
+		opts = append(opts, astnormalization.WithInlineArgumentsValidation(astnormalization.InlineArgumentsValidationOptions{
+			Enforce:      validateInlineArguments.Enforcing(),
+			ErrorMessage: validateInlineArguments.ErrorMessage,
+			ErrorCode:    validateInlineArguments.ErrorCode,
+			StatusCode:   validateInlineArguments.EnforceHTTPStatusCode,
+		}))
+	}
+
+	return opts
 }
 
 func createOperationValidator(options *parseKitOptions) *astvalidation.OperationValidator {
@@ -1532,6 +1756,9 @@ func createOperationValidator(options *parseKitOptions) *astvalidation.Operation
 	))
 	if options.relaxSubgraphOperationFieldSelectionMergingNullability {
 		opts = append(opts, astvalidation.WithRelaxFieldSelectionMergingNullability())
+	}
+	if options.allowStringLiteralsForEnums {
+		opts = append(opts, astvalidation.WithAllowStringLiteralsForEnums())
 	}
 	return astvalidation.DefaultOperationValidator(opts...)
 }
@@ -1552,10 +1779,13 @@ func NewOperationProcessor(opts OperationProcessorOptions) *OperationProcessor {
 		complexityLimits:         opts.ComplexityLimits,
 		costControl:              opts.CostControl,
 		parseKitOptions: &parseKitOptions{
+			enableDefer:                                            opts.EnableDefer,
 			apolloCompatibilityFlags:                               opts.ApolloCompatibilityFlags,
 			apolloRouterCompatibilityFlags:                         opts.ApolloRouterCompatibilityFlags,
 			disableExposingVariablesContentOnValidationError:       opts.DisableExposingVariablesContentOnValidationError,
 			relaxSubgraphOperationFieldSelectionMergingNullability: opts.RelaxSubgraphOperationFieldSelectionMergingNullability,
+			allowStringLiteralsForEnums:                            opts.AllowStringLiteralsForEnums,
+			validateInlineArguments:                                opts.ValidateInlineArguments,
 		},
 	}
 	for i := 0; i < opts.ParseKitPoolSize; i++ {
@@ -1575,7 +1805,7 @@ func NewOperationProcessor(opts OperationProcessorOptions) *OperationProcessor {
 	}
 	if opts.EnablePersistedOperationsCache {
 		processor.operationCache.automaticPersistedOperationCacheTtl = float64(opts.AutomaticPersistedOperationCacheTtl)
-		processor.operationCache.persistedOperationVariableNames = map[string][]string{}
+		processor.operationCache.persistedOperationVariableNames = map[string]persistedOperationVariableNames{}
 		processor.operationCache.persistedOperationVariableNamesLock = &sync.RWMutex{}
 		processor.operationCache.persistedOperationNormalizationCache = opts.PersistedOpsNormalizationCache
 	}
@@ -1624,10 +1854,4 @@ func (p *OperationProcessor) ReadBody(reader io.Reader, buf *bytes.Buffer) ([]by
 // limit.
 func (p *OperationProcessor) NewKit() (*OperationKit, error) {
 	return NewOperationKit(p), nil
-}
-
-// NewIndependentKit creates a new OperationKit which will not be pooled.
-// This is useful, e.g. for warming up the caches
-func (p *OperationProcessor) NewIndependentKit() (*OperationKit, error) {
-	return NewIndependentOperationKit(p), nil
 }

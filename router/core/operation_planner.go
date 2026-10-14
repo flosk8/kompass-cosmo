@@ -2,19 +2,21 @@ package core
 
 import (
 	"errors"
+	"slices"
 	"strconv"
 	"time"
 
 	"golang.org/x/sync/singleflight"
 
-	graphqlmetricsv1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/graphqlmetrics/v1"
-	"github.com/wundergraph/cosmo/router/pkg/graphqlschemausage"
-	"github.com/wundergraph/cosmo/router/pkg/slowplancache"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/astparser"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/postprocess"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
+
+	graphqlmetricsv1 "github.com/wundergraph/cosmo/router/gen/proto/wg/cosmo/graphqlmetrics/v1"
+	"github.com/wundergraph/cosmo/router/pkg/graphqlschemausage"
+	"github.com/wundergraph/cosmo/router/pkg/slowplancache"
 )
 
 type planWithMetaData struct {
@@ -81,16 +83,26 @@ func (p *OperationPlanner) planOperation(content string, name string, includeQue
 		return nil, err
 	}
 
-	var preparedPlan plan.Plan
+	var (
+		plannerOptions []plan.Opts
+	)
+
 	if includeQueryPlan {
-		preparedPlan = planner.Plan(&doc, p.executor.RouterSchema, name, &report, plan.IncludeQueryPlanInResponse())
-	} else {
-		preparedPlan = planner.Plan(&doc, p.executor.RouterSchema, name, &report)
+		plannerOptions = append(plannerOptions, plan.IncludeQueryPlanInResponse())
 	}
+
+	// create the raw query plan
+	// Note: planning uses the router schema as it needs access to all fields (including inaccessible), validation/introspection uses client schema
+	preparedPlan := planner.Plan(&doc, p.executor.RouterSchema, name, &report, plannerOptions...)
 	if report.HasErrors() {
 		return nil, &reportError{report: &report}
 	}
-	post := postprocess.NewProcessor(postprocess.CollectDataSourceInfo())
+
+	// postprocess query plan to get its final state
+	post := postprocess.NewProcessor(append(
+		slices.Clone(p.executor.PostprocessorOptions),
+		postprocess.CollectDataSourceInfo(),
+	)...)
 	post.Process(preparedPlan)
 
 	return &planWithMetaData{
@@ -177,7 +189,7 @@ func (p *OperationPlanner) plan(opContext *operationContext, options PlanOptions
 		// prepare a new plan using single flight
 		// this ensures that we only prepare the plan once for this operation ID
 		operationIDStr := strconv.FormatUint(operationID, 10)
-		sharedPreparedPlan, err, _ := p.sf.Do(operationIDStr, func() (interface{}, error) {
+		sharedPreparedPlan, err, _ := p.sf.Do(operationIDStr, func() (any, error) {
 			start := time.Now()
 			prepared, err := p.preparePlan(opContext, operationPlannerOpts{operationContent: p.slowPlanCache != nil})
 			if err != nil {

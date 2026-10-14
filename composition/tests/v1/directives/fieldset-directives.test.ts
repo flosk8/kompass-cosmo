@@ -11,7 +11,6 @@ import {
   INTERFACE,
   invalidDirectiveError,
   invalidInlineFragmentTypeConditionErrorMessage,
-  invalidInlineFragmentTypeErrorMessage,
   invalidProvidesOrRequiresDirectivesError,
   invalidSelectionOnUnionErrorMessage,
   invalidSelectionSetDefinitionErrorMessage,
@@ -383,7 +382,8 @@ describe('openfed_FieldSet tests', () => {
       expect(errors).toHaveLength(1);
       expect(errors[0]).toStrictEqual(
         invalidProvidesOrRequiresDirectivesError(REQUIRES, [
-          ` On field "Entity.age":\n -` + invalidInlineFragmentTypeErrorMessage('... on I { name }', [], 'I', 'Entity'),
+          ` On field "Entity.age":\n -` +
+            invalidInlineFragmentTypeConditionErrorMessage('... on I { name }', [], 'I', OBJECT, 'Entity', INTERFACE),
         ]),
       );
       expect(warnings).toHaveLength(0);
@@ -479,6 +479,7 @@ describe('openfed_FieldSet tests', () => {
               OBJECT,
               INTERFACE,
               'I',
+              OBJECT,
             ),
         ]),
       );
@@ -539,6 +540,7 @@ describe('openfed_FieldSet tests', () => {
               'AnotherObject',
               UNION,
               'U',
+              OBJECT,
             ),
         ]),
       );
@@ -745,16 +747,15 @@ describe('openfed_FieldSet tests', () => {
         nonExternalConditionalFieldWarning('Entity.name', naaaa.name, 'Entity.__typename', '__typename', REQUIRES),
       );
       expect(schemaToSortedNormalizedString(schema)).toBe(
-        normalizeString(
-          KEY_DIRECTIVE +
-            REQUIRES_DIRECTIVE +
-            `
+        normalizeString(`
+          ${KEY_DIRECTIVE}
+          ${REQUIRES_DIRECTIVE}
           type Entity @key(fields: "id") {
             id: ID!
             name: String! @requires(fields: "__typename")
-          }` +
-            OPENFED_FIELD_SET,
-        ),
+          }
+          ${OPENFED_FIELD_SET}
+        `),
       );
       expect(configurationDataByTypeName).toStrictEqual(
         new Map<TypeName, ConfigurationData>([

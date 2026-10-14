@@ -27,7 +27,6 @@ import (
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasource/introspection_datasource"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/postprocess"
-	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/resolve"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/operationreport"
 )
 
@@ -40,16 +39,26 @@ func (e *PlannerOperationValidationError) Error() string {
 }
 
 type PlanGenerator struct {
-	planConfiguration *plan.Configuration
-	clientDefinition  *ast.Document
-	definition        *ast.Document
+	planConfiguration    *plan.Configuration
+	clientDefinition     *ast.Document
+	definition           *ast.Document
+	postprocessorOptions []postprocess.ProcessorOption
+}
+
+type PlanGeneratorOptions struct {
+	// MaxDataSourceCollectorsConcurrency limits the number of concurrent data source
+	// collectors during planning. Zero means no limit.
+	MaxDataSourceCollectorsConcurrency uint
+	EnableMultiFetch                   bool
+	EnableScheduleFetches              bool
 }
 
 type Planner struct {
-	planner            *plan.Planner
-	definition         *ast.Document
-	clientDefinition   *ast.Document
-	operationValidator *astvalidation.OperationValidator
+	planner              *plan.Planner
+	definition           *ast.Document
+	clientDefinition     *ast.Document
+	operationValidator   *astvalidation.OperationValidator
+	postprocessorOptions []postprocess.ProcessorOption
 }
 
 type OperationTimes struct {
@@ -80,16 +89,17 @@ const (
 	PlanOutputFormatJSON  PlanOutputFormat = "json"
 )
 
-func NewPlanner(planConfiguration *plan.Configuration, definition *ast.Document, clientDefinition *ast.Document) (*Planner, error) {
+func NewPlanner(planConfiguration *plan.Configuration, definition *ast.Document, clientDefinition *ast.Document, postprocessorOptions ...postprocess.ProcessorOption) (*Planner, error) {
 	planner, err := plan.NewPlanner(*planConfiguration)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create planner: %w", err)
 	}
 
 	return &Planner{
-		planner:          planner,
-		definition:       definition,
-		clientDefinition: clientDefinition,
+		planner:              planner,
+		definition:           definition,
+		clientDefinition:     clientDefinition,
+		postprocessorOptions: postprocessorOptions,
 	}, nil
 }
 
@@ -110,7 +120,7 @@ func (pl *Planner) PlanOperation(operationFilePath string, outputFormat PlanOutp
 	case PlanOutputFormatText:
 		return rawPlan.PrettyPrint(), opTimes, nil
 	case PlanOutputFormatJSON:
-		marshal, err := json.Marshal(rawPlan)
+		marshal, err := rawPlan.Marshal()
 		if err != nil {
 			return "", opTimes, fmt.Errorf("failed to marshal raw plan: %w", err)
 		}
@@ -148,6 +158,9 @@ func (pl *Planner) PrepareOperation(operation *ast.Document) (*ast.Document, Ope
 	opTimes := OperationTimes{}
 
 	start := time.Now()
+	// Normalize WITHOUT variable extraction first, so schema validation still sees the
+	// original inline argument literals. Extraction serializes them into JSON variables,
+	// erasing their GraphQL type and hiding invalid-type literals.
 	err := pl.normalizeOperation(operation, operationName)
 	opTimes.NormalizeTime = time.Since(start)
 	if err != nil {
@@ -157,6 +170,14 @@ func (pl *Planner) PrepareOperation(operation *ast.Document) (*ast.Document, Ope
 	start = time.Now()
 	err = pl.validateOperation(operation)
 	opTimes.ValidateTime = time.Since(start)
+	if err != nil {
+		return nil, opTimes, &PlannerOperationValidationError{err: err}
+	}
+
+	// Extract and remap variables only after validation has passed.
+	start = time.Now()
+	err = pl.extractAndRemapVariables(operation, operationName)
+	opTimes.NormalizeTime += time.Since(start)
 	if err != nil {
 		return nil, opTimes, &PlannerOperationValidationError{err: err}
 	}
@@ -175,28 +196,88 @@ func (pl *Planner) normalizeOperation(operation *ast.Document, operationName []b
 
 	normalizer := astnormalization.NewWithOpts(
 		astnormalization.WithRemoveNotMatchingOperationDefinitions(),
-		astnormalization.WithExtractVariables(),
 		astnormalization.WithRemoveFragmentDefinitions(),
 		astnormalization.WithInlineFragmentSpreads(),
 		astnormalization.WithRemoveUnusedVariables(),
 		astnormalization.WithIgnoreSkipInclude(),
+		astnormalization.WithEnableDefer(),
+		astnormalization.WithPrevalidationRules(
+			astvalidation.DeferStreamOnValidOperations(),
+			astvalidation.DeferStreamHaveUniqueLabels(),
+			astvalidation.DirectivesAreInValidLocations(),
+			astvalidation.StreamAppliedToListFieldsOnly()),
 	)
 	normalizer.NormalizeNamedOperation(operation, pl.definition, operationName, &report)
 	if report.HasErrors() {
-		return report
-	}
-
-	remapper := astnormalization.NewVariablesMapper()
-	remapper.NormalizeOperation(operation, pl.definition, &report)
-	if report.HasErrors() {
-		return report
+		return &report
 	}
 
 	return nil
 }
 
+// extractAndRemapVariables extracts inline argument values into variables and remaps
+// variable names. It runs after validateOperation so that schema validation observes the
+// original inline literals rather than the JSON variables they would be serialized into.
+func (pl *Planner) extractAndRemapVariables(operation *ast.Document, operationName []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic during variable extraction: %v", r)
+		}
+	}()
+
+	report := operationreport.Report{}
+
+	normalizer := astnormalization.NewWithOpts(
+		astnormalization.WithExtractVariables(),
+	)
+	normalizer.NormalizeNamedOperation(operation, pl.definition, operationName, &report)
+	if report.HasErrors() {
+		return &report
+	}
+
+	remapper := astnormalization.NewVariablesMapper()
+	remapper.NormalizeOperation(operation, pl.definition, &report)
+	if report.HasErrors() {
+		return &report
+	}
+
+	return nil
+}
+
+type PlanWrapper struct {
+	Plan plan.Plan
+}
+
+func (p *PlanWrapper) PrettyPrint() string {
+	switch p := p.Plan.(type) {
+	case *plan.SynchronousResponsePlan:
+
+		return p.Response.Fetches.QueryPlan().PrettyPrint()
+	case *plan.SubscriptionResponsePlan:
+		return p.Response.Response.Fetches.QueryPlan().PrettyPrint()
+	case *plan.DeferResponsePlan:
+		return p.Response.QueryPlanString()
+	}
+
+	return ""
+}
+
+func (p *PlanWrapper) Marshal() ([]byte, error) {
+	switch p := p.Plan.(type) {
+	case *plan.SynchronousResponsePlan:
+
+		return json.Marshal(p.Response.Fetches.QueryPlan())
+	case *plan.SubscriptionResponsePlan:
+		return json.Marshal(p.Response.Response.Fetches.QueryPlan())
+	case *plan.DeferResponsePlan:
+		return nil, errors.New("defer marshal unsupported yet")
+	}
+
+	return nil, nil
+}
+
 // PlanPreparedOperation creates a query plan from a normalized and validated operation
-func (pl *Planner) PlanPreparedOperation(operation *ast.Document) (planNode *resolve.FetchTreeQueryPlanNode, opTimes OperationTimes, err error) {
+func (pl *Planner) PlanPreparedOperation(operation *ast.Document) (planNode *PlanWrapper, opTimes OperationTimes, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic during plan generation: %v", r)
@@ -219,19 +300,12 @@ func (pl *Planner) PlanPreparedOperation(operation *ast.Document) (planNode *res
 		return nil, opTimes, errors.New(report.Error())
 	}
 
-	post := postprocess.NewProcessor()
+	post := postprocess.NewProcessor(pl.postprocessorOptions...)
 	post.Process(preparedPlan)
 	// measure postprocessing time as part of planning time
 	opTimes.PlanTime = time.Since(start)
 
-	switch p := preparedPlan.(type) {
-	case *plan.SynchronousResponsePlan:
-		return p.Response.Fetches.QueryPlan(), opTimes, nil
-	case *plan.SubscriptionResponsePlan:
-		return p.Response.Response.Fetches.QueryPlan(), opTimes, nil
-	}
-
-	return &resolve.FetchTreeQueryPlanNode{}, opTimes, nil
+	return &PlanWrapper{preparedPlan}, opTimes, nil
 }
 
 func (pl *Planner) validateOperation(operation *ast.Document) (err error) {
@@ -246,7 +320,7 @@ func (pl *Planner) validateOperation(operation *ast.Document) (err error) {
 	report := operationreport.Report{}
 	pl.operationValidator.Validate(operation, pl.clientDefinition, &report)
 	if report.HasErrors() {
-		return report
+		return &report
 	}
 
 	return nil
@@ -266,7 +340,7 @@ func (pl *Planner) parseOperation(operationFilePath string) (*ast.Document, erro
 	return &doc, nil
 }
 
-func NewPlanGenerator(configFilePath string, logger *zap.Logger, maxDataSourceCollectorsConcurrency uint) (*PlanGenerator, error) {
+func NewPlanGenerator(configFilePath string, logger *zap.Logger, opts PlanGeneratorOptions) (*PlanGenerator, error) {
 	pg := &PlanGenerator{}
 	routerConfig, err := pg.buildRouterConfig(configFilePath)
 	if err != nil {
@@ -276,7 +350,7 @@ func NewPlanGenerator(configFilePath string, logger *zap.Logger, maxDataSourceCo
 	if err := pg.loadConfiguration(
 		routerConfig,
 		logger,
-		maxDataSourceCollectorsConcurrency,
+		opts,
 	); err != nil {
 		return nil, err
 	}
@@ -284,9 +358,9 @@ func NewPlanGenerator(configFilePath string, logger *zap.Logger, maxDataSourceCo
 	return pg, nil
 }
 
-func NewPlanGeneratorFromConfig(config *nodev1.RouterConfig, logger *zap.Logger, maxDataSourceCollectorsConcurrency uint) (*PlanGenerator, error) {
+func NewPlanGeneratorFromConfig(config *nodev1.RouterConfig, logger *zap.Logger, opts PlanGeneratorOptions) (*PlanGenerator, error) {
 	pg := &PlanGenerator{}
-	if err := pg.loadConfiguration(config, logger, maxDataSourceCollectorsConcurrency); err != nil {
+	if err := pg.loadConfiguration(config, logger, opts); err != nil {
 		return nil, err
 	}
 
@@ -294,7 +368,7 @@ func NewPlanGeneratorFromConfig(config *nodev1.RouterConfig, logger *zap.Logger,
 }
 
 func (pg *PlanGenerator) GetPlanner() (*Planner, error) {
-	return NewPlanner(pg.planConfiguration, pg.definition, pg.clientDefinition)
+	return NewPlanner(pg.planConfiguration, pg.definition, pg.clientDefinition, pg.postprocessorOptions...)
 }
 
 func (pg *PlanGenerator) buildRouterConfig(configFilePath string) (*nodev1.RouterConfig, error) {
@@ -306,9 +380,19 @@ func (pg *PlanGenerator) buildRouterConfig(configFilePath string) (*nodev1.Route
 	return routerConfig, nil
 }
 
-func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, logger *zap.Logger, maxDataSourceCollectorsConcurrency uint) error {
+func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, logger *zap.Logger, opts PlanGeneratorOptions) error {
 	routerEngineConfig := RouterEngineConfiguration{
 		StreamMetricStore: metric.NewNoopStreamMetricStore(),
+	}
+	// EnableMultiFetch has to be known at planning time, the planner records the subgraph
+	// operation artifacts the postprocessor's multi-fetch merge stage consumes.
+	routerEngineConfig.Execution.EnableMultiFetch = opts.EnableMultiFetch
+
+	if opts.EnableMultiFetch {
+		pg.postprocessorOptions = append(pg.postprocessorOptions, postprocess.EnableMultiFetch())
+	}
+	if opts.EnableScheduleFetches {
+		pg.postprocessorOptions = append(pg.postprocessorOptions, postprocess.EnableScheduleFetches())
 	}
 	natSources := map[string]*nats.ProviderAdapter{}
 	kafkaSources := map[string]*kafka.ProviderAdapter{}
@@ -370,7 +454,7 @@ func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, lo
 		DatasourceVisitor:             false,
 	}
 
-	planConfig.MaxDataSourceCollectorsConcurrency = maxDataSourceCollectorsConcurrency
+	planConfig.MaxDataSourceCollectorsConcurrency = opts.MaxDataSourceCollectorsConcurrency
 
 	if logger != nil {
 		planConfig.Logger = log.NewZapLogger(logger, log.DebugLevel)
@@ -380,7 +464,7 @@ func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, lo
 	// this is the GraphQL Schema that we will expose from our API
 	definition, report := astparser.ParseGraphqlDocumentString(routerConfig.EngineConfig.GraphqlSchema)
 	if report.HasErrors() {
-		return fmt.Errorf("failed to parse graphql schema from engine config: %w", report)
+		return fmt.Errorf("failed to parse graphql schema from engine config: %w", &report)
 	}
 
 	// we need to merge the base schema, it contains the __schema and __type queries
@@ -394,7 +478,7 @@ func (pg *PlanGenerator) loadConfiguration(routerConfig *nodev1.RouterConfig, lo
 	if clientSchemaStr := routerConfig.GetEngineConfig().GetGraphqlClientSchema(); clientSchemaStr != "" {
 		clientSchema, report := astparser.ParseGraphqlDocumentString(clientSchemaStr)
 		if report.HasErrors() {
-			return fmt.Errorf("failed to parse graphql client schema from engine config: %w", report)
+			return fmt.Errorf("failed to parse graphql client schema from engine config: %w", &report)
 		}
 		err = asttransform.MergeDefinitionWithBaseSchema(&clientSchema)
 		if err != nil {

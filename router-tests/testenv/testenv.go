@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -80,6 +81,10 @@ const (
 	myRedisProviderID     = "my-redis"
 )
 
+// Handler defines what is run inside the test environment.
+// It is provided to testenv.Run and executed inside it.
+type Handler func(t *testing.T, xEnv *Environment)
+
 var (
 	//go:embed testdata/config.json
 	ConfigJSONTemplate string
@@ -95,6 +100,9 @@ var (
 	ConfigWithPluginsJSONTemplate string
 	//go:embed testdata/configWithGRPC.json
 	ConfigWithGRPCJSONTemplate string
+
+	//go:embed testdata/natsSubscriptionFilter.json
+	NatsSubscriptionFilterJSONTemplate string
 
 	// routerTestsDir is the absolute path to the router-tests directory,
 	// derived from this source file's location. Used internally by testexec.go
@@ -114,7 +122,7 @@ func init() {
 }
 
 // Run runs the test and fails the test if an error occurs
-func Run(t *testing.T, cfg *Config, f func(t *testing.T, xEnv *Environment)) {
+func Run(t *testing.T, cfg *Config, f Handler) {
 	t.Helper()
 	env, err := CreateTestEnv(t, cfg)
 	if env != nil {
@@ -290,11 +298,17 @@ type MetricOptions struct {
 	PrometheusEngineStatsOptions          EngineStatOptions
 	PrometheusSchemaFieldUsage            PrometheusSchemaFieldUsage
 	EnableOTLPConnectionMetrics           bool
+	EnableOTLPNetworkMetrics              bool
+	EnableOTLPResolverMetrics             bool
 	EnableOTLPCircuitBreakerMetrics       bool
 	EnableOTLPStreamMetrics               bool
 	EnablePrometheusConnectionMetrics     bool
+	EnablePrometheusNetworkMetrics        bool
+	EnablePrometheusResolverMetrics       bool
 	EnablePrometheusCircuitBreakerMetrics bool
 	EnablePrometheusStreamMetrics         bool
+	EnableOTLPResponseCacheMetrics        bool
+	EnablePrometheusResponseCacheMetrics  bool
 	LogExporter                           MetricsLogExporterOptions
 	OTLPCostStats                         config.CostStats
 	PrometheusCostStats                   config.CostStats
@@ -1378,6 +1392,10 @@ func configureRouter(ctx context.Context, listenerAddr string, testConfig *Confi
 		EnableInboundRequestDeduplication: false,
 		EnableRequestTracing:              true,
 		EnableNormalizationCache:          true,
+		EnableDefer:                       true,
+		EnableMultiFetch:                  true,
+		EnableScheduleFetches:             true,
+		EnableGRPCWireEncoding:            true,
 		NormalizationCacheSize:            1024,
 		Debug: config.EngineDebugConfiguration{
 			ReportWebSocketConnections: true,
@@ -1634,7 +1652,10 @@ func configureRouter(ctx context.Context, listenerAddr string, testConfig *Confi
 			Path:            "/metrics",
 			TestRegistry:    testConfig.PrometheusRegistry,
 			GraphqlCache:    testConfig.MetricOptions.EnablePrometheusRouterCache,
+			ResponseCache:   testConfig.MetricOptions.EnablePrometheusResponseCacheMetrics,
 			ConnectionStats: testConfig.MetricOptions.EnablePrometheusConnectionMetrics,
+			NetworkStats:    testConfig.MetricOptions.EnablePrometheusNetworkMetrics,
+			ResolverStats:   testConfig.MetricOptions.EnablePrometheusResolverMetrics,
 			EngineStats: rmetric.EngineStatsConfig{
 				Subscription: testConfig.MetricOptions.PrometheusEngineStatsOptions.EnableSubscription,
 			},
@@ -1663,8 +1684,11 @@ func configureRouter(ctx context.Context, listenerAddr string, testConfig *Confi
 					ExemplarFilter:  testConfig.MetricOptions.OTLPExemplarFilter,
 					RouterRuntime:   testConfig.MetricOptions.EnableRuntimeMetrics,
 					GraphqlCache:    testConfig.MetricOptions.EnableOTLPRouterCache,
+					ResponseCache:   testConfig.MetricOptions.EnableOTLPResponseCacheMetrics,
 					Streams:         testConfig.MetricOptions.EnableOTLPStreamMetrics,
 					ConnectionStats: testConfig.MetricOptions.EnableOTLPConnectionMetrics,
+					Network:         config.TelemetryCategory{Enabled: testConfig.MetricOptions.EnableOTLPNetworkMetrics},
+					Resolver:        config.TelemetryCategory{Enabled: testConfig.MetricOptions.EnableOTLPResolverMetrics},
 					EngineStats: config.EngineStats{
 						Subscriptions: testConfig.MetricOptions.OTLPEngineStatsOptions.EnableSubscription,
 					},
@@ -1814,8 +1838,11 @@ func SetupCDNServer(t testing.TB) (cdnServer *httptest.Server, port int) {
 	baseCdnFile := filepath.Join(path.Dir(filePath), "testdata", "cdn")
 	cdnFileServer := http.FileServer(http.Dir(baseCdnFile))
 	var cdnRequestLog []string
+	var cdnRequestLogMu sync.Mutex
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
+			cdnRequestLogMu.Lock()
+			defer cdnRequestLogMu.Unlock()
 			requestLog, err := json.Marshal(cdnRequestLog)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1830,7 +1857,9 @@ func SetupCDNServer(t testing.TB) (cdnServer *httptest.Server, port int) {
 			return
 		}
 
+		cdnRequestLogMu.Lock()
 		cdnRequestLog = append(cdnRequestLog, r.Method+" "+r.URL.Path)
+		cdnRequestLogMu.Unlock()
 		// Ensure we have an authorization header with a valid token
 		authorization := r.Header.Get("Authorization")
 		token, ok := strings.CutPrefix(authorization, "Bearer ")
@@ -2027,12 +2056,13 @@ func (e *Environment) Shutdown() {
 		}
 	}
 
-	// Flush Kafka connection
+	// Flush Kafka connection and close client
 	if e.cfg.EnableKafka && e.KafkaClient != nil {
 		err := e.KafkaClient.Flush(ctx)
 		if err != nil {
 			e.t.Logf("could not flush Kafka connection: %s", err)
 		}
+		e.KafkaClient.Close()
 	}
 
 	if e.routerCmd != nil {
@@ -2303,15 +2333,16 @@ func (e *Environment) MakeGraphQLRequestAsMultipartForm(request GraphQLRequest) 
 	formValues["operations"] = bytes.NewReader(data)
 
 	if len(request.Files) > 0 {
-		mapStr := `{`
+		var mapStr strings.Builder
+		mapStr.WriteString(`{`)
 		for i := 0; i < len(request.Files); i++ {
 			if i > 0 {
-				mapStr += ", "
+				mapStr.WriteString(", ")
 			}
-			mapStr += fmt.Sprintf(`"%d": ["%s"]`, i, request.Files[i].VariablesPath)
+			fmt.Fprintf(&mapStr, `"%d": ["%s"]`, i, request.Files[i].VariablesPath)
 		}
-		mapStr += `}`
-		formValues["map"] = strings.NewReader(mapStr)
+		mapStr.WriteString(`}`)
+		formValues["map"] = strings.NewReader(mapStr.String())
 		for i := 0; i < len(request.Files); i++ {
 			formValues[fmt.Sprintf("%d", i)] = bytes.NewReader(request.Files[i].FileContent)
 		}
@@ -2421,10 +2452,21 @@ func (e *Environment) MakeGraphQLMultipartRequest(method string, body io.Reader)
 	return req
 }
 
+func (e *Environment) MakeGraphQLDeferRequest(method string, body io.Reader) *http.Request {
+	req, err := http.NewRequest(method, e.GraphQLRequestURL(), body)
+	require.NoError(e.t, err)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "multipart/mixed")
+	req.Header.Set("Connection", "keep-alive")
+
+	return req
+}
+
 func (e *Environment) GraphQLWebSocketSubscriptionURL() string {
 	u, err := url.Parse(e.GraphQLRequestURL())
 	require.NoError(e.t, err)
-	u.Scheme = "ws"
+	u.Scheme = websocketScheme(u.Scheme)
 	return u.String()
 }
 
@@ -2433,8 +2475,31 @@ func (e *Environment) AbsintheSubscriptionURL() string {
 	require.NoError(e.t, err)
 	u, err := url.Parse(joined)
 	require.NoError(e.t, err)
-	u.Scheme = "ws"
+	u.Scheme = websocketScheme(u.Scheme)
 	return u.String()
+}
+
+// websocketScheme maps the router's HTTP scheme to the matching WebSocket
+// scheme so that a TLS-enabled router (https) is dialed over wss.
+func websocketScheme(httpScheme string) string {
+	if httpScheme == "https" {
+		return "wss"
+	}
+	return "ws"
+}
+
+// websocketTLSClientConfig returns a tls.Config trusting the router's test
+// certificate when TLS is enabled, or nil otherwise. It lets the WebSocket
+// dialers reach a wss endpoint using the self-signed testdata certs.
+func (e *Environment) websocketTLSClientConfig() *tls.Config {
+	if !e.cfg.TLSConfig.Server.Enabled {
+		return nil
+	}
+	caCert, err := os.ReadFile(e.cfg.TLSConfig.Server.CertFile)
+	require.NoError(e.t, err)
+	caCertPool := x509.NewCertPool()
+	require.True(e.t, caCertPool.AppendCertsFromPEM(caCert), "could not append ca cert to pool")
+	return &tls.Config{RootCAs: caCertPool}
 }
 
 func (e *Environment) GraphQLServeSentEventsURL() string {
@@ -2466,14 +2531,15 @@ type GraphQLErrorExtensions struct {
 type GraphQLError struct {
 	Message    string                 `json:"message"`
 	Path       []any                  `json:"path,omitempty"`
-	Extensions GraphQLErrorExtensions `json:"extensions,omitempty"`
+	Extensions GraphQLErrorExtensions `json:"extensions"`
 }
 
 const maxSocketRetries = 5
 
 func (e *Environment) GraphQLWebsocketDialWithRetry(header http.Header, query url.Values) (*websocket.Conn, *http.Response, error) {
 	dialer := websocket.Dialer{
-		Subprotocols: []string{"graphql-transport-ws"},
+		Subprotocols:    []string{"graphql-transport-ws"},
+		TLSClientConfig: e.websocketTLSClientConfig(),
 	}
 
 	waitBetweenRetriesInMs := rand.Intn(10)
@@ -2593,8 +2659,8 @@ func (e *Environment) ReadSSE(ctx context.Context, body io.ReadCloser, handler f
 			}
 
 			// SSE lines typically start with "event", "data", etc.
-			if strings.HasPrefix(line, "data: ") {
-				data := strings.TrimPrefix(line, "data: ")
+			if after, ok := strings.CutPrefix(line, "data: "); ok {
+				data := after
 				handler(data)
 			}
 		}
@@ -2604,6 +2670,7 @@ func (e *Environment) ReadSSE(ctx context.Context, body io.ReadCloser, handler f
 func (e *Environment) AbsintheWebsocketDialWithRetry(header http.Header) (*websocket.Conn, *http.Response, error) {
 	dialer := websocket.Dialer{
 		// Subprotocols: []string{"absinthe"}, explicitly removed as this needs to be added by the absinthe handler
+		TLSClientConfig: e.websocketTLSClientConfig(),
 	}
 
 	waitBetweenRetriesInMs := rand.Intn(10)
@@ -2611,7 +2678,7 @@ func (e *Environment) AbsintheWebsocketDialWithRetry(header http.Header) (*webso
 
 	var err error
 
-	for i := 0; i < maxSocketRetries; i++ {
+	for i := range maxSocketRetries {
 		u := e.AbsintheSubscriptionURL()
 
 		conn, resp, err := dialer.Dial(u, header)
@@ -3037,7 +3104,7 @@ func ReadSSEField(t testing.TB, reader *bufio.Reader) string {
 	}
 }
 
-func WSReadJSON(t testing.TB, conn *websocket.Conn, v interface{}) (err error) {
+func WSReadJSON(t testing.TB, conn *websocket.Conn, v any) (err error) {
 	t.Helper()
 
 	b := backoff.New(5*time.Second, 100*time.Millisecond)
@@ -3125,7 +3192,7 @@ func WSWriteMessage(t testing.TB, conn *websocket.Conn, messageType int, data []
 	return fmt.Errorf("failed to write message to WebSocket: %w", err)
 }
 
-func WSWriteJSON(t testing.TB, conn *websocket.Conn, v interface{}) (err error) {
+func WSWriteJSON(t testing.TB, conn *websocket.Conn, v any) (err error) {
 	b := backoff.New(5*time.Second, 100*time.Millisecond)
 
 	attempts := 0

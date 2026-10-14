@@ -1,4 +1,5 @@
 import { useApplyParams } from '@/components/analytics/use-apply-params';
+import { useParams } from 'next/navigation';
 import { useDateRangeQueryState } from '@/components/analytics/useAnalyticsQueryState';
 import { getCheckIcon } from '@/components/check-badge-icon';
 import { DatePickerWithRange, DateRangePickerChangeHandler } from '@/components/date-picker-with-range';
@@ -24,36 +25,39 @@ import { getCompositions } from '@wundergraph/cosmo-connect/dist/platform/v1/pla
 import { formatDistanceToNow, formatISO } from 'date-fns';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
+import { usePaginationParams } from '@/hooks/use-pagination-params';
 import { MdNearbyError, MdVerifiedUser } from 'react-icons/md';
 import { useWorkspace } from '@/hooks/use-workspace';
+import { useFeature } from '@/hooks/use-feature';
 
 const CompositionsPage: NextPageWithLayout = () => {
   const router = useRouter();
-  const pageNumber = router.query.page ? parseInt(router.query.page as string) : 1;
+  const { pageNumber, pageSize: limit, offset } = usePaginationParams();
 
-  const limit = Number.parseInt((router.query.pageSize as string) || '10');
   const {
     namespace: { name: namespace },
   } = useWorkspace();
+  const { slug: graphName } = useParams<{ slug: string }>();
 
   const {
     dateRange: { start, end },
     range,
   } = useDateRangeQueryState();
 
+  const splitConfigLoadingEnabled = useFeature('split-config-loading')?.enabled ?? false;
   const startDate = range ? createDateRange(range).start : start;
   const endDate = range ? createDateRange(range).end : end;
 
   const { data, isLoading, error, refetch } = useQuery(
     getCompositions,
     {
-      fedGraphName: router.query.slug as string,
+      fedGraphName: graphName,
       namespace,
-      limit: limit > 50 ? 50 : limit,
-      offset: (pageNumber - 1) * limit,
+      limit,
+      offset,
       startDate: formatISO(startDate),
       endDate: formatISO(endDate),
-      excludeFeatureFlagCompositions: true,
+      excludeFeatureFlagCompositions: !splitConfigLoadingEnabled,
     },
     {
       placeholderData: (prev) => prev,
@@ -81,6 +85,7 @@ const CompositionsPage: NextPageWithLayout = () => {
           <TableHeader>
             <TableRow>
               <TableHead>Id</TableHead>
+              {splitConfigLoadingEnabled && <TableHead>Feature Flag</TableHead>}
               <TableHead>Triggered By Subgraph</TableHead>
               <TableHead>Actor</TableHead>
               <TableHead className="flex items-center space-x-1">
@@ -106,9 +111,10 @@ const CompositionsPage: NextPageWithLayout = () => {
                   isLatestValid,
                   admissionError,
                   routerConfigSignature,
-                  deploymentError,
                   hasMultipleChangedSubgraphs,
                   triggeredBySubgraphName,
+                  isFeatureFlagComposition,
+                  featureFlagName,
                 }) => {
                   const path = `${router.asPath.split('?')[0]}/${id}`;
                   return (
@@ -134,12 +140,17 @@ const CompositionsPage: NextPageWithLayout = () => {
                           </Tooltip>
                         </div>
                       </TableCell>
+                      {splitConfigLoadingEnabled && (
+                        <TableCell>
+                          {isFeatureFlagComposition && featureFlagName ? <>{featureFlagName}</> : '-'}
+                        </TableCell>
+                      )}
                       <TableCell
                         className={cn({
                           italic: hasMultipleChangedSubgraphs,
                         })}
                       >
-                        {hasMultipleChangedSubgraphs ? 'Multiple Subgraphs' : triggeredBySubgraphName}
+                        {hasMultipleChangedSubgraphs ? 'Multiple Subgraphs' : triggeredBySubgraphName || '-'}
                       </TableCell>
                       <TableCell>{createdBy}</TableCell>
                       <TableCell>
@@ -202,7 +213,7 @@ const CompositionsPage: NextPageWithLayout = () => {
               )
             ) : (
               <TableRow>
-                <TableCell colSpan={7} className="h-24 text-center">
+                <TableCell colSpan={splitConfigLoadingEnabled ? 7 : 6} className="h-24 text-center">
                   No results.
                 </TableCell>
               </TableRow>
